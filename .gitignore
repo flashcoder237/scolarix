@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.db
+*.db-wal
+*.db-shm
+/archives_demo/
+/captures/
+.pytest_cache/
+.ruff_cache/
+tools/*.exe
