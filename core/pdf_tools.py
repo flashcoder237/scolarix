@@ -22,8 +22,9 @@ def export_filename(rel: Releve, suffix: str = "") -> str:
     annee = (rel.annee_academique or "").split("-")[-1] or "NA"
     niv = f"Niv{rel.niveau_num}" if rel.niveau_num and rel.niveau_num < 100 else \
         (rel.niveau or "").replace(" ", "") or "NivNA"
+    sem = f"_S{rel.semestre}" if rel.semestre else ""
     sess = "_Rattrapage" if (rel.session or "").lower().startswith("rattrap") else ""
-    return f"FMSP_{rel.matricule}_{nom}_{annee}_{niv}{sess}{suffix}.pdf"
+    return f"FMSP_{rel.matricule}_{nom}_{annee}_{niv}{sem}{sess}{suffix}.pdf"
 
 
 def _stamp_page(width: float, height: float, title: str, subtitle: str):
@@ -87,17 +88,23 @@ def _cover_page(rels: list[Releve], title: str) -> PdfReader:
     c.drawString(50, h - 146, f"Édité le {datetime.now():%d/%m/%Y à %H:%M} par la Cellule Informatique")
     y = h - 190
     c.setFont("Helvetica-Bold", 10)
-    for x, label in ((50, "#"), (75, "Niveau"), (160, "Année"), (240, "Session"), (320, "Décision"), (420, "Pages source")):
+    for x, label in ((50, "#"), (72, "Niveau · semestre"), (180, "Année"), (250, "Moyenne"), (310, "Crédits"),
+                     (360, "Décision du jury"), (500, "Pages")):
         c.drawString(x, y, label)
-    c.setFont("Helvetica", 10)
+    c.setFont("Helvetica", 9.5)
     for i, r in enumerate(rels, start=1):
-        y -= 18
+        y -= 17
+        if y < 60:
+            c.showPage()
+            y = h - 60
+            c.setFont("Helvetica", 9.5)
         c.drawString(50, y, str(i))
-        c.drawString(75, y, r.niveau or "?")
-        c.drawString(160, y, r.annee_academique or "?")
-        c.drawString(240, y, r.session or "?")
-        c.drawString(320, y, r.statut or "?")
-        c.drawString(420, y, r.pages_label)
+        c.drawString(72, y, r.periode)
+        c.drawString(180, y, r.annee_academique or "?")
+        c.drawString(250, y, r.moyenne or "—")
+        c.drawString(310, y, str(r.credits) if r.credits is not None else "—")
+        c.drawString(360, y, (r.decision or r.statut or "?")[:26])
+        c.drawString(500, y, r.pages_label.replace("Pages ", "p. ").replace("Page ", "p. "))
     c.showPage()
     c.save()
     buf.seek(0)
@@ -115,7 +122,7 @@ def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
     for r in rels:
         src = r.preview_pdf
         if not src or not Path(src).exists():
-            missing.append(f"{r.niveau} {r.annee_academique} ({r.session})")
+            missing.append(f"{r.periode} {r.annee_academique}")
             continue
         reader = readers.setdefault(src, PdfReader(src))
         for i in range(r.numero_page - 1, min(r.page_fin, len(reader.pages))):
@@ -128,15 +135,19 @@ def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
 
 
 def select_for_cursus(rels: list[Releve]) -> list[Releve]:
-    """Sélection par défaut : pour chaque niveau, si un relevé ADMIS existe (rattrapage compris),
-    on écarte les relevés d'échec du même niveau (cas S2.1)."""
-    by_level: dict[str, list[Releve]] = {}
+    """Sélection par défaut pour le cursus : pour chaque (niveau, semestre), si un relevé validé existe
+    (rattrapage ou redoublement compris), on écarte les relevés non validés de la même période (cas S2.1)
+    et on ne garde que le plus récent s'il y a plusieurs exemplaires validés."""
+    by_period: dict[tuple, list[Releve]] = {}
     for r in rels:
-        by_level.setdefault(f"{r.matricule}|{r.niveau}", []).append(r)
+        by_period.setdefault((r.matricule, r.niveau, r.semestre or 0), []).append(r)
     keep = []
-    for group in by_level.values():
+    for group in by_period.values():
         ok = [r for r in group if r.is_success]
-        keep.extend(ok if ok else group)
-    keep.sort(key=lambda r: (r.annee_academique or "", r.niveau_num,
-                             0 if (r.session or "").lower().startswith("normal") else 1))
+        if ok:
+            keep.append(max(ok, key=lambda r: (r.annee_academique or "", r.id)))
+        else:
+            keep.extend(group)
+    keep.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",
+                             1 if (r.session or "").lower().startswith("rattrap") else 0))
     return keep

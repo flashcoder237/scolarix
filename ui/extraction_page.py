@@ -149,7 +149,7 @@ class ExtractionPage(QWidget):
         ph.addWidget(card_header("Aperçu de l'export", "Premières lignes"), 1)
         prev.lay.addLayout(ph)
         self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["MATRICULE", "NOM & PRÉNOM", "ANNÉE", "NIVEAU", "MOY.", "DÉCISION"])
+        self.table.setHorizontalHeaderLabels(["MATRICULE", "NOM & PRÉNOM", "ANNÉE", "NIVEAU · SEM.", "MOY.", "DÉCISION"])
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(40)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -263,7 +263,7 @@ class ExtractionPage(QWidget):
         mono = QFont("Consolas", 10)
         mono.setBold(True)
         for i, r in enumerate(shown):
-            vals = [r.matricule, r.nom_complet, r.annee_academique or "", r.niveau or "", r.moyenne or "", r.statut or ""]
+            vals = [r.matricule, r.nom_complet, r.annee_academique or "", r.periode, r.moyenne or "", r.statut or ""]
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(v)
                 if j == 0:

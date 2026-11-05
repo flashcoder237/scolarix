@@ -46,20 +46,20 @@ class CursusDialog(QDialog):
 
         missing = self._missing_levels()
         if missing:
-            card.lay.addWidget(Alert(f"Niveau(x) introuvable(s) dans l'index : {', '.join(missing)}. "
+            card.lay.addWidget(Alert(f"Période(s) introuvable(s) dans l'index : {', '.join(missing)}. "
                                      "Le dossier fusionné sera incomplet.", "red"))
         if any(not r.is_success for r in self.rels):
-            card.lay.addWidget(Alert("Les relevés d'échec sont décochés lorsqu'un relevé ADMIS existe pour le même "
-                                     "niveau (rattrapage ou redoublement).", "amber"))
+            card.lay.addWidget(Alert("Les relevés non validés sont décochés lorsqu'un relevé validé existe pour le même "
+                                     "semestre (rattrapage ou redoublement).", "amber"))
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Inclure", "Niveau", "Année", "Session", "Décision", "Pages"])
+        self.tree.setHeaderLabels(["Inclure", "Période", "Année", "Moyenne", "Décision", "Pages"])
         self.tree.setRootIsDecorated(False)
         self.tree.setMinimumHeight(240)
         for r in self.rels:
             self._add_item(r, r.id in default)
         self.tree.itemChanged.connect(lambda *_: self._update_summary())
-        for i, w in enumerate((70, 110, 110, 110, 120, 90)):
+        for i, w in enumerate((70, 130, 100, 110, 120, 90)):
             self.tree.setColumnWidth(i, w)
         card.lay.addWidget(self.tree, 1)
 
@@ -123,8 +123,11 @@ class CursusDialog(QDialog):
         self._update_summary()
 
     def _add_item(self, r: Releve, checked: bool) -> None:
-        it = QTreeWidgetItem(["", r.niveau or "?", r.annee_academique or "?", r.session or "?", r.statut or "—",
-                              r.pages_label])
+        it = QTreeWidgetItem(["", r.periode, r.annee_academique or "?",
+                              (r.moyenne or "—") + (f" · {r.grade}" if r.grade else ""),
+                              r.statut or "—", r.pages_label])
+        if r.decision:
+            it.setToolTip(4, r.decision)
         it.setData(0, Qt.ItemDataRole.UserRole, r.id)
         it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         it.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
@@ -132,6 +135,9 @@ class CursusDialog(QDialog):
         self.tree.addTopLevelItem(it)
 
     def _missing_levels(self) -> list[str]:
+        sems = {r.semestre for r in self.rels if r.semestre}
+        if sems:  # LMD : semestres attendus de S1 jusqu'au dernier semestre trouvé
+            return [f"S{n}" for n in range(1, max(sems) + 1) if n not in sems]
         nums = {r.niveau_num for r in self.rels if 0 < r.niveau_num < 100}
         if not nums:
             return []
@@ -158,8 +164,8 @@ class CursusDialog(QDialog):
             it = self.tree.topLevelItem(i)
             if not it.isHidden() and it.checkState(0) == Qt.CheckState.Checked:
                 out.append(by_id[it.data(0, Qt.ItemDataRole.UserRole)])
-        out.sort(key=lambda r: (r.annee_academique or "", r.niveau_num,
-                                0 if (r.session or "").lower().startswith("normal") else 1))
+        out.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",
+                                1 if (r.session or "").lower().startswith("rattrap") else 0))
         return out
 
     def _filename(self) -> str:

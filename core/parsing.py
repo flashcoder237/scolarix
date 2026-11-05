@@ -1,11 +1,22 @@
 """Découpage des pages en blocs « étudiant » et extraction des métadonnées d'un relevé.
 
-Le format exact des relevés a varié au fil des années : toutes les expressions sont regroupées
-dans ``PATTERNS`` pour être ajustées facilement sur un échantillon réel d'archives.
+Calé sur les VRAIS relevés de la FMSP (échantillon 2012-2025) :
 
-Règle des relevés sur plusieurs pages (cas S4.2) : une page qui porte le même matricule que le
-bloc précédent, ou qui ne contient aucun nouvel en-tête d'étudiant (suite du tableau de notes),
-est rattachée au bloc précédent -> page_debut=34, page_fin=35.
+* un relevé = un étudiant × un SEMESTRE (LMD) : « NIVEAU: II  SEMESTRE: IV » (chiffres romains ou arabes) ;
+* format récent : ligne récapitulative sous l'en-tête
+  « RELEVE NIVEAU | SEMESTRE | TOTAL CREDIT /30 | MOYENNE SEMESTRIELLE /20 | MGP | GRADE | DECISION DU JURY »
+  -> « 1 1 30 10,99 2,0 C SEMESTRE VALIDE » ;
+* ancien format (Word 2012-2014) : pas de décision semestrielle, une colonne JURY par UE
+  (VALIDEE / NON VALIDEE) ;
+* l'extraction PDF coupe parfois les libellés (« N OM ET PRENOM », « N IVEAU », « N É(E) LE ») :
+  chaque libellé tolère un espace entre ses lettres ;
+* dates parfois écrites avec des barres inverses (« 02\\01\\1997 »).
+
+Toutes les expressions sont regroupées dans ``PATTERNS`` pour être ajustées sur d'autres variantes.
+
+Règle des relevés sur plusieurs pages (cas S4.2) : une page SANS nouvel en-tête d'étudiant (pas de
+libellé « NOM ET PRENOM ») est la suite du relevé précédent. Une page avec un en-tête complet est
+toujours un nouveau relevé, même si le matricule est identique (doublon, redoublement).
 """
 from __future__ import annotations
 
@@ -13,33 +24,69 @@ import re
 from dataclasses import dataclass, field
 
 from .extractors import PageText
-from .normalize import (FILIERES, MATRICULE_RE, filiere_code_from_matricule, find_matricules,
-                        niveau_number, norm_text, strip_accents)
+from .normalize import (FILIERES, MATRICULE_RE, filiere_code_from_matricule, find_matricules, niveau_number,
+                        norm_text, roman_or_int, strip_accents)
+
+
+def lab(word: str) -> str:
+    """Libellé tolérant aux espaces parasites entre les lettres : NOM -> N\\s?O\\s?M."""
+    parts = []
+    for ch in word:
+        if ch == " ":
+            parts.append(None)
+        elif ch.upper() in "EÉÈ":
+            parts.append("[EÉÈ]")
+        else:
+            parts.append(re.escape(ch))
+    out = ""
+    for i, part in enumerate(parts):
+        if part is None:
+            out += r"\s+"
+            continue
+        if i and parts[i - 1] is not None:
+            out += r"\s?"
+        out += part
+    return out
+
 
 SEP = r"\s*[:：.]?\s*"
+ROMAN_OR_INT = r"([IVX]{1,5}|\d{1,2})\b"
+DATE = r"(\d{1,2}\s*[\\/.-]\s*\d{1,2}\s*[\\/.-]\s*\d{2,4})"
 
 PATTERNS = {
-    "matricule_label": re.compile(r"matricule\s*(?:n[°o]\.?|no\.?)?" + SEP, re.I),
-    "nom_complet": re.compile(r"(?:noms?\s*(?:et|&)\s*pr[ée]noms?|nom\s*complet|[ée]tudiant\(?e?\)?)" + SEP
-                              + r"([^\n]+)", re.I),
-    "nom": re.compile(r"(?<![a-zé])noms?(?!\s*(?:et|&))" + SEP + r"([^\n]+)", re.I),
-    "prenom": re.compile(r"pr[ée]noms?(?:\(s\))?" + SEP + r"([^\n]+)", re.I),
-    "naissance": re.compile(r"n[ée]\(?e?\)?\s*le" + SEP + r"(\d{1,2}\s*[/.-]\s*\d{1,2}\s*[/.-]\s*\d{2,4})", re.I),
-    "filiere": re.compile(r"(?:fili[eè]re|parcours|option|sp[ée]cialit[ée])" + SEP + r"([^\n]+)", re.I),
-    "niveau": re.compile(r"(?:niveau|level|ann[ée]e\s*d['’]?[ée]tudes?)" + SEP + r"(\d{1,2})", re.I),
+    "matricule_label": re.compile(lab("MATRICULE") + r"\s*(?:n[°o]\.?|no\.?)?" + SEP, re.I),
+    # « NOM ET PRENOM: », « N OM ET PRENOM: », « NOM(S) ET PRENOM(S) : », « Noms et Prénoms : »
+    "nom_complet": re.compile(lab("NOM") + r"(?:\(S\)|S)?\s*(?:ET|&)\s*" + lab("PRENOM") + r"(?:\(S\)|S)?"
+                              + SEP + r"([^\n]*)", re.I),
+    "nom_seul": re.compile(r"(?<![A-Za-zÀ-ÿ])" + lab("NOM") + r"(?:\(S\)|S)?(?!\s*(?:ET|&|\(|S\b))" + SEP
+                           + r"([^\n]+)", re.I),
+    "prenom": re.compile(lab("PRENOM") + r"(?:\(S\)|S)?" + SEP + r"([^\n]+)", re.I),
+    "naissance": re.compile(r"N\s?[ÉE]\s?\(?\s?E?\s?\)?\s*LE" + SEP + DATE, re.I),
+    "lieu": re.compile(r"(?:^|\s)(?:A|À)\s*:\s*([A-ZÀ-ÿ][A-ZÀ-ÿ' \-]{1,40})", re.M),
+    "filiere": re.compile(lab("FILIERE") + r"\s*:\s*([^\n]+)", re.I),
+    "filiere_lache": re.compile(r"(?:fili[eè]re|parcours|option|sp[ée]cialit[ée])" + SEP + r"([^\n]+)", re.I),
+    "cycle": re.compile(lab("CYCLE") + r"\s*:\s*([A-Za-zÀ-ÿ]+)", re.I),
+    "niveau": re.compile(lab("NIVEAU") + r"\s*:\s*" + ROMAN_OR_INT, re.I),
+    "niveau_lache": re.compile(r"(?:niveau|level)\s*[:：]?\s*(\d{1,2})\b", re.I),
     "niveau_ordinal": re.compile(r"\b(\d)\s*(?:e|è|ème|eme|i[eè]me)\s*ann[ée]e\b", re.I),
-    "master": re.compile(r"\bmaster\s*(\d)\b|\bM\s?([12])\b", re.I),
+    "semestre": re.compile(lab("SEMESTRE") + r"\s*:\s*" + ROMAN_OR_INT, re.I),
+    "master": re.compile(r"\bmaster\s*(\d)\b", re.I),
+    "annee_label": re.compile(r"ANN[ÉE]E\s*ACAD[ÉE]MIQUE\s*:?\s*((?:19|20)\d{2})\s*[-/–]\s*((?:19|20)\d{2})", re.I),
     "annee": re.compile(r"\b((?:19|20)\d{2})\s*[-/–]\s*((?:19|20)\d{2})\b"),
     "session": re.compile(r"session\s*(?:de\s*)?(normale|ordinaire|rattrapage|de\s*rattrapage|sp[ée]ciale)", re.I),
-    "decision": re.compile(r"d[ée]cision(?:\s*du\s*jury)?" + SEP + r"([A-Za-zÀ-ÿ ]{4,40})", re.I),
+    # Ligne récapitulative : niveau semestre crédits moyenne [mgp] grade décision
+    "recap": re.compile(r"^\s*(\d{1,2})\s+(\d{1,2})\s+(\d{1,3})\s+(\d{1,2}[,.]\d{1,3})\s+(?:(\d[,.]\d{1,2})\s+)?"
+                        r"([A-F][+-]?)\s+([A-ZÀ-ÿ][A-ZÀ-ÿ '\-]{2,60}?)\s*$", re.M),
+    "decision": re.compile(r"d[ée]cision(?:\s*du\s*jury)?\s*[:：]\s*([A-Za-zÀ-ÿ ]{4,40})", re.I),
     "moyenne": re.compile(r"moyenne[^:\n]{0,30}[:：]\s*(\d{1,2}[,.]\d{1,3})", re.I),
+    "ue_jury": re.compile(r"\b(NON\s+VALID[EÉ]E?S?|VALID[EÉ]E?S?)\s*$", re.M | re.I),
     "entete": re.compile(r"relev[ée]\s*de\s*notes|bulletin\s*de\s*notes|transcript", re.I),
 }
 
 STATUTS = [  # ordre de priorité : les formes négatives d'abord
-    ("NON ADMIS", "AJOURNÉ"), ("AJOURN", "AJOURNÉ"), ("EXCLU", "EXCLUSION"), ("ABANDON", "ABANDON"),
-    ("REPORT", "REPORT"), ("REDOUBL", "REDOUBLEMENT"), ("SUSPEN", "SUSPENSION"),
-    ("ADMIS", "ADMIS"), ("ADMISE", "ADMIS"),
+    ("NON VALID", "NON VALIDÉ"), ("NON ADMIS", "AJOURNÉ"), ("AJOURN", "AJOURNÉ"), ("EXCLU", "EXCLUSION"),
+    ("ABANDON", "ABANDON"), ("REPORT", "REPORT"), ("REDOUBL", "REDOUBLEMENT"), ("SUSPEN", "SUSPENSION"),
+    ("VALID", "VALIDÉ"), ("ADMIS", "ADMIS"),
 ]
 
 FILIERE_KEYWORDS = [
@@ -68,10 +115,11 @@ class PathHints:
     filiere_code: str | None = None
     session: str | None = None
     niveau: str | None = None
+    semestre: int | None = None
 
 
 def hints_from_path(path: str) -> PathHints:
-    """Indices tirés de l'arborescence : « 2020-2021\\Medecine\\N3_SR_Releves.doc »."""
+    """Indices tirés de l'arborescence : « 2020-2021\\Medecine\\N3_SR_Releves.doc », « EM2_S2.docx »."""
     h = PathHints()
     p = strip_accents(path).replace("\\", "/")
     m = PATTERNS["annee"].search(p)
@@ -85,11 +133,14 @@ def hints_from_path(path: str) -> PathHints:
     name = up.rsplit("/", 1)[-1]
     if re.search(r"(^|[_\- ])(SR|RATTRAP)", name):
         h.session = "Rattrapage"
-    elif re.search(r"(^|[_\- ])(SN|NORMAL|ORDINAIRE)", name):
+    elif re.search(r"(^|[_\- ])(SN|NORMAL|ORDINAIRE)(?=[_\- .]|$)", name):
         h.session = "Normale"
-    m = re.search(r"(?:^|[_\- ])(?:NIV(?:EAU)?|[NPB])\s*_?(\d)(?=[_\- .]|$)", name)
+    m = re.search(r"(?:^|[_\- ])(?:NIV(?:EAU)?|[NPB]|E[MP])\s*_?(\d)(?=[_\- .]|$)", name)
     if m:
         h.niveau = f"Niveau {m.group(1)}"
+    m = re.search(r"(?:^|[_\- ])(?:S|SEM)(\d{1,2})(?=[_\- .]|$)", name)
+    if m:
+        h.semestre = int(m.group(1))
     m = re.search(r"(?:^|[_\- ])M(?:ASTER)?\s*_?([12])(?=[_\- .]|$)", name)
     if m and "MASTER" in up:
         h.niveau = f"Master {m.group(1)}"
@@ -97,14 +148,14 @@ def hints_from_path(path: str) -> PathHints:
 
 
 def _labeled_matricules(text: str) -> list[tuple[str, str, int]]:
-    """Matricules précédés du libellé « Matricule » : (normalisé, brut, position)."""
+    """Matricules précédés du libellé « Matricule » : (normalisé, brut, position du libellé)."""
     out = []
-    for lab in PATTERNS["matricule_label"].finditer(text):
-        m = MATRICULE_RE.match(text, lab.end())
+    for lab_m in PATTERNS["matricule_label"].finditer(text):
+        m = MATRICULE_RE.match(text, lab_m.end())
         if m:
             mat = f"{m.group(1)}{m.group(2).upper()}{m.group(3)}"
             if not any(o[0] == mat for o in out):
-                out.append((mat, m.group(0), lab.start()))
+                out.append((mat, m.group(0), lab_m.start()))
     return out
 
 
@@ -118,12 +169,16 @@ def _header_matricule(text: str) -> tuple[str, str] | None:
     return mats[0], (m.group(0) if m else mats[0])
 
 
+def _has_student_header(text: str) -> bool:
+    return bool(PATTERNS["nom_complet"].search(text) or PATTERNS["nom_seul"].search(text[:1500]))
+
+
 def split_blocks(pages: list[PageText]) -> tuple[list[Block], list[str]]:
     """Regroupe les pages en blocs étudiants. Renvoie (blocs, avertissements)."""
     blocks: list[Block] = []
     warnings: list[str] = []
     current: Block | None = None
-    any_label = any(_labeled_matricules(p.text) for p in pages)
+    any_label = any(_labeled_matricules(p.text or "") for p in pages)
 
     for page in pages:
         text = page.text or ""
@@ -134,32 +189,32 @@ def split_blocks(pages: list[PageText]) -> tuple[list[Block], list[str]]:
             hm = _header_matricule(text)
             labeled = [(hm[0], hm[1], 0)] if hm else []
 
-        if not labeled:
-            # Suite du tableau de notes sans nouvel en-tête : rattachée au relevé précédent
-            if current is not None:
-                current.page_fin = page.number
-                current.texts.append(text)
-                if page.ocr_confidence is not None:
-                    current.ocr.append(page.ocr_confidence)
-            else:
-                warnings.append(f"Page {page.number} : aucun matricule détecté.")
-            continue
-
-        if len(labeled) == 1 and current is not None and labeled[0][0] == current.matricule \
-                and page.number == current.page_fin + 1:
-            # Même matricule sur la page suivante : relevé sur plusieurs pages
+        def attach():
             current.page_fin = page.number
             current.texts.append(text)
             if page.ocr_confidence is not None:
                 current.ocr.append(page.ocr_confidence)
+
+        if not labeled:
+            if current is not None and not re.search(r"\d{1,2}[,.]\d{2}", text):
+                # Page de fin vide (gabarit sans notes) : on ne l'imprime pas avec le relevé
+                warnings.append(f"Page {page.number} : page sans notes ignorée (suite vide du relevé "
+                                f"{current.matricule}).")
+            elif current is not None:    # suite du tableau de notes, sans nouvel en-tête
+                attach()
+            else:
+                warnings.append(f"Page {page.number} : aucun matricule détecté.")
             continue
 
-        # Un ou plusieurs nouveaux étudiants sur cette page
+        if (len(labeled) == 1 and current is not None and labeled[0][0] == current.matricule
+                and page.number == current.page_fin + 1 and not _has_student_header(text)):
+            attach()                      # même matricule, page de suite sans en-tête complet
+            continue
+
         for i, (mat, brut, pos) in enumerate(labeled):
             end = labeled[i + 1][2] if i + 1 < len(labeled) else len(text)
             start = 0 if i == 0 else pos
-            chunk = text[start:end]
-            current = Block(mat, brut, page.number, page.number, [chunk])
+            current = Block(mat, brut, page.number, page.number, [text[start:end]])
             if page.ocr_confidence is not None:
                 current.ocr.append(page.ocr_confidence)
             blocks.append(current)
@@ -167,19 +222,22 @@ def split_blocks(pages: list[PageText]) -> tuple[list[Block], list[str]]:
 
 
 # ------------------------------------------------------------ champs du bloc
+_CUT = re.compile(r"\s{3,}|\t|\s(?:" + lab("MATRICULE") + r"|n[ée]\(?e?\)?\s*le|fili[eè]re|niveau|session|"
+                  r"ann[ée]e|surname|registration)\b", re.I)
+
+
 def _clean(value: str) -> str:
-    value = re.split(r"\s{3,}|\t|\s(?:matricule|n[ée]e?\s*le|fili[eè]re|niveau|session|ann[ée]e)\b",
-                     value, maxsplit=1, flags=re.I)[0]
+    value = _CUT.split(value, maxsplit=1)[0]
     return value.strip(" :;,-– ")
 
 
 def split_nom_prenom(full: str) -> tuple[str, str]:
-    """« TCHOUA NGUEMO Brice » -> (« TCHOUA NGUEMO », « Brice »). Les mots en capitales forment le nom."""
+    """« TCHOUA NGUEMO Brice » -> (« TCHOUA NGUEMO », « Brice »). Tout en capitales -> (tout, « »)."""
     words = full.split()
     nom, prenom = [], []
     for w in words:
         letters = re.sub(r"[^A-Za-zÀ-ÿ]", "", w)
-        if not prenom and letters and letters.upper() == letters and len(letters) >= 1:
+        if not prenom and letters and letters.upper() == letters:
             nom.append(w)
         else:
             prenom.append(w)
@@ -188,74 +246,160 @@ def split_nom_prenom(full: str) -> tuple[str, str]:
     return " ".join(nom), " ".join(prenom)
 
 
+def _valid_name(value: str) -> bool:
+    letters = re.sub(r"[^A-Za-zÀ-ÿ]", "", value)
+    return len(letters) >= 3 and not MATRICULE_RE.fullmatch(value.strip()) and \
+        not re.match(r"(?i)\s*(surname|registration|born|at)\b", value)
+
+
 def extract_name(text: str, matricule_brut: str) -> tuple[str, str, str]:
     m = PATTERNS["nom_complet"].search(text)
     if m:
         full = _clean(m.group(1))
-        if full and not MATRICULE_RE.fullmatch(full):
+        if not _valid_name(full):
+            # Valeur sur la ligne suivante (mise en page en deux lignes)
+            after = text[m.end():].splitlines()
+            nxt = next((ln for ln in after[:3] if ln.strip() and not re.match(r"(?i)\s*surname", ln)), "")
+            full = _clean(nxt)
+        if _valid_name(full):
+            full = re.sub(r"\s+", " ", full)
             nom, prenom = split_nom_prenom(full)
             return nom, prenom, f"{nom} {prenom}".strip()
-    nom_m = PATTERNS["nom"].search(text)
+    nom_m = PATTERNS["nom_seul"].search(text)
     pre_m = PATTERNS["prenom"].search(text)
     if nom_m:
         nom = _clean(nom_m.group(1))
         prenom = _clean(pre_m.group(1)) if pre_m else ""
         if nom and pre_m and prenom and nom.endswith(prenom):
             nom = nom[: -len(prenom)].strip()
-        if nom:
+        if _valid_name(nom):
             return nom.upper(), prenom, f"{nom.upper()} {prenom}".strip()
-    # Dernier recours : la ligne du matricule, débarrassée des libellés
-    for line in text.splitlines():
+    for line in text.splitlines():  # dernier recours : la ligne du matricule
         if matricule_brut and matricule_brut in line:
             rest = line.replace(matricule_brut, " ")
             rest = re.sub(r"(?i)matricule\s*(?:n[°o])?\s*[:：]?", " ", rest)
             rest = re.sub(r"\s+", " ", rest).strip(" :;-")
-            if len(re.sub(r"[^A-Za-z]", "", rest)) >= 3:
+            if _valid_name(rest):
                 nom, prenom = split_nom_prenom(rest)
                 return nom, prenom, f"{nom} {prenom}".strip()
     return "", "", ""
 
 
-def detect_statut(text: str) -> str | None:
-    m = PATTERNS["decision"].search(text)
-    zone = norm_text(m.group(1)) if m else ""
-    if not zone:
-        # Pas de libellé « Décision » : on regarde la fin du relevé (là où figure la décision du jury)
-        zone = norm_text(text[-600:])
-    zone = re.sub(r"\bNON VALIDEE?S?\b|\bVALIDEE?S?\b", " ", zone)
+def _statut_from(text: str) -> str | None:
+    zone = norm_text(text)
     for key, label in STATUTS:
         if re.search(r"\b" + key, zone):
             return label
     return None
 
 
-def detect_filiere(text: str, matricule: str, hints: PathHints) -> tuple[str, str]:
-    m = PATTERNS["filiere"].search(text)
+def extract_recap(text: str) -> dict | None:
+    """Ligne récapitulative du format récent (niveau, semestre, crédits, moyenne, MGP, grade, décision)."""
+    candidates = list(PATTERNS["recap"].finditer(text))
+    for m in reversed(candidates):  # la récapitulation est en bas du relevé
+        decision = re.sub(r"\s+", " ", m.group(7)).strip()
+        if not re.search(r"(?i)valid|admis|ajourn|exclu|abandon|report|redoubl|suspen|semestre", decision):
+            continue
+        return {"niveau": int(m.group(1)), "semestre": int(m.group(2)), "credits": int(m.group(3)),
+                "moyenne": m.group(4).replace(".", ","), "mgp": (m.group(5) or "").replace(".", ",") or None,
+                "grade": m.group(6), "decision": decision}
+    return None
+
+
+def detect_statut(text: str) -> tuple[str | None, str | None]:
+    """(statut normalisé, décision telle qu'écrite)."""
+    recap = extract_recap(text)
+    if recap:
+        return _statut_from(recap["decision"]), recap["decision"]
+    m = PATTERNS["decision"].search(text)
     if m:
-        val = norm_text(m.group(1))
-        for kw, code in FILIERE_KEYWORDS:
-            if kw in val:
-                return code, FILIERES.get(code, _clean(m.group(1)))
-    head = norm_text(text[:800])
-    if "MASTER" in head:
+        raw = re.sub(r"\s+", " ", m.group(1)).strip()
+        return _statut_from(raw), raw
+    # Ancien format : colonne JURY par UE (VALIDEE / NON VALIDEE)
+    jury = [norm_text(x) for x in PATTERNS["ue_jury"].findall(text)]
+    if jury:
+        ko = sum(1 for j in jury if j.startswith("NON"))
+        if ko:
+            return "NON VALIDÉ", f"{ko} UE non validée(s) sur {len(jury)}"
+        return "VALIDÉ", f"{len(jury)} UE validées sur {len(jury)}"
+    # Pas de libellé : la fin du relevé (là où figure la décision), sans les « Validée » des UE
+    zone = re.sub(r"\bNON VALIDEE?S?\b|\bVALIDEE?S?\b", " ", norm_text(text[-600:]))
+    for key, label in STATUTS:
+        if key.startswith(("NON VALID", "VALID")):
+            continue
+        if re.search(r"\b" + key, zone):
+            return label, label
+    return None, None
+
+
+def detect_filiere(text: str, matricule: str, hints: PathHints) -> tuple[str, str]:
+    for pat in ("filiere", "filiere_lache"):
+        m = PATTERNS[pat].search(text)
+        if m:
+            raw = _clean(m.group(1))
+            val = norm_text(raw)
+            for kw, code in FILIERE_KEYWORDS:
+                if kw in val:
+                    return code, FILIERES.get(code, raw)
+    if re.search(r"\bMASTER\s*\d", norm_text(text[:800])):
         return "MS", FILIERES["MS"]
     code = filiere_code_from_matricule(matricule) or hints.filiere_code or ""
-    if code == "MS" or code not in FILIERES:
-        code = hints.filiere_code or code
     return code, FILIERES.get(code, code or "")
 
 
-def detect_niveau(text: str, hints: PathHints) -> str | None:
+def detect_niveau(text: str, hints: PathHints, recap: dict | None) -> tuple[str | None, int | None]:
+    """(libellé « Niveau 2 » / « Master 1 », numéro de semestre)."""
+    sem = None
+    sem_from_hint = False
+    m = PATTERNS["semestre"].search(text)
+    if m:
+        sem = roman_or_int(m.group(1))
+    if sem is None and recap:
+        sem = recap["semestre"]
+    if sem is None:
+        # Valeur décalée par la mise en page (« Academic Year VI » une ligne au-dessus de « SEMESTRE: »)
+        lm = re.search(lab("SEMESTRE") + r"\s*:", text, re.I)
+        if lm:
+            lines = text.splitlines()
+            idx = text[:lm.start()].count("\n")
+            window = "\n".join(lines[max(0, idx - 2): idx + 3])
+            window = re.sub(lab("SEMESTRE") + r"\s*:", " ", window, flags=re.I)
+            window = PATTERNS["niveau"].sub(" ", window)   # ne pas confondre avec « NIVEAU: III »
+            for tok in re.findall(r"(?<![A-Za-z])([IVX]{1,4})(?![A-Za-z])", window):
+                v = roman_or_int(tok)
+                if v and v <= 12:
+                    sem = v
+                    break
+    if sem is None and hints.semestre:
+        sem, sem_from_hint = hints.semestre, True
+    cycle = PATTERNS["cycle"].search(text)
+    is_master = bool(cycle and norm_text(cycle.group(1)).startswith("MASTER"))
+    n = None
     m = PATTERNS["niveau"].search(text)
     if m:
-        return f"Niveau {int(m.group(1))}"
-    m = PATTERNS["niveau_ordinal"].search(text)
-    if m:
-        return f"Niveau {int(m.group(1))}"
-    m = PATTERNS["master"].search(text[:1200])
-    if m:
-        return f"Master {m.group(1) or m.group(2)}"
-    return hints.niveau
+        n = roman_or_int(m.group(1))
+    if n is None and recap:
+        n = recap["niveau"]
+    if n is None:
+        for pat in ("niveau_lache", "niveau_ordinal"):
+            m = PATTERNS[pat].search(text)
+            if m:
+                n = int(m.group(1))
+                break
+    if n is None:
+        m = PATTERNS["master"].search(text[:1200])
+        if m:
+            return f"Master {m.group(1)}", sem
+        if hints.niveau:
+            return hints.niveau, sem
+        if sem:  # niveau déduit du semestre : S1-S2 -> 1, S3-S4 -> 2...
+            n = (sem + 1) // 2
+    if n is None:
+        return None, sem
+    if sem_from_hint and sem <= 2 and n > 1:
+        # Nom de fichier « EM3_S2 » : 2e semestre du niveau 3 -> semestre 6 du cursus
+        sem = 2 * (n - 1) + sem
+    return (f"Master {n}" if is_master else f"Niveau {n}"), sem
 
 
 def detect_session(text: str, hints: PathHints) -> str | None:
@@ -267,7 +411,17 @@ def detect_session(text: str, hints: PathHints) -> str | None:
         if "SPECIAL" in v:
             return "Spéciale"
         return "Normale"
-    return hints.session or "Normale"
+    return hints.session
+
+
+def _date(raw: str) -> str:
+    parts = re.split(r"\s*[\\/.-]\s*", raw.strip())
+    if len(parts) == 3:
+        d, mth, y = parts
+        if len(y) == 2:
+            y = ("19" if int(y) > 30 else "20") + y
+        return f"{int(d):02d}/{int(mth):02d}/{y}"
+    return raw
 
 
 def parse_block(block: Block, hints: PathHints) -> tuple[dict, list[str]]:
@@ -277,35 +431,55 @@ def parse_block(block: Block, hints: PathHints) -> tuple[dict, list[str]]:
     if not full:
         full = "(nom non détecté)"
         warnings.append(f"{block.matricule} (page {block.page_debut}) : nom non détecté.")
+    recap = extract_recap(text)
     code, filiere = detect_filiere(text, block.matricule, hints)
-    niveau = detect_niveau(text, hints)
-    annee_m = PATTERNS["annee"].search(text)
-    annee = f"{annee_m.group(1)}-{annee_m.group(2)}" if annee_m else hints.annee
-    moy_m = PATTERNS["moyenne"].search(text)
-    nais_m = PATTERNS["naissance"].search(text)
-    statut = detect_statut(text)
+    niveau, semestre = detect_niveau(text, hints, recap)
+    am = PATTERNS["annee_label"].search(text) or PATTERNS["annee"].search(text)
+    annee = f"{am.group(1)}-{am.group(2)}" if am else hints.annee
+    statut, decision = detect_statut(text)
+    moyenne = recap["moyenne"] if recap else None
+    if not moyenne:
+        mm = PATTERNS["moyenne"].search(text)
+        moyenne = mm.group(1).replace(".", ",") if mm else None
+    nais = PATTERNS["naissance"].search(text)
+    lieu = PATTERNS["lieu"].search(text)
     if not annee:
         warnings.append(f"{block.matricule} (page {block.page_debut}) : année académique non détectée.")
-    excerpt = re.sub(r"\s+", " ", text)[:400]
+    if not niveau:
+        warnings.append(f"{block.matricule} (page {block.page_debut}) : niveau non détecté.")
+    if not statut:
+        warnings.append(f"{block.matricule} (page {block.page_debut}) : décision du jury non détectée.")
+    n = niveau_number(niveau)
+    if semestre and 0 < n < 100 and not (2 * n - 1 <= semestre <= 2 * n):
+        warnings.append(f"{block.matricule} (page {block.page_debut}) : niveau {n} incohérent avec le semestre "
+                        f"{semestre} — à vérifier.")
+    if not (PATTERNS["naissance"].search(text)):
+        warnings.append(f"{block.matricule} (page {block.page_debut}) : date de naissance illisible.")
     return {
         "matricule": block.matricule,
         "matricule_brut": block.matricule_brut.strip(),
         "nom": nom,
         "prenom": prenom,
         "nom_complet": full,
-        "date_naissance": re.sub(r"\s", "", nais_m.group(1)) if nais_m else None,
+        "date_naissance": _date(nais.group(1)) if nais else None,
+        "lieu_naissance": _clean(lieu.group(1)) if lieu else None,
         "filiere": filiere,
         "filiere_code": code,
         "niveau": niveau,
         "niveau_num": niveau_number(niveau),
+        "semestre": semestre,
         "annee_academique": annee,
         "session": detect_session(text, hints),
         "statut": statut,
-        "moyenne": moy_m.group(1).replace(".", ",") if moy_m else None,
+        "decision": decision,
+        "moyenne": moyenne,
+        "credits": recap["credits"] if recap else None,
+        "grade": recap["grade"] if recap else None,
+        "mgp": recap["mgp"] if recap else None,
         "numero_page": block.page_debut,
         "page_fin": block.page_fin,
         "ocr_confiance": round(sum(block.ocr) / len(block.ocr), 1) if block.ocr else None,
-        "extrait": excerpt,
+        "extrait": re.sub(r"\s+", " ", text)[:400],
     }, warnings
 
 

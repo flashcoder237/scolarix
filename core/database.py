@@ -55,9 +55,15 @@ CREATE TABLE IF NOT EXISTS etudiants_releves (
     niveau           VARCHAR(20),
     niveau_num       INTEGER DEFAULT 0,
     annee_academique VARCHAR(20),
-    session          VARCHAR(20),              -- Normale / Rattrapage
+    semestre         INTEGER,                  -- 1..12 (LMD : un relevé = un semestre)
+    session          VARCHAR(20),              -- Normale / Rattrapage (si indiqué)
     statut           VARCHAR(30),              -- ADMIS, AJOURNÉ, EXCLUSION, ABANDON, REPORT...
+    decision         VARCHAR(80),              -- texte exact : « SEMESTRE VALIDE »...
     moyenne          VARCHAR(10),
+    credits          INTEGER,
+    grade            VARCHAR(4),
+    mgp              VARCHAR(6),
+    lieu_naissance   VARCHAR(80),
     numero_page      INTEGER NOT NULL DEFAULT 1,
     page_fin         INTEGER NOT NULL DEFAULT 1,
     ocr_confiance    REAL,
@@ -110,6 +116,7 @@ RELEVE_COLUMNS = (
     "r.id, r.fichier_id, r.matricule, r.matricule_brut, r.nom, r.prenom, r.nom_complet, r.nom_norm, "
     "r.date_naissance, r.filiere, r.filiere_code, r.niveau, r.niveau_num, r.annee_academique, r.session, "
     "r.statut, r.moyenne, r.numero_page, r.page_fin, r.ocr_confiance, r.extrait, "
+    "r.semestre, r.decision, r.credits, r.grade, r.mgp, r.lieu_naissance, "
     "f.chemin, f.type_fichier, f.cache_pdf, f.statut AS fichier_statut"
 )
 
@@ -137,6 +144,12 @@ class Releve:
     page_fin: int
     ocr_confiance: float | None
     extrait: str | None
+    semestre: int | None
+    decision: str | None
+    credits: int | None
+    grade: str | None
+    mgp: str | None
+    lieu_naissance: str | None
     chemin: str
     type_fichier: str
     cache_pdf: str | None
@@ -165,6 +178,16 @@ class Releve:
     def is_success(self) -> bool:
         return (self.statut or "").upper().startswith("ADMIS") or (self.statut or "").upper() == "VALIDÉ"
 
+    @property
+    def periode(self) -> str:
+        """« Niveau 2 · S3 » (ou « Niveau 2 » si le semestre est inconnu)."""
+        base = self.niveau or "Niveau ?"
+        return f"{base} · S{self.semestre}" if self.semestre else base
+
+    @property
+    def periode_key(self) -> tuple:
+        return (self.niveau_num, self.semestre or 0)
+
 
 def _row_to_releve(row: sqlite3.Row) -> Releve:
     return Releve(**{k: row[k] for k in row.keys()})
@@ -192,6 +215,11 @@ class Database:
     def _create_schema(self) -> None:
         with self._lock:
             self.conn.executescript(SCHEMA)
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(etudiants_releves)")}
+            for col, decl in (("semestre", "INTEGER"), ("decision", "VARCHAR(80)"), ("credits", "INTEGER"),
+                              ("grade", "VARCHAR(4)"), ("mgp", "VARCHAR(6)"), ("lieu_naissance", "VARCHAR(80)")):
+                if col not in cols:  # base créée par une version précédente
+                    self.conn.execute(f"ALTER TABLE etudiants_releves ADD COLUMN {col} {decl}")
             row = self.conn.execute("SELECT valeur FROM meta WHERE cle='fts_mode'").fetchone()
             if row:
                 self.fts_mode = row[0]
@@ -210,7 +238,7 @@ class Database:
                 self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('fts_mode', ?)", (self.fts_mode,))
             if self.fts_mode != "none":
                 self.conn.executescript(FTS_TRIGGERS)
-            self.conn.execute("INSERT OR IGNORE INTO meta VALUES ('schema_version', '1')")
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', '2')")
             self.conn.commit()
 
     def close(self) -> None:
@@ -251,13 +279,14 @@ class Database:
                     cur.execute(
                         "INSERT INTO etudiants_releves(fichier_id, matricule, matricule_brut, nom, prenom, nom_complet, "
                         "nom_norm, date_naissance, filiere, filiere_code, niveau, niveau_num, annee_academique, session, "
-                        "statut, moyenne, numero_page, page_fin, ocr_confiance, extrait) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "statut, moyenne, numero_page, page_fin, ocr_confiance, extrait, semestre, decision, credits, grade, mgp, "
+                        "lieu_naissance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (fid, r["matricule"], r.get("matricule_brut"), r.get("nom"), r.get("prenom"),
                          r["nom_complet"], norm_text(r["nom_complet"]), r.get("date_naissance"), r.get("filiere"),
                          r.get("filiere_code"), r.get("niveau"), r.get("niveau_num", 0), r.get("annee_academique"),
                          r.get("session"), r.get("statut"), r.get("moyenne"), r["numero_page"], r["page_fin"],
-                         r.get("ocr_confiance"), r.get("extrait")),
+                         r.get("ocr_confiance"), r.get("extrait"), r.get("semestre"), r.get("decision"),
+                         r.get("credits"), r.get("grade"), r.get("mgp"), r.get("lieu_naissance")),
                     )
                 cur.execute("COMMIT")
             except Exception:
@@ -388,7 +417,7 @@ class Database:
         words = [w for w in qn.split() if not re.fullmatch(r"\d+", w)]
         clauses, args = [], []
 
-        if looks_like_matricule(q) or (re.fullmatch(r"\d{2}[A-Z]{1,2}\d{0,4}", qm) and not years):
+        if looks_like_matricule(q) or (re.fullmatch(r"\d{2}[A-Z]{1,4}\d{0,4}", qm) and not years):
             # 1) Matricule complet ou préfixe (« 18M0 », « 19-m/042 »)
             clauses.append("r.matricule LIKE ?")
             args.append(f"{qm}%")
@@ -436,8 +465,8 @@ class Database:
                         results[r.id] = r
 
         out = list(results.values())
-        out.sort(key=lambda r: (-r.score, r.nom_norm, r.matricule, r.niveau_num, r.annee_academique or "",
-                                0 if (r.session or "").lower().startswith("normal") else 1))
+        out.sort(key=lambda r: (-r.score, r.nom_norm, r.matricule, r.niveau_num, r.semestre or 0,
+                                r.annee_academique or "", 0 if (r.session or "").lower().startswith("rattrap") else -1))
         self._flag(out)
         return out[:limit]
 
@@ -448,9 +477,9 @@ class Database:
         if mats:
             ph = ",".join("?" * len(mats))
             for row in self.conn.execute(
-                    f"SELECT matricule, niveau, COUNT(*) c FROM etudiants_releves WHERE matricule IN ({ph}) "
-                    f"GROUP BY matricule, niveau", list(mats)):
-                keys[(row["matricule"], row["niveau"])] = row["c"]
+                    f"SELECT matricule, niveau, IFNULL(semestre, 0) sem, COUNT(*) c FROM etudiants_releves "
+                    f"WHERE matricule IN ({ph}) GROUP BY matricule, niveau, IFNULL(semestre, 0)", list(mats)):
+                keys[(row["matricule"], row["niveau"], row["sem"])] = row["c"]
         for r in rels:
             r.flags = []
             if r.score < 100:
@@ -459,22 +488,25 @@ class Database:
                 r.flags.append("RATTRAPAGE")
             if r.nb_pages > 1:
                 r.flags.append(f"{r.nb_pages} PAGES LIÉES")
-            if keys.get((r.matricule, r.niveau), 1) > 1 and not (r.session or "").lower().startswith("rattrap"):
-                r.flags.append("DOUBLON NIVEAU")
+            n_same = keys.get((r.matricule, r.niveau, r.semestre or 0), 1)
+            if n_same > 1:
+                r.flags.append(f"{n_same} RELEVÉS S{r.semestre}" if r.semestre else "DOUBLON NIVEAU")
             if r.type_fichier == "PDF_SCAN":
                 r.flags.append("SCAN OCR")
             if r.fichier_statut == "ERREUR" or not Path(r.chemin).exists():
                 r.flags.append("FICHIER INTROUVABLE")
 
     def level_siblings(self, rel: Releve) -> list[Releve]:
-        """Autres relevés du même matricule et du même niveau (session normale vs rattrapage)."""
-        return self._select("r.matricule = ? AND r.niveau = ? AND r.id <> ?", [rel.matricule, rel.niveau, rel.id])
+        """Autres relevés du même matricule pour le même niveau ET le même semestre
+        (session normale / rattrapage, redoublement, doublon d'archive)."""
+        return self._select("r.matricule = ? AND r.niveau IS ? AND IFNULL(r.semestre, 0) = ? AND r.id <> ?",
+                            [rel.matricule, rel.niveau, rel.semestre or 0, rel.id])
 
     # ------------------------------------------------------------ cursus
     def cursus(self, matricule: str) -> list[Releve]:
         rels = self._select("r.matricule = ?", [norm_matricule(matricule)])
-        rels.sort(key=lambda r: (r.niveau_num, r.annee_academique or "",
-                                 0 if (r.session or "").lower().startswith("normal") else 1))
+        rels.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",
+                                 1 if (r.session or "").lower().startswith("rattrap") else 0))
         self._flag(rels)
         return rels
 
@@ -527,17 +559,19 @@ class Database:
         if year_to:
             where.append("CAST(substr(r.annee_academique, 1, 4) AS INTEGER) <= ?")
             args.append(year_to)
+        ok = "(upper(r.statut) LIKE 'ADMIS%' OR r.statut = 'VALIDÉ')"
         if statut == "admis":
-            where.append("upper(r.statut) LIKE 'ADMIS%'")
+            where.append(ok)
         elif statut == "non_valides":
-            where.append("(r.statut IS NULL OR upper(r.statut) NOT LIKE 'ADMIS%')")
+            where.append(f"(r.statut IS NULL OR NOT {ok})")
         rels = self._select(" AND ".join(where), args,
-                            order="r.annee_academique, r.nom_norm, r.niveau_num")
+                            order="r.annee_academique, r.nom_norm, r.niveau_num, r.semestre")
         if dernier_niveau:
             best: dict[str, Releve] = {}
             for r in rels:
                 cur = best.get(r.matricule)
-                if cur is None or (r.niveau_num, r.annee_academique or "") > (cur.niveau_num, cur.annee_academique or ""):
+                if cur is None or (r.niveau_num, r.semestre or 0, r.annee_academique or "") > \
+                        (cur.niveau_num, cur.semestre or 0, cur.annee_academique or ""):
                     best[r.matricule] = r
             rels = sorted(best.values(), key=lambda r: (r.annee_academique or "", r.nom_norm))
         return rels

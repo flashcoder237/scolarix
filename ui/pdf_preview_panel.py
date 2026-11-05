@@ -122,6 +122,8 @@ class PreviewPanel(QWidget):
         col.addWidget(eyebrow("Contrôle avant impression"))
         self.name = title("Aucun relevé sélectionné", 16, "h1")
         col.addWidget(self.name)
+        self.details = muted("", 9)
+        col.addWidget(self.details)
         head.addLayout(col, 1)
         self.statut = Badge("", "gray", big=True)
         head.addWidget(self.statut, 0, Qt.AlignmentFlag.AlignTop)
@@ -129,7 +131,7 @@ class PreviewPanel(QWidget):
         grid = QGridLayout()
         grid.setSpacing(8)
         self.tiles = {}
-        for i, (key, label) in enumerate((("mat", "Matricule"), ("niv", "Année · niveau"), ("ses", "Session"),
+        for i, (key, label) in enumerate((("mat", "Matricule"), ("niv", "Année · niveau"), ("ses", "Semestre"),
                                           ("pages", "À imprimer"))):
             tile = QFrame()
             tile.setObjectName("soft")
@@ -263,7 +265,22 @@ class PreviewPanel(QWidget):
         self.statut.show()
         self.tiles["mat"].setText(rel.matricule)
         self.tiles["niv"].setText(f"{rel.annee_academique or '?'} · {rel.niveau or '?'}")
-        self.tiles["ses"].setText(rel.session or "?")
+        sem = f"S{rel.semestre}" if rel.semestre else "?"
+        if rel.credits is not None:
+            sem += f" · {rel.credits}/30 crédits"
+        if (rel.session or "").lower().startswith("rattrap"):
+            sem += " · rattrapage"
+        self.tiles["ses"].setText(sem)
+        bits = []
+        if rel.moyenne:
+            bits.append(f"Moyenne {rel.moyenne}/20")
+        if rel.grade:
+            bits.append(f"grade {rel.grade}" + (f" (MGP {rel.mgp})" if rel.mgp else ""))
+        if rel.decision:
+            bits.append(f"décision : « {rel.decision} »")
+        if rel.date_naissance:
+            bits.append(f"né(e) le {rel.date_naissance}" + (f" à {rel.lieu_naissance}" if rel.lieu_naissance else ""))
+        self.details.setText(" · ".join(bits))
         self.tiles["pages"].setText(rel.pages_label + (" liées" if rel.nb_pages > 1 else ""))
         self._clear_alerts()
         for text, tone in self._alerts(rel, siblings):
@@ -279,16 +296,21 @@ class PreviewPanel(QWidget):
         ok_sib = [s for s in siblings if s.is_success]
         if not Path(rel.chemin).exists():
             out.append(("Fichier source introuvable (déplacé ou renommé) : lancez la vérification d'intégrité.", "red"))
+        periode = rel.periode
         if not rel.is_success and ok_sib:
             s = ok_sib[0]
-            out.append((f"Relevé d'échec (session {(rel.session or '').lower()} non validée). Un relevé "
-                        f"{s.statut} existe pour ce niveau (session {(s.session or '').lower()}, {s.pages_label.lower()}) : "
-                        "vérifiez lequel délivrer.", "red"))
+            out.append((f"Relevé NON VALIDÉ ({periode}, {rel.annee_academique}). Un relevé {s.statut} existe pour la "
+                        f"même période ({s.annee_academique}, {s.pages_label.lower()}"
+                        + (", rattrapage" if (s.session or "").lower().startswith("rattrap") else "")
+                        + ") : vérifiez lequel délivrer.", "red"))
         elif siblings:
-            out.append((f"Ce niveau possède {len(siblings) + 1} relevés (normale et rattrapage). "
-                        f"Vous êtes sur la session {(rel.session or '?').lower()}.", "amber"))
+            autres = ", ".join(f"{s.annee_academique} {s.statut or '?'}" for s in siblings[:3])
+            out.append((f"{len(siblings) + 1} relevés existent pour {periode} (autres : {autres}). "
+                        f"Vous êtes sur celui de {rel.annee_academique}.", "amber"))
         elif rel.statut and not rel.is_success:
-            out.append((f"Mention spéciale « {rel.statut} » : année non validée. Délivrance soumise à la scolarité.", "red"))
+            cred = f" ({rel.credits}/30 crédits)" if rel.credits is not None else ""
+            out.append((f"« {rel.decision or rel.statut} »{cred} : {periode} non validé. "
+                        "Délivrance soumise à la scolarité.", "red"))
         elif not rel.statut:
             out.append(("Décision du jury non lue automatiquement : contrôlez-la sur l'aperçu.", "amber"))
         if rel.nb_pages > 1:

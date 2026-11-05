@@ -159,3 +159,89 @@ def test_differential_and_integrity(indexed):
         assert any("2015-2016" in o for o in orphans)
     finally:
         (archives.parent / "deplace").rename(moved)
+
+
+# ------------------------------------------------- formats réels FMSP (données anonymisées)
+NOUVEAU = """REPUBLIQUE DU CAMEROUN
+UNIVERSITE DE DOUALA UNIVERSITY OF DOUALA
+FACULTE DE MEDECINE ET DES SCIENCES PHARMACEUTIQUES
+RELEVE DE NOTES /TRANSCRIPT
+N OM ET PRENOM: ETUDIANT TEST ALPHA MATRICULE: 17MM023
+su rname and name: Registration N°:
+A AWAE
+NÉ(E) LE : 02\\01\\1997
+CYCLE: LICENCE ANNÉE ACADÉMIQUE: 2022 - 2023 FILIÈRE: MEDECINE
+N IVEAU: I SEMESTRE: II
+CODE UNITE D’ENSEIGNEMENT ELEMENT CONSTITUTIF NOTE/20 MOYENNE CREDIT
+UE M141 GENETIQUE MEDICALE GENETIQUE MEDICALE 10,00 10,00 2
+RELEVE NIVEAU SEMESTRE TOTAL CREDIT / 30 MOYENNE SEMESTRIELLE / 20 MGP GRADE DECISION DU JURY
+1 2 24 9,48 1,7 C- SEMESTRE NON VALIDE
+Grade Note/4 Appréciation Moy /20
+A + 4.0 Excellent [18-20]
+"""
+
+LSB = """RELEVE DE NOTES / TRANSCRIPT
+NOM(S) ET PRENOM(S): ETUDIANTE TEST BETA GAMMA MATRICULE: 23LSB010
+surname and name: Registration N°:
+NÉ(E) LE: 22/08/2006 A: VILLE
+CYCLE: LICENCE ANNÉE ACADÉMIQUE: 2024-2025 FILIÈRE: SCIENCES BIOMÉDICALES
+NIVEAU: 2 SEMESTRE: 3
+UE ANATOMIE SYSTEMIQUE 3 14,80
+RELEVE TOTAL
+SEMESTRE MOYENNE SEMESTRIELLE / 20 MGP GRADE DECISION DU JURY
+NIVEAU CREDIT
+2 3 30 12,31 2,7 B- SEMESTRE VALIDE
+"""
+
+ANCIEN = """RELEVE DE NOTES /TRANSCRIPT
+NOM ET PRENOM : ETUDIANT ANCIEN DELTA MATRICULE: 11EM640
+Surname and name: Registration N°:
+NÉ(E) LE : 18/11/1992 A : VILLE
+NIVEAU: III ANNÉE ACADÉMIQUE: 2013 - 2014 FILIÈRE: MEDECINE
+Level: Academic Year VI Field of Study
+CYCLE : LICENCE SEMESTRE:
+Training cycle: semester
+N° UNITE ELEMENT CONSTITUTIF NOTE/20 MOYENNE GRADE CREDIT JURY
+24 ANATOMIE PATHOLOGIE 11,50 11,50 C+ 8 VALIDEE
+25 SEMIOLOGIE 8,20 8,20 D 0 NON VALIDEE
+"""
+
+PAGE_VIDE = """RELEVE DE NOTES /TRANSCRIPT FMSP/VDAAP/VDSSSE/SSSE
+Il n’est délivré qu’un seul exemplaire de reléve de note , le titulaire peut en faire des copies."""
+
+
+def test_format_recent_recap_et_libelles_coupes():
+    rels, warns = parse_pages([_page(1, NOUVEAU)], r"X:\Archives\Releve_X_EM1_S2_22-23.pdf")
+    r = rels[0]
+    assert (r["matricule"], r["nom_complet"]) == ("17MM023", "ETUDIANT TEST ALPHA")
+    assert (r["niveau"], r["semestre"], r["annee_academique"]) == ("Niveau 1", 2, "2022-2023")
+    assert (r["moyenne"], r["credits"], r["grade"], r["mgp"]) == ("9,48", 24, "C-", "1,7")
+    assert (r["statut"], r["decision"]) == ("NON VALIDÉ", "SEMESTRE NON VALIDE")
+    assert r["date_naissance"] == "02/01/1997" and r["filiere_code"] == "M"
+
+
+def test_matricule_lsb_et_sciences_biomedicales():
+    r = parse_pages([_page(1, LSB)], "x.pdf")[0][0]
+    assert (r["matricule"], r["filiere_code"], r["niveau"], r["semestre"]) == ("23LSB010", "B", "Niveau 2", 3)
+    assert r["statut"] == "VALIDÉ" and r["moyenne"] == "12,31"
+
+
+def test_ancien_format_jury_par_ue_et_semestre_decale():
+    r = parse_pages([_page(1, ANCIEN)], r"X:\EM3_S2.docx")[0][0]
+    assert (r["niveau"], r["semestre"]) == ("Niveau 3", 6)
+    assert r["statut"] == "NON VALIDÉ" and "1 UE non validée" in r["decision"]
+
+
+def test_fichier_collectif_page_vide_et_doublon_avec_entete():
+    pages = [_page(1, NOUVEAU), _page(2, NOUVEAU), _page(3, PAGE_VIDE)]
+    rels, warns = parse_pages(pages, "collectif.pdf")
+    # Même matricule mais en-tête complet -> 2 relevés distincts ; la page 3 vide n'est pas rattachée
+    assert [(r["numero_page"], r["page_fin"]) for r in rels] == [(1, 1), (2, 2)]
+    assert any("page sans notes" in w for w in warns)
+
+
+def test_roman_et_matricules_longs():
+    from core.normalize import filiere_code_from_matricule, roman_or_int
+    assert [roman_or_int(x) for x in ("I", "IV", "VI", "XII", "3")] == [1, 4, 6, 12, 3]
+    assert find_matricules("MATRICULE :19MP001 et 23LSB010") == ["19MP001", "23LSB010"]
+    assert [filiere_code_from_matricule(m) for m in ("19MM071", "19MP001", "11EM641", "23LSB010")] == ["M", "P", "M", "B"]

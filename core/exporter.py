@@ -13,10 +13,15 @@ COLUMNS = [
     ("Date de naissance", lambda r: r.date_naissance or ""),
     ("Filière", lambda r: r.filiere or ""),
     ("Niveau", lambda r: r.niveau or ""),
+    ("Semestre", lambda r: r.semestre if r.semestre is not None else ""),
     ("Année académique", lambda r: r.annee_academique or ""),
     ("Session", lambda r: r.session or ""),
-    ("Décision", lambda r: r.statut or ""),
+    ("Statut", lambda r: r.statut or ""),
+    ("Décision du jury", lambda r: r.decision or ""),
     ("Moyenne", lambda r: r.moyenne or ""),
+    ("Crédits", lambda r: r.credits if r.credits is not None else ""),
+    ("Grade", lambda r: r.grade or ""),
+    ("MGP", lambda r: r.mgp or ""),
     ("Mention", lambda r: mention(r.moyenne)),
     ("Fichier source", lambda r: r.chemin),
     ("Pages", lambda r: f"{r.numero_page}-{r.page_fin}" if r.page_fin > r.numero_page else str(r.numero_page)),
@@ -67,7 +72,7 @@ def export_xlsx(rels: list[Releve], path: str | Path, title: str = "Extraction F
         cell.alignment = Alignment(vertical="center")
     for r in rels:
         ws.append([f(r) for _, f in COLUMNS])
-    widths = [12, 22, 22, 14, 24, 12, 16, 12, 14, 10, 12, 60, 8]
+    widths = [12, 22, 22, 14, 24, 12, 9, 16, 12, 12, 22, 10, 9, 8, 8, 12, 60, 8]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A4"

@@ -295,11 +295,12 @@ class GuichetPage(QWidget):
         bold = QFont()
         bold.setWeight(QFont.Weight.DemiBold)
         for mat, rels in groups.items():
-            rels = sorted(rels, key=lambda r: (r.niveau_num, r.annee_academique or "", r.session or ""))
+            rels = sorted(rels, key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or ""))
             nums = {r.niveau_num for r in rels if 0 < r.niveau_num < 100}
             missing = [n for n in range(1, max(nums) + 1) if n not in nums] if nums else []
             cover = " ".join(dict.fromkeys(
-                (f"N{r.niveau_num}" if 0 < r.niveau_num < 100 else (r.niveau or "?").replace("Master ", "M"))
+                (f"S{r.semestre}" if r.semestre else
+                 (f"N{r.niveau_num}" if 0 < r.niveau_num < 100 else (r.niveau or "?").replace("Master ", "M")))
                 for r in rels))
             top = QTreeWidgetItem([mat, rels[0].nom_complet, f"{len(rels)} relevé(s) · {cover}",
                                    ("N" + ", N".join(map(str, missing)) + " manquant") if missing else "Complet", ""])
@@ -308,7 +309,7 @@ class GuichetPage(QWidget):
             top.setForeground(3, QColor(TONES["red" if missing else "green"][0]))
             top.setData(0, Qt.ItemDataRole.UserRole, rels[0].id)
             for r in rels:
-                child = QTreeWidgetItem([r.niveau or "?", ", ".join(r.flags) or "", f"{r.annee_academique} · {r.session}",
+                child = QTreeWidgetItem([r.periode, ", ".join(r.flags) or "", f"{r.annee_academique} · moy. {r.moyenne or '—'}",
                                          r.statut or "—", r.pages_label.replace("Pages ", "").replace("Page ", "")])
                 child.setData(0, Qt.ItemDataRole.UserRole, r.id)
                 child.setForeground(3, QColor(TONES[statut_tone(r.statut)][0]))
@@ -351,7 +352,7 @@ class GuichetPage(QWidget):
         if rel.id not in self._consulted:
             self._consulted.add(rel.id)
             self.db.log("CONSULTATION", self.s.operateur, self.s.poste, rel.id, rel.matricule,
-                        f"{rel.niveau} · {rel.annee_academique} · session {rel.session} · {rel.pages_label}")
+                        f"{rel.periode} · {rel.annee_academique} · {rel.statut or '?'} · {rel.pages_label}")
 
     # ------------------------------------------------------------ actions
     @property
@@ -377,7 +378,7 @@ class GuichetPage(QWidget):
 
         def ok(how):
             self.db.log("DUPLICATA" if dup else "IMPRESSION", self.s.operateur, self.s.poste, rel.id, rel.matricule,
-                        f"{rel.niveau} · {rel.annee_academique} · {rel.pages_label}" + (" · recto-verso" if rel.nb_pages > 1 else ""))
+                        f"{rel.periode} · {rel.annee_academique} · {rel.pages_label}" + (" · recto-verso" if rel.nb_pages > 1 else ""))
             self.preview.toast.show_message(
                 f"Envoyé à l'imprimante — {rel.pages_label}" + (" · timbre Duplicata apposé" if dup else "")
                 + " · impression journalisée")

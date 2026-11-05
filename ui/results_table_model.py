@@ -48,16 +48,33 @@ class ResultsModel(QAbstractTableModel):
         if role == ReleveRole:
             return r
         if role == Qt.ItemDataRole.DisplayRole:
-            return [r.matricule, r.nom_complet, f"{FIL_SHORT.get(r.filiere_code or '', r.filiere or '?')} · {r.niveau or '?'}",
+            return [r.matricule, r.nom_complet, f"{FIL_SHORT.get(r.filiere_code or '', r.filiere or '?')} · {_periode_court(r)}",
                     r.annee_academique or "?", r.statut or "—", _pages(r)][c]
         if role == Qt.ItemDataRole.AccessibleTextRole:
-            return f"{r.matricule} {r.nom_complet} {r.niveau} {r.annee_academique} session {r.session} {r.statut}"
+            return f"{r.matricule} {r.nom_complet} {r.periode} {r.annee_academique} {r.statut}"
         if role == Qt.ItemDataRole.ToolTipRole and c == 1 and r.flags:
             return " · ".join(r.flags)
         return None
 
     def releve_at(self, row: int) -> Releve | None:
         return self.rows[row] if 0 <= row < len(self.rows) else None
+
+
+def _periode_court(r: Releve) -> str:
+    """« N2 · S3 » ou « Master 1 » (le libellé complet est dans l'aperçu)."""
+    if 0 < r.niveau_num < 100:
+        base = f"N{r.niveau_num}"
+    else:
+        base = r.niveau or "?"
+    return f"{base} · S{r.semestre}" if r.semestre else base
+
+
+def _ligne2(r: Releve) -> str:
+    if (r.session or "").lower().startswith("rattrap"):
+        return "Session de rattrapage"
+    if r.moyenne:
+        return f"Moy. {r.moyenne}" + (f" · {r.grade}" if r.grade else "")
+    return f"Session {(r.session or 'normale').lower()}"
 
 
 def _pages(r: Releve) -> str:
@@ -150,7 +167,7 @@ class RowDelegate(QStyledItemDelegate):
             p.setFont(f)
             p.setPen(QColor(MUTED))
             p.drawText(QRectF(inner.left(), inner.center().y() + 1, inner.width(), inner.height() / 2),
-                       Qt.AlignmentFlag.AlignTop, f"Session {(r.session or '?').lower()}")
+                       Qt.AlignmentFlag.AlignTop, _ligne2(r))
         elif col == 4:
             self._pill(p, inner.left(), inner.center().y(), r.statut or "—", statut_tone(r.statut))
         elif col == 5:

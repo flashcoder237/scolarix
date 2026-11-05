@@ -17,7 +17,7 @@ from .config import Settings
 from .database import Releve
 from .extractors import MIN_TEXT_CHARS, configure_tesseract, ocr_pdf_pages, pdf_pages_text, preprocess_for_ocr
 from .normalize import find_matricules, norm_text
-from .parsing import detect_statut
+from .parsing import detect_statut, extract_recap
 
 GRADE_LINE = re.compile(r"^(?P<label>.*?[A-Za-zÀ-ÿ]{3}.*?)\s+(?:\d{1,2}\s+)?(?P<note>\d{1,2}[,.]\d{1,2})\b")
 MOYENNE = re.compile(r"moyenne[^:\n]{0,30}[:：]\s*(\d{1,2}[,.]\d{1,3})", re.I)
@@ -67,6 +67,14 @@ def _grades(text: str) -> dict[str, tuple[str, str]]:
     return out
 
 
+def _moyenne(text: str) -> str | None:
+    recap = extract_recap(text)
+    if recap:
+        return recap["moyenne"]
+    m = MOYENNE.search(text)
+    return m.group(1).replace(".", ",") if m else None
+
+
 def compare(submitted_text: str, original_text: str, original: Releve) -> list[Comparison]:
     rows: list[Comparison] = []
     sub_mats = find_matricules(submitted_text)
@@ -86,10 +94,8 @@ def compare(submitted_text: str, original_text: str, original: Releve) -> list[C
             best = process.extractOne(key, list(g_sub), scorer=fuzz.ratio, score_cutoff=80)
             sub = g_sub.get(best[0]) if best else None
         rows.append(Comparison(label, sub[1] if sub else "—", note))
-    ms, mo = MOYENNE.search(submitted_text), MOYENNE.search(original_text)
-    rows.append(Comparison("Moyenne", ms.group(1).replace(".", ",") if ms else "—",
-                           mo.group(1).replace(".", ",") if mo else (original.moyenne or "—")))
-    rows.append(Comparison("Décision du jury", detect_statut(submitted_text) or "—", original.statut or "—"))
+    rows.append(Comparison("Moyenne", _moyenne(submitted_text) or "—", _moyenne(original_text) or original.moyenne or "—"))
+    rows.append(Comparison("Décision du jury", detect_statut(submitted_text)[0] or "—", original.statut or "—"))
     return rows
 
 

@@ -170,7 +170,7 @@ class VerificationPage(QWidget):
         self.choice.blockSignals(True)
         self.choice.clear()
         for r in rels:
-            self.choice.addItem(f"{r.niveau} · {r.annee_academique} · {r.session} · {r.statut or '?'}", r.id)
+            self.choice.addItem(f"{r.periode} · {r.annee_academique} · {r.statut or '?'}", r.id)
         self.choice.blockSignals(False)
         if not rels:
             self.toast.show_message("Aucun relevé indexé pour ce matricule : document probablement non authentique "
