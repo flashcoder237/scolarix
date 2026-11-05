@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -113,6 +114,11 @@ def test_cursus_and_rattrapage(indexed):
     assert db.correlated_matricules("18M042")[0]["matricule"] == "15B077"
 
 
+HAS_TESSERACT = bool(shutil.which("tesseract")) or Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe").exists()
+HAS_CONVERTER = bool(shutil.which("soffice") or shutil.which("libreoffice"))
+
+
+@pytest.mark.skipif(not HAS_TESSERACT, reason="Tesseract non installé")
 def test_ocr_scan(indexed):
     db = indexed[0]
     r = db.search("marie claire")[0]
@@ -127,7 +133,10 @@ def test_pdf_tools(indexed, tmp_path):
     from pypdf import PdfReader
     assert len(PdfReader(str(out)).pages) == 2
     path, n, missing = pdf_tools.merge_releves(pdf_tools.select_for_cursus(db.cursus("18M042")), tmp_path / "c.pdf")
-    assert n == 1 + 7 and not missing     # page de garde + 7 pages
+    if HAS_CONVERTER:
+        assert n == 1 + 7 and not missing     # page de garde + 7 pages
+    else:                                     # .docx sans aperçu : signalés comme manquants, jamais d'erreur
+        assert n >= 1 and len(missing) <= 3
 
 
 def test_read_only_sources(indexed):

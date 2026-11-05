@@ -1,0 +1,60 @@
+name: Construire l'exécutable Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Dépendances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: Exécutable (PyInstaller)
+        run: pyinstaller --noconfirm fmsp_archives.spec
+
+      - name: Vérification rapide de l'exécutable (robot d'indexation)
+        shell: pwsh
+        run: |
+          python tools/generate_samples.py archives_demo
+          $env:FMSP_DATA_DIR = "$PWD\ci_data"
+          $p = Start-Process -FilePath "dist\FMSP_Archives\FMSP_Archives.exe" `
+               -ArgumentList "--index","--json","--source","archives_demo","--no-ocr" `
+               -RedirectStandardOutput ci_index.log -Wait -PassThru -NoNewWindow
+          Get-Content ci_index.log -Tail 3
+          if ($p.ExitCode -ne 0) { exit 1 }
+          if (-not (Select-String -Path ci_index.log -Pattern '"type": "done"' -Quiet)) { exit 1 }
+
+      - name: Archive zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\FMSP_Archives\tools | Out-Null
+          Copy-Item README.md dist\FMSP_Archives\LISEZMOI.md
+          Compress-Archive -Path dist\FMSP_Archives -DestinationPath FMSP_Archives_Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FMSP_Archives_Windows
+          path: FMSP_Archives_Windows.zip
+          retention-days: 30
+
+      - name: Publication (tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: FMSP_Archives_Windows.zip

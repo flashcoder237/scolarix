@@ -98,10 +98,18 @@ class Indexer:
         cache = cache_path_for(path, self.cache_dir)
         need_cache = self.s.preview_cache_enabled or kind == "DOC"
         if need_cache and converter.available:
-            if not cache.exists() or cache.stat().st_mtime < path.stat().st_mtime:
-                self.emit({"type": "stage", "stage": "conversion", "file": str(path), "backend": converter.backend()})
-                converter.convert(path, cache)
-            return pdf_pages_text(cache), kind, str(cache)
+            try:
+                if not cache.exists() or cache.stat().st_mtime < path.stat().st_mtime:
+                    self.emit({"type": "stage", "stage": "conversion", "file": str(path), "backend": converter.backend()})
+                    converter.convert(path, cache)
+                return pdf_pages_text(cache), kind, str(cache)
+            except ExtractionError as exc:
+                if kind != "DOCX" or "mot de passe" in str(exc):
+                    raise
+                # .docx : on peut encore le lire directement (sans aperçu) plutôt que de l'abandonner
+                self.db.add_anomaly("AVERTISSEMENT", str(path), f"{exc} Lecture directe du .docx, aperçu indisponible.",
+                                    "Vérifier Word / LibreOffice")
+                return docx_pages_text(path), kind, None
         if kind == "DOCX":
             if need_cache:
                 self.db.add_anomaly("INFO", str(path),
