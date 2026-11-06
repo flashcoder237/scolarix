@@ -10,13 +10,13 @@ from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, QThreadPool, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
                                QLabel, QPushButton, QScrollArea, QSplitter, QStackedWidget, QTableView, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from core import pdf_tools
 from core.config import Settings
-from core.database import Database, Releve
+from core.database import Database, Releve, missing_periods
 from core.printer_service import print_pdf
 
 from .cursus_dialog import CursusDialog
@@ -44,7 +44,7 @@ def greeting() -> str:
 class GuichetPage(QWidget):
     open_settings = Signal()
 
-    def __init__(self, db: Database, settings: Settings, parent=None):
+    def __init__(self, db: Database, settings: Settings, previews=None, parent=None):
         super().__init__(parent)
         self.setObjectName("page")
         self.db, self.s = db, settings
@@ -160,15 +160,17 @@ class GuichetPage(QWidget):
         hh = self.table.horizontalHeader()
         hh.setHighlightSections(False)
         hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        for i, w in enumerate((96, 0, 150, 140, 118, 64)):
+        for i, w in enumerate((92, 0, 138, 108, 112, 56)):
             if w:
                 hh.resizeSection(i, w)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setMinimumSectionSize(48)
+        self.table.horizontalHeader().setStretchLastSection(False)
         self.table.selectionModel().currentRowChanged.connect(lambda cur, _prev: self.on_row(cur.row()))
         self.table.setAccessibleName("Résultats de recherche")
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["MATRICULE / NIVEAU", "NOM & PRÉNOM", "ANNÉE · SESSION", "STATUT", "PAGES"])
+        self.tree.setHeaderLabels(["MATRICULE / NIVEAU", "NOM & PRÉNOM", "ANNÉE · MOYENNE", "STATUT", "PAGES"])
         self.tree.setAlternatingRowColors(False)
         self.tree.setUniformRowHeights(False)
         self.tree.currentItemChanged.connect(self.on_tree_item)
@@ -187,23 +189,29 @@ class GuichetPage(QWidget):
         split.addWidget(results)
 
         self.preview = PreviewPanel()
+        self.previews = previews
+        self.preview.previews = previews
+        self.preview.rules_active = settings.text_rules_enabled and any(r.get("actif", True) for r in settings.text_rules)
         self.preview.print_requested.connect(self.print_current)
         self.preview.export_requested.connect(self.export_current)
         self.preview.cursus_requested.connect(self.open_cursus)
         self.preview.open_location_requested.connect(self.open_location)
+        self.preview.releve_updated.connect(self._on_releve_updated)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # pas de défilement horizontal
         holder = QWidget()
         holder.setObjectName("page")
         hl = QVBoxLayout(holder)
         hl.setContentsMargins(0, 0, 6, 0)
         hl.addWidget(self.preview)
+        self.preview.setMinimumWidth(420)
         scroll.setWidget(holder)
         split.addWidget(scroll)
         split.setStretchFactor(0, 55)
         split.setStretchFactor(1, 45)
-        split.setSizes([550, 450])
+        split.setSizes([580, 420])
         root.addWidget(split, 1)
 
         self.refresh_header()
@@ -296,17 +304,20 @@ class GuichetPage(QWidget):
         bold.setWeight(QFont.Weight.DemiBold)
         for mat, rels in groups.items():
             rels = sorted(rels, key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or ""))
-            nums = {r.niveau_num for r in rels if 0 < r.niveau_num < 100}
-            missing = [n for n in range(1, max(nums) + 1) if n not in nums] if nums else []
+            dossier = self.db.cursus(mat)          # tout le dossier, pas seulement les relevés trouvés
+            missing = missing_periods(dossier)
+            n_ok = sum(1 for r in dossier if r.is_success)
+            latest = max(dossier or rels, key=lambda r: (r.annee_academique or "", r.niveau_num, r.semestre or 0))
             cover = " ".join(dict.fromkeys(
                 (f"S{r.semestre}" if r.semestre else
                  (f"N{r.niveau_num}" if 0 < r.niveau_num < 100 else (r.niveau or "?").replace("Master ", "M")))
                 for r in rels))
-            top = QTreeWidgetItem([mat, rels[0].nom_complet, f"{len(rels)} relevé(s) · {cover}",
-                                   ("N" + ", N".join(map(str, missing)) + " manquant") if missing else "Complet", ""])
+            etat = (", ".join(missing) + " manquant" + ("s" if len(missing) > 1 else "")) if missing else \
+                f"Tous présents · {n_ok}/{len(dossier)} validé(s)"
+            top = QTreeWidgetItem([mat, latest.nom_complet, f"{len(rels)} relevé(s) · {cover}", etat, ""])
             top.setFont(0, bold)
             top.setFont(1, bold)
-            top.setForeground(3, QColor(TONES["red" if missing else "green"][0]))
+            top.setForeground(3, QColor(TONES["red" if missing else ("green" if n_ok == len(dossier) else "amber")][0]))
             top.setData(0, Qt.ItemDataRole.UserRole, rels[0].id)
             for r in rels:
                 child = QTreeWidgetItem([r.periode, ", ".join(r.flags) or "", f"{r.annee_academique} · moy. {r.moyenne or '—'}",
@@ -354,10 +365,37 @@ class GuichetPage(QWidget):
             self.db.log("CONSULTATION", self.s.operateur, self.s.poste, rel.id, rel.matricule,
                         f"{rel.periode} · {rel.annee_academique} · {rel.statut or '?'} · {rel.pages_label}")
 
+    def _on_releve_updated(self, rel: Releve) -> None:
+        """Aperçu Word produit : les numéros de page exacts remplacent l'estimation dans la liste."""
+        for i, r in enumerate(self.model.rows):
+            if r.id == rel.id:
+                rel.flags, rel.score = r.flags, r.score
+                self.model.rows[i] = rel
+        for i, r in enumerate(self.results):
+            if r.id == rel.id:
+                self.results[i] = rel
+
     # ------------------------------------------------------------ actions
     @property
     def current(self) -> Releve | None:
         return self.preview.rel
+
+    def _ready(self, rel: Releve) -> Releve | None:
+        """Relevé prêt à imprimer : aperçu Word produit au besoin (normalement déjà fait à l'affichage)."""
+        if self.previews is not None and self.previews.needs_render(rel):
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                rel = self.previews.ensure(rel)
+                self.preview.rel = rel
+            except Exception as exc:
+                self.preview.toast.show_message(f"Aperçu Word impossible : {exc}", "red")
+                return None
+            finally:
+                QApplication.restoreOverrideCursor()
+        return rel if self._source_ok(rel) else None
+
+    def _trace(self, rel: Releve) -> str:
+        return " · en-tête corrigé" if rel.is_word and self.preview.rules_active else ""
 
     def _source_ok(self, rel: Releve) -> bool:
         if not rel.preview_pdf or not Path(rel.preview_pdf).exists():
@@ -367,8 +405,8 @@ class GuichetPage(QWidget):
         return True
 
     def print_current(self) -> None:
-        rel = self.current
-        if not rel or not self._source_ok(rel):
+        rel = self.current and self._ready(self.current)
+        if not rel:
             return
         dup = self.preview.duplicata
         tmp = pdf_tools.extract_pages(rel.preview_pdf, rel.numero_page, rel.page_fin,
@@ -378,7 +416,8 @@ class GuichetPage(QWidget):
 
         def ok(how):
             self.db.log("DUPLICATA" if dup else "IMPRESSION", self.s.operateur, self.s.poste, rel.id, rel.matricule,
-                        f"{rel.periode} · {rel.annee_academique} · {rel.pages_label}" + (" · recto-verso" if rel.nb_pages > 1 else ""))
+                        f"{rel.periode} · {rel.annee_academique} · {rel.pages_label}" + (" · recto-verso" if rel.nb_pages > 1 else "")
+                        + self._trace(rel))
             self.preview.toast.show_message(
                 f"Envoyé à l'imprimante — {rel.pages_label}" + (" · timbre Duplicata apposé" if dup else "")
                 + " · impression journalisée")
@@ -394,8 +433,8 @@ class GuichetPage(QWidget):
         QThreadPool.globalInstance().start(task)
 
     def export_current(self) -> None:
-        rel = self.current
-        if not rel or not self._source_ok(rel):
+        rel = self.current and self._ready(self.current)
+        if not rel:
             return
         dup = self.preview.duplicata
         dest = self.s.export_dir() / pdf_tools.export_filename(rel, "_DUPLICATA" if dup else "")
@@ -406,13 +445,13 @@ class GuichetPage(QWidget):
             self.preview.toast.show_message(f"Export impossible : {exc}", "red")
             return
         self.db.log("EXPORT PDF", self.s.operateur, self.s.poste, rel.id, rel.matricule,
-                    dest.name + (" · DUPLICATA" if dup else ""))
+                    dest.name + (" · DUPLICATA" if dup else "") + self._trace(rel))
         self.preview.toast.show_message(f"Exporté : {dest}")
 
     def open_cursus(self) -> None:
         rel = self.current
         if rel:
-            CursusDialog(self.db, self.s, rel.matricule, self).exec()
+            CursusDialog(self.db, self.s, rel.matricule, self, previews=self.previews).exec()
             self.refresh_stats()
 
     def open_location(self) -> None:

@@ -10,6 +10,8 @@ from PySide6.QtWidgets import QApplication
 
 from core.config import APP_NAME, load_settings
 from core.database import Database
+from core.pdf_tools import purge_temp
+from core.preview import PreviewService
 
 from .main_window import MainWindow
 
@@ -38,11 +40,21 @@ def run_gui(argv: list[str]) -> int:
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("FMSP - Université de Douala")
     app.setFont(_font())
+    ico = resource_path("assets", "scolarix.ico")
+    if not ico.exists():
+        ico = resource_path("assets", "scolarix_256.png")
+    if ico.exists():
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(ico)))
+    purge_temp()
+    import atexit
+    atexit.register(purge_temp)
     qss = resource_path("ui", "theme_fmsp.qss")
     if qss.exists():
         app.setStyleSheet(qss.read_text(encoding="utf-8"))
     settings = load_settings()
-    db = Database(settings.resolved_db_path())
-    win = MainWindow(db, settings)
+    db = Database(settings.resolved_db_path(), cache_dir=settings.resolved_cache_dir())
+    previews = PreviewService(db, settings)
+    win = MainWindow(db, settings, previews)
     win.show()
     return app.exec()

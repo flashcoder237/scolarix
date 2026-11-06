@@ -1,4 +1,4 @@
-name: Construire l'exécutable Windows
+name: Construire Scolarix pour Windows (exécutable + installateur)
 
 on:
   push:
@@ -31,33 +31,56 @@ jobs:
       - name: Exécutable (PyInstaller)
         run: pyinstaller --noconfirm fmsp_archives.spec
 
-      - name: Vérification rapide de l'exécutable (robot d'indexation)
+      - name: Vérification rapide de l'exécutable (robot parallèle + exclusions)
         shell: pwsh
         run: |
           python tools/generate_samples.py archives_demo
+          New-Item -ItemType Directory -Force archives_demo\DIPLOMES | Out-Null
+          Copy-Item (Get-ChildItem archives_demo -Filter *.pdf -Recurse | Select-Object -First 1).FullName archives_demo\DIPLOMES\a_ignorer.pdf
           $env:FMSP_DATA_DIR = "$PWD\ci_data"
-          $p = Start-Process -FilePath "dist\FMSP_Archives\FMSP_Archives.exe" `
-               -ArgumentList "--index","--json","--source","archives_demo","--no-ocr" `
+          $p = Start-Process -FilePath "dist\Scolarix\Scolarix.exe" `
+               -ArgumentList "--index","--json","--source","archives_demo","--no-ocr","--workers","2","--exclude","DIPLOMES" `
                -RedirectStandardOutput ci_index.log -Wait -PassThru -NoNewWindow
           Get-Content ci_index.log -Tail 3
           if ($p.ExitCode -ne 0) { exit 1 }
           if (-not (Select-String -Path ci_index.log -Pattern '"type": "done"' -Quiet)) { exit 1 }
+          if (-not (Select-String -Path ci_index.log -Pattern '"workers": 2' -Quiet)) { exit 1 }
+          if (Select-String -Path ci_index.log -Pattern 'a_ignorer' -Quiet) { Write-Error "exclusion ignorée"; exit 1 }
+          Start-Sleep -Seconds 3
+          $left = Get-Process -Name Scolarix -ErrorAction SilentlyContinue
+          if ($left) { Write-Error "processus de lecture restés ouverts"; exit 1 }
 
-      - name: Archive zip
+      - name: Installateur (Inno Setup)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist\FMSP_Archives\tools | Out-Null
-          Copy-Item README.md dist\FMSP_Archives\LISEZMOI.md
-          Compress-Archive -Path dist\FMSP_Archives -DestinationPath FMSP_Archives_Windows.zip
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /DAppVersion=1.1.0 installer\scolarix.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem Output
+
+      - name: Archive zip (version portable)
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist\Scolarix\LISEZMOI.md
+          Compress-Archive -Path dist\Scolarix -DestinationPath Scolarix_Portable_Windows.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: FMSP_Archives_Windows
-          path: FMSP_Archives_Windows.zip
+          name: Scolarix_Installateur_Windows
+          path: Output/Scolarix_Setup_*.exe
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Scolarix_Portable_Windows
+          path: Scolarix_Portable_Windows.zip
           retention-days: 30
 
       - name: Publication (tag v*)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: FMSP_Archives_Windows.zip
+          files: |
+            Output/Scolarix_Setup_*.exe
+            Scolarix_Portable_Windows.zip

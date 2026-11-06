@@ -5,7 +5,7 @@ import os
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QMargins, QPointF, Qt, Signal
+from PySide6.QtCore import QMargins, QPointF, QThreadPool, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -16,7 +16,7 @@ from core import pdf_tools
 from core.database import Releve
 
 from .icons import icon
-from .widgets import (Alert, Badge, Card, IconChip, Segmented, Switch, Toast, eyebrow, mono_font, muted,
+from .widgets import (Alert, Badge, Card, IconChip, Segmented, Switch, Task, Toast, eyebrow, mono_font, muted,
                       statut_tone, title)
 
 
@@ -102,6 +102,7 @@ class PdfViewer(QFrame):
 class PreviewPanel(QWidget):
     print_requested = Signal()
     export_requested = Signal()
+    releve_updated = Signal(object)
     cursus_requested = Signal()
     open_location_requested = Signal()
 
@@ -110,6 +111,9 @@ class PreviewPanel(QWidget):
         self.rel: Releve | None = None
         self._page = 0
         self._stamped: str | None = None
+        self.previews = None          # core.preview.PreviewService (aperçu Word produit à la demande)
+        self.rules_active = False     # corrections de texte des relevés Word
+        self._rendering: int | None = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(14)
@@ -130,6 +134,9 @@ class PreviewPanel(QWidget):
         self.recap.lay.addLayout(head)
         grid = QGridLayout()
         grid.setSpacing(8)
+        self._grid = grid
+        self._tile_frames: list[QFrame] = []
+        self._grid_cols = 4
         self.tiles = {}
         for i, (key, label) in enumerate((("mat", "Matricule"), ("niv", "Année · niveau"), ("ses", "Semestre"),
                                           ("pages", "À imprimer"))):
@@ -149,6 +156,7 @@ class PreviewPanel(QWidget):
                 val.setFont(f)
             tl.addWidget(val)
             self.tiles[key] = val
+            self._tile_frames.append(tile)
             grid.addWidget(tile, 0, i)
         self.recap.lay.addLayout(grid)
         self.alerts = QVBoxLayout()
@@ -229,6 +237,17 @@ class PreviewPanel(QWidget):
         lay.addWidget(actions)
         self.set_enabled(False)
 
+    def resizeEvent(self, event):
+        # Écran étroit (1366×768) : les 4 tuiles passent sur 2 lignes au lieu d'être coupées.
+        cols = 2 if self.width() < 640 else 4
+        if cols != self._grid_cols:
+            self._grid_cols = cols
+            for t in self._tile_frames:
+                self._grid.removeWidget(t)
+            for i, t in enumerate(self._tile_frames):
+                self._grid.addWidget(t, i // cols, i % cols)
+        super().resizeEvent(event)
+
     # ----------------------------------------------------------------
     @property
     def duplicata(self) -> bool:
@@ -240,7 +259,9 @@ class PreviewPanel(QWidget):
 
     def clear(self) -> None:
         self.rel = None
+        self._drop_stamped()
         self.name.setText("Aucun relevé sélectionné")
+        self.details.setText("")
         self.statut.hide()
         for v in self.tiles.values():
             v.setText("—")
@@ -276,10 +297,14 @@ class PreviewPanel(QWidget):
             bits.append(f"Moyenne {rel.moyenne}/20")
         if rel.grade:
             bits.append(f"grade {rel.grade}" + (f" (MGP {rel.mgp})" if rel.mgp else ""))
-        if rel.decision:
+        if rel.decision_deduite:
+            bits.append(f"décision déduite : {rel.decision}")
+        elif rel.decision:
             bits.append(f"décision : « {rel.decision} »")
-        if rel.date_naissance:
-            bits.append(f"né(e) le {rel.date_naissance}" + (f" à {rel.lieu_naissance}" if rel.lieu_naissance else ""))
+        if rel.date_connue:
+            bits.append(f"né(e) le {rel.date_connue}" + (f" à {rel.lieu_naissance}" if rel.lieu_naissance else ""))
+        elif rel.date_naissance:
+            bits.append("date de naissance non renseignée sur le relevé")
         self.details.setText(" · ".join(bits))
         self.tiles["pages"].setText(rel.pages_label + (" liées" if rel.nb_pages > 1 else ""))
         self._clear_alerts()
@@ -289,7 +314,50 @@ class PreviewPanel(QWidget):
         self.source.setToolTip(rel.chemin)
         self._rebuild_pages(rel.nb_pages)
         self.set_enabled(True)
-        self._refresh_view()
+        if self.previews is not None and self.previews.needs_render(rel):
+            self._render_async(rel)
+        else:
+            self._refresh_view()
+
+    def _render_async(self, rel: Releve) -> None:
+        """Première consultation d'un relevé Word : le PDF d'aperçu est produit en arrière-plan."""
+        self.btn_print.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.viewer.show_message("Préparation de l'aperçu Word… (première consultation de ce fichier, "
+                                 "quelques secondes)")
+        self._rendering = rel.id
+        task = Task(self.previews.ensure, rel)
+
+        def done(new_rel):
+            if self.rel is None or self.rel.id != new_rel.id:
+                return   # l'agent est passé à un autre relevé entre-temps
+            self.rel = new_rel
+            self.tiles["pages"].setText(new_rel.pages_label + (" liées" if new_rel.nb_pages > 1 else ""))
+            self._rebuild_pages(new_rel.nb_pages)
+            self.set_enabled(True)
+            self._refresh_view()
+            self.releve_updated.emit(new_rel)
+
+        def failed(err):
+            if self.rel is None or self.rel.id != rel.id:
+                return
+            self.viewer.show_message(f"Aperçu indisponible : {err}")
+            self.alerts.addWidget(Alert(f"Aperçu Word impossible : {err}", "red"))
+            self.btn_print.setEnabled(False)
+            self.btn_export.setEnabled(False)
+
+        task.signals.done.connect(done)
+        task.signals.failed.connect(failed)
+        QThreadPool.globalInstance().start(task)
+
+    def _drop_stamped(self) -> None:
+        if self._stamped:
+            self.viewer.forget(self._stamped)
+            try:
+                os.unlink(self._stamped)
+            except OSError:
+                pass
+            self._stamped = None
 
     def _alerts(self, rel: Releve, siblings: list[Releve]) -> list[tuple[str, str]]:
         out = []
@@ -323,9 +391,17 @@ class PreviewPanel(QWidget):
             conf = f" (confiance {rel.ocr_confiance:.0f} %)" if rel.ocr_confiance is not None else ""
             tone = "amber" if (rel.ocr_confiance or 100) < 70 else "blue"
             out.append((f"Texte issu de l'OCR{conf} : contrôlez le matricule sur l'image avant impression.", tone))
-        if not rel.preview_pdf:
-            out.append(("Aperçu indisponible (aucun convertisseur Word → PDF). Installez Word ou LibreOffice puis réindexez.",
-                        "blue"))
+        if rel.decision_deduite:
+            out.append(("Ancien format (2012-2014) : aucune décision semestrielle n'est imprimée sur ce relevé ; "
+                        "le statut est déduit de la colonne JURY des UE. Vérifiez sur l'aperçu.", "blue"))
+        if rel.date_naissance and not rel.date_connue:
+            out.append((f"Date de naissance fictive sur le relevé ({rel.date_naissance}) : à faire corriger "
+                        "par la scolarité avant délivrance.", "amber"))
+        if rel.is_word and self.rules_active:
+            out.append(("En-tête corrigé à l'aperçu et à l'impression (règles de Réglages › Corrections). "
+                        "Le fichier d'origine n'est pas modifié.", "blue"))
+        if not rel.preview_pdf and not rel.is_word:
+            out.append(("Aperçu indisponible : fichier source introuvable.", "blue"))
         if not out:
             out.append(("Document prêt — aucune anomalie détectée.", "green"))
         return out
@@ -352,13 +428,10 @@ class PreviewPanel(QWidget):
         if rel is None:
             return
         src = rel.preview_pdf
+        if self.previews is not None and self.previews.needs_render(rel):
+            return   # aperçu en préparation
         if self.duplicata and src and Path(src).exists():
-            if self._stamped:
-                self.viewer.forget(self._stamped)
-                try:
-                    os.unlink(self._stamped)
-                except OSError:
-                    pass
+            self._drop_stamped()
             self._stamped = str(pdf_tools.extract_pages(src, rel.numero_page, rel.page_fin,
                                                         stamp=pdf_tools.stamp_text()))
             self.viewer.show_page(self._stamped, self._page)

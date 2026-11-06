@@ -183,6 +183,16 @@ class VerificationPage(QWidget):
     def _choose(self) -> None:
         rid = self.choice.currentData()
         self.original = self.db.get(rid) if rid else None
+        previews = getattr(self, "previews", None)
+        if self.original and previews is not None and previews.needs_render(self.original):
+            from PySide6.QtWidgets import QApplication
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.original = previews.ensure(self.original)
+            except Exception as exc:
+                self.toast.show_message(f"Aperçu Word impossible : {exc}", "red")
+            finally:
+                QApplication.restoreOverrideCursor()
         if self.original:
             self.orig_viewer.show_page(self.original.preview_pdf, self.original.numero_page - 1)
             self.compare()

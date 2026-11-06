@@ -17,6 +17,29 @@ from .database import Releve
 from .normalize import norm_text
 
 
+TEMP_DIR = Path(tempfile.gettempdir()) / "scolarix_tmp"
+
+
+def temp_pdf(prefix: str = "releve_") -> Path:
+    """Fichier temporaire dans un dossier dédié, vidé au démarrage et à la fermeture (données personnelles)."""
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    fd = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".pdf", delete=False, dir=TEMP_DIR)
+    fd.close()
+    return Path(fd.name)
+
+
+def purge_temp() -> int:
+    n = 0
+    if TEMP_DIR.exists():
+        for f in TEMP_DIR.glob("*.pdf"):
+            try:
+                f.unlink()
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
 def export_filename(rel: Releve, suffix: str = "") -> str:
     nom = re.sub(r"[^A-Z0-9]", "", (norm_text(rel.nom or rel.nom_complet).split() or ["ETUDIANT"])[0])
     annee = (rel.annee_academique or "").split("-")[-1] or "NA"
@@ -42,6 +65,7 @@ def _stamp_page(width: float, height: float, title: str, subtitle: str):
     c.setLineWidth(3)
     c.roundRect(-tw / 2 - 18, -size * 1.15, tw + 36, size * 2.35, 10, stroke=1, fill=0)
     c.drawCentredString(0, size * 0.35, title)
+    c.setFillColor(Color(0.72, 0.11, 0.11, alpha=0.75))   # sous-titre horodaté lisible sur le filigrane
     c.setFont("Helvetica-Bold", size * 0.36)
     c.drawCentredString(0, -size * 0.65, subtitle)
     c.restoreState()
@@ -66,15 +90,14 @@ def extract_pages(src_pdf: str | Path, first: int, last: int, dest: str | Path |
             w, h = float(page.mediabox.width), float(page.mediabox.height)
             page.merge_page(_stamp_page(w, h, *stamp))
     if dest is None:
-        fd = tempfile.NamedTemporaryFile(prefix="fmsp_", suffix=".pdf", delete=False)
-        fd.close()
-        dest = fd.name
+        dest = temp_pdf()
     with open(dest, "wb") as fh:
         writer.write(fh)
     return Path(dest)
 
 
-def _cover_page(rels: list[Releve], title: str) -> PdfReader:
+def _cover_page(rels: list[Releve], title: str, page_labels: list[str] | None = None,
+                absent: list[str] | None = None) -> PdfReader:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     w, h = A4
@@ -82,14 +105,22 @@ def _cover_page(rels: list[Releve], title: str) -> PdfReader:
     c.drawString(50, h - 60, "UNIVERSITÉ DE DOUALA — FACULTÉ DE MÉDECINE ET DES SCIENCES PHARMACEUTIQUES")
     c.setFont("Helvetica-Bold", 18)
     c.drawString(50, h - 100, title)
-    first = rels[0]
+    # Nom de l'étudiant : celui du relevé le plus récent (les anciens fichiers ont parfois des noms collés)
+    latest = max(rels, key=lambda r: (r.annee_academique or "", r.niveau_num, r.semestre or 0, r.id))
     c.setFont("Helvetica", 11)
-    c.drawString(50, h - 128, f"{first.nom_complet}   ·   matricule(s) : {', '.join(sorted({r.matricule for r in rels}))}")
+    c.drawString(50, h - 128, f"{latest.nom_complet}   ·   matricule(s) : {', '.join(sorted({r.matricule for r in rels}))}")
     c.drawString(50, h - 146, f"Édité le {datetime.now():%d/%m/%Y à %H:%M} par la Cellule Informatique")
-    y = h - 190
+    y = h - 172
+    if absent:
+        c.setFillColor(Color(0.72, 0.11, 0.11))
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(50, y, f"Dossier incomplet — période(s) non trouvée(s) dans les archives : {', '.join(absent)}"[:110])
+        c.setFillColor(Color(0, 0, 0))
+        y -= 18
+    y -= 14
     c.setFont("Helvetica-Bold", 10)
-    for x, label in ((50, "#"), (72, "Niveau · semestre"), (180, "Année"), (250, "Moyenne"), (310, "Crédits"),
-                     (360, "Décision du jury"), (500, "Pages")):
+    for x, label in ((50, "#"), (72, "Niveau · semestre"), (200, "Année"), (262, "Moyenne"), (318, "Crédits"),
+                     (364, "Décision du jury"), (505, "Pages")):
         c.drawString(x, y, label)
     c.setFont("Helvetica", 9.5)
     for i, r in enumerate(rels, start=1):
@@ -99,12 +130,13 @@ def _cover_page(rels: list[Releve], title: str) -> PdfReader:
             y = h - 60
             c.setFont("Helvetica", 9.5)
         c.drawString(50, y, str(i))
-        c.drawString(72, y, r.periode)
-        c.drawString(180, y, r.annee_academique or "?")
-        c.drawString(250, y, r.moyenne or "—")
-        c.drawString(310, y, str(r.credits) if r.credits is not None else "—")
-        c.drawString(360, y, (r.decision or r.statut or "?")[:26])
-        c.drawString(500, y, r.pages_label.replace("Pages ", "p. ").replace("Page ", "p. "))
+        c.drawString(72, y, r.periode[:24])
+        c.drawString(200, y, r.annee_academique or "?")
+        c.drawString(262, y, r.moyenne or "—")
+        c.drawString(318, y, str(r.credits) if r.credits is not None else "—")
+        c.drawString(364, y, (r.decision or r.statut or "?")[:26])
+        label = page_labels[i - 1] if page_labels else ""
+        c.drawString(505, y, label)
     c.showPage()
     c.save()
     buf.seek(0)
@@ -112,20 +144,40 @@ def _cover_page(rels: list[Releve], title: str) -> PdfReader:
 
 
 def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
-                  stamp: tuple[str, str] | None = None, title: str = "Cursus académique") -> tuple[Path, int, list[str]]:
-    """Fusionne plusieurs relevés (dans l'ordre donné) en un seul PDF. Renvoie (chemin, nb pages, manquants)."""
-    writer = PdfWriter()
+                  stamp: tuple[str, str] | None = None, title: str = "Cursus académique",
+                  prepare=None, absent: list[str] | None = None) -> tuple[Path, int, list[str]]:
+    """Fusionne plusieurs relevés (dans l'ordre donné) en un seul PDF. Renvoie (chemin, nb pages, manquants).
+
+    ``prepare(rel) -> rel`` produit au besoin l'aperçu PDF d'un relevé Word (voir core/preview.py).
+    ``absent`` : périodes attendues mais introuvables, signalées sur la page de garde."""
     missing: list[str] = []
-    if cover and rels:
-        writer.add_page(_cover_page(rels, title).pages[0])
+    chunks: list[tuple[Releve, PdfReader, range]] = []
     readers: dict[str, PdfReader] = {}
     for r in rels:
+        if prepare is not None:
+            try:
+                r = prepare(r)
+            except Exception:
+                missing.append(f"{r.periode} {r.annee_academique or ''}".strip())
+                continue
         src = r.preview_pdf
         if not src or not Path(src).exists():
-            missing.append(f"{r.periode} {r.annee_academique}")
+            missing.append(f"{r.periode} {r.annee_academique or ''}".strip())
             continue
         reader = readers.setdefault(src, PdfReader(src))
-        for i in range(r.numero_page - 1, min(r.page_fin, len(reader.pages))):
+        chunks.append((r, reader, range(r.numero_page - 1, min(r.page_fin, len(reader.pages)))))
+    writer = PdfWriter()
+    kept = [c[0] for c in chunks]
+    if cover and kept:
+        n_cover = len(_cover_page(kept, title, None, absent).pages)
+        labels, pos = [], n_cover + 1
+        for _, _, pages in chunks:
+            labels.append(f"p. {pos}" if len(pages) == 1 else f"p. {pos}–{pos + len(pages) - 1}")
+            pos += len(pages)
+        for page in _cover_page(kept, title, labels, (absent or []) + missing).pages:
+            writer.add_page(page)
+    for _, reader, pages in chunks:
+        for i in pages:
             page = writer.add_page(reader.pages[i])
             if stamp:
                 page.merge_page(_stamp_page(float(page.mediabox.width), float(page.mediabox.height), *stamp))

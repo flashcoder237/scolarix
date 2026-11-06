@@ -74,12 +74,20 @@ PATTERNS = {
     "annee_label": re.compile(r"ANN[ÉE]E\s*ACAD[ÉE]MIQUE\s*:?\s*((?:19|20)\d{2})\s*[-/–]\s*((?:19|20)\d{2})", re.I),
     "annee": re.compile(r"\b((?:19|20)\d{2})\s*[-/–]\s*((?:19|20)\d{2})\b"),
     "session": re.compile(r"session\s*(?:de\s*)?(normale|ordinaire|rattrapage|de\s*rattrapage|sp[ée]ciale)", re.I),
-    # Ligne récapitulative : niveau semestre crédits moyenne [mgp] grade décision
-    "recap": re.compile(r"^\s*(\d{1,2})\s+(\d{1,2})\s+(\d{1,3})\s+(\d{1,2}[,.]\d{1,3})\s+(?:(\d[,.]\d{1,2})\s+)?"
-                        r"([A-F][+-]?)\s+([A-ZÀ-ÿ][A-ZÀ-ÿ '\-]{2,60}?)\s*$", re.M),
+    # Ligne récapitulative : niveau [semestre] crédits moyenne [MGP] grade [MGP] décision
+    #   semestriel : « 1 1 30 10,99 2,0 C SEMESTRE VALIDE »
+    #   annuel     : « 7 60 19,00 A+ 4,0 SEMESTRES VALIDES » ou « 7 60 18.40 4.0 A+ SEMESTRES VALIDES »
+    # La case « total crédits » est parfois vide sur le relevé : elle est donc facultative.
+    "recap": re.compile(r"^\s*(?P<niv>\d{1,2})\s+(?:(?P<sem>\d{1,2})\s+)?(?:(?P<cred>\d{1,3})\s+)?"
+                        r"(?P<moy>\d{1,2}[,.]\d{1,3})\s+(?:(?P<mgp1>\d[,.]\d{1,2})\s+)?(?P<grade>[A-F]\s?[+-]?)\s+"
+                        r"(?:(?P<mgp2>\d[,.]\d{1,2})\s+)?(?P<dec>[A-ZÀ-ÿ][A-ZÀ-ÿ '\-]{2,60}?)\s*$", re.M),
+    "annuel": re.compile(r"ANNUEL|MOYENNE\s+ANNUELLE|TOTAL\s+CREDIT\s*/\s*60|SEMESTRES\s+VALID", re.I),
+    "option": re.compile(lab("OPTION") + r"\s*:\s*([A-ZÀ-ÿ][A-ZÀ-ÿ '\-]{1,40})", re.I),
     "decision": re.compile(r"d[ée]cision(?:\s*du\s*jury)?\s*[:：]\s*([A-Za-zÀ-ÿ ]{4,40})", re.I),
     "moyenne": re.compile(r"moyenne[^:\n]{0,30}[:：]\s*(\d{1,2}[,.]\d{1,3})", re.I),
-    "ue_jury": re.compile(r"\b(NON\s+VALID[EÉ]E?S?|VALID[EÉ]E?S?)\s*$", re.M | re.I),
+    # Colonne JURY de l'ancien format : « … GRADE CRÉDIT VALIDEE » (le texte d'une cellule voisine peut suivre)
+    "ue_jury": re.compile(r"(?:\b[A-F]\s?[+-]?|\b)\s+\d{1,2}\s+(NON\s+VALID[EÉ]E?S?|VALID[EÉ]E?S?)\b(?!\s+(?:VALID|SEMESTRE))"
+                          r"|(?<!SEMESTRE\s)(?<!SEMESTRES\s)\b(NON\s+VALID[EÉ]E?S?|VALID[EÉ]E?S?)\s*$", re.M | re.I),
     "entete": re.compile(r"relev[ée]\s*de\s*notes|bulletin\s*de\s*notes|transcript", re.I),
 }
 
@@ -147,11 +155,15 @@ def hints_from_path(path: str) -> PathHints:
     return h
 
 
+# Juste après le libellé « Matricule : », le texte d'une zone voisine peut être collé (« 98EM103Registration N° »).
+_LABELED_MAT_RE = re.compile(r"(\d{2})\s*[-/. ]?\s*([A-Za-z]{1,4})\s*[-/. ]?\s*(\d{2,4})(?!\d)(?=[A-Z][a-z])")
+
+
 def _labeled_matricules(text: str) -> list[tuple[str, str, int]]:
     """Matricules précédés du libellé « Matricule » : (normalisé, brut, position du libellé)."""
     out = []
     for lab_m in PATTERNS["matricule_label"].finditer(text):
-        m = MATRICULE_RE.match(text, lab_m.end())
+        m = MATRICULE_RE.match(text, lab_m.end()) or _LABELED_MAT_RE.match(text, lab_m.end())
         if m:
             mat = f"{m.group(1)}{m.group(2).upper()}{m.group(3)}"
             if not any(o[0] == mat for o in out):
@@ -297,12 +309,20 @@ def extract_recap(text: str) -> dict | None:
     """Ligne récapitulative du format récent (niveau, semestre, crédits, moyenne, MGP, grade, décision)."""
     candidates = list(PATTERNS["recap"].finditer(text))
     for m in reversed(candidates):  # la récapitulation est en bas du relevé
-        decision = re.sub(r"\s+", " ", m.group(7)).strip()
+        decision = re.sub(r"\s+", " ", m.group("dec")).strip()
         if not re.search(r"(?i)valid|admis|ajourn|exclu|abandon|report|redoubl|suspen|semestre", decision):
             continue
-        return {"niveau": int(m.group(1)), "semestre": int(m.group(2)), "credits": int(m.group(3)),
-                "moyenne": m.group(4).replace(".", ","), "mgp": (m.group(5) or "").replace(".", ",") or None,
-                "grade": m.group(6), "decision": decision}
+        niv, sem, cred = int(m.group("niv")), m.group("sem"), m.group("cred")
+        if cred is None and sem and int(sem) > 14:   # « 7 60 18,40 » : niveau, crédits, moyenne (relevé annuel)
+            sem, cred = None, sem
+        cred = int(cred) if cred is not None else None
+        if niv > 14 or (sem and int(sem) > 14) or (cred is not None and cred > 90):
+            continue
+        mgp = m.group("mgp1") or m.group("mgp2")
+        return {"niveau": niv, "semestre": int(sem) if sem else None, "credits": cred,
+                "moyenne": m.group("moy").replace(".", ","), "mgp": mgp.replace(".", ",") if mgp else None,
+                "grade": m.group("grade").replace(" ", ""), "decision": decision,
+                "annuel": sem is None and (cred is None or cred >= 45 or "SEMESTRES" in norm_text(decision))}
     return None
 
 
@@ -316,7 +336,7 @@ def detect_statut(text: str) -> tuple[str | None, str | None]:
         raw = re.sub(r"\s+", " ", m.group(1)).strip()
         return _statut_from(raw), raw
     # Ancien format : colonne JURY par UE (VALIDEE / NON VALIDEE)
-    jury = [norm_text(x) for x in PATTERNS["ue_jury"].findall(text)]
+    jury = [norm_text(a or b) for a, b in PATTERNS["ue_jury"].findall(text)]
     if jury:
         ko = sum(1 for j in jury if j.startswith("NON"))
         if ko:
@@ -350,7 +370,7 @@ def detect_filiere(text: str, matricule: str, hints: PathHints) -> tuple[str, st
 def detect_niveau(text: str, hints: PathHints, recap: dict | None) -> tuple[str | None, int | None]:
     """(libellé « Niveau 2 » / « Master 1 », numéro de semestre)."""
     sem = None
-    sem_from_hint = False
+    sem_from_hint = False  # noqa: F841 (conservé pour lisibilité)
     m = PATTERNS["semestre"].search(text)
     if m:
         sem = roman_or_int(m.group(1))
@@ -370,8 +390,8 @@ def detect_niveau(text: str, hints: PathHints, recap: dict | None) -> tuple[str 
                 if v and v <= 12:
                     sem = v
                     break
-    if sem is None and hints.semestre:
-        sem, sem_from_hint = hints.semestre, True
+    if sem is None and hints.semestre and not (recap and recap.get("annuel")):
+        sem = hints.semestre
     cycle = PATTERNS["cycle"].search(text)
     is_master = bool(cycle and norm_text(cycle.group(1)).startswith("MASTER"))
     n = None
@@ -396,8 +416,8 @@ def detect_niveau(text: str, hints: PathHints, recap: dict | None) -> tuple[str 
             n = (sem + 1) // 2
     if n is None:
         return None, sem
-    if sem_from_hint and sem <= 2 and n > 1:
-        # Nom de fichier « EM3_S2 » : 2e semestre du niveau 3 -> semestre 6 du cursus
+    if sem and sem <= 2 and n > 1:
+        # « NIVEAU: VI SEMESTRE: I » ou fichier « EM3_S2 » : semestre DANS l'année -> semestre du cursus
         sem = 2 * (n - 1) + sem
     return (f"Master {n}" if is_master else f"Niveau {n}"), sem
 
@@ -437,6 +457,13 @@ def parse_block(block: Block, hints: PathHints) -> tuple[dict, list[str]]:
     am = PATTERNS["annee_label"].search(text) or PATTERNS["annee"].search(text)
     annee = f"{am.group(1)}-{am.group(2)}" if am else hints.annee
     statut, decision = detect_statut(text)
+    annuel = bool(recap and recap.get("annuel")) or (semestre is None and bool(PATTERNS["annuel"].search(text)))
+    n_num = niveau_number(niveau)
+    semestre_fin = semestre
+    if annuel and 0 < n_num < 100:
+        semestre, semestre_fin = 2 * n_num - 1, 2 * n_num   # relevé annuel : couvre les 2 semestres
+    cycle_m = PATTERNS["cycle"].search(text)
+    option_m = PATTERNS["option"].search(text)
     moyenne = recap["moyenne"] if recap else None
     if not moyenne:
         mm = PATTERNS["moyenne"].search(text)
@@ -450,10 +477,14 @@ def parse_block(block: Block, hints: PathHints) -> tuple[dict, list[str]]:
     if not statut:
         warnings.append(f"{block.matricule} (page {block.page_debut}) : décision du jury non détectée.")
     n = niveau_number(niveau)
-    if semestre and 0 < n < 100 and not (2 * n - 1 <= semestre <= 2 * n):
+    if semestre and not annuel and 0 < n < 100 and not (2 * n - 1 <= semestre <= 2 * n):
         warnings.append(f"{block.matricule} (page {block.page_debut}) : niveau {n} incohérent avec le semestre "
                         f"{semestre} — à vérifier.")
-    if not (PATTERNS["naissance"].search(text)):
+    date_naissance = _date(nais.group(1)) if nais else None
+    if date_naissance and date_naissance.endswith("/1900"):
+        warnings.append(f"{block.matricule} (page {block.page_debut}) : date de naissance factice ({date_naissance}).")
+        date_naissance = None
+    elif not nais:
         warnings.append(f"{block.matricule} (page {block.page_debut}) : date de naissance illisible.")
     return {
         "matricule": block.matricule,
@@ -461,13 +492,16 @@ def parse_block(block: Block, hints: PathHints) -> tuple[dict, list[str]]:
         "nom": nom,
         "prenom": prenom,
         "nom_complet": full,
-        "date_naissance": _date(nais.group(1)) if nais else None,
+        "date_naissance": date_naissance,
         "lieu_naissance": _clean(lieu.group(1)) if lieu else None,
         "filiere": filiere,
         "filiere_code": code,
         "niveau": niveau,
         "niveau_num": niveau_number(niveau),
         "semestre": semestre,
+        "semestre_fin": semestre_fin,
+        "cycle": cycle_m.group(1).upper() if cycle_m else None,
+        "option_filiere": _clean(option_m.group(1)) if option_m else None,
         "annee_academique": annee,
         "session": detect_session(text, hints),
         "statut": statut,

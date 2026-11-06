@@ -15,8 +15,21 @@ import socket
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-APP_NAME = "Archives Relevés FMSP"
-APP_VERSION = "1.0.0"
+APP_NAME = "Scolarix"
+APP_SUBTITLE = "Archives des relevés de notes · FMSP"
+APP_VERSION = "1.1.0"
+
+# Corrections d'en-tête par défaut des relevés Word (modifiables dans Réglages).
+DEFAULT_TEXT_RULES = (
+    {"actif": True, "regex": True, "description": "Retirer l'ancien numéro de téléphone",
+     "chercher": r"Tel\s*:\s*33\s*01\s*41\s*39\s*/\s*33\s*01\s*41\s*29\s*[.,]?", "remplacer": ""},
+    {"actif": True, "regex": True, "description": "Ajouter « Ref N° » devant le titre",
+     "chercher": r"(?<!N° )RELEVE\s+DE\s+NOTES\s*/\s*TRANSCRIPT", "remplacer": "Ref N° RELEVE DE NOTES /TRANSCRIPT",
+     "taille": 8, "gras": False},
+    {"actif": True, "regex": True, "description": "Nouvelle référence des services",
+     "chercher": r"/?FMSP(?:/[A-Z]{2,8})+", "remplacer": " /FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE",
+     "taille": 7},
+)
 
 
 def data_dir() -> Path:
@@ -53,8 +66,16 @@ class Settings:
     ocr_preprocess: bool = True
     ocr_lang: str = "fra"
     word_com_enabled: bool = True
-    preview_cache_enabled: bool = True
+    preview_cache_enabled: bool = True     # aperçu PDF des fichiers Word (produit à la première consultation)
+    docx_convert_at_index: bool = False    # préconvertir les .docx pendant l'indexation (aperçu immédiat, très lent)
     differential: bool = True
+    index_workers: int = 0                 # processus parallèles ; 0 = automatique (cœurs - 1, au plus 4)
+    # Dossiers (chemin absolu ou relatif à la racine) et motifs de noms (*DIPLOME*, Brouillons…) à ignorer
+    exclusions: list = field(default_factory=list)
+    # Corrections de texte appliquées aux SEULS fichiers Word, sur une copie, à l'aperçu, à l'impression
+    # et à l'export (l'original n'est jamais modifié). Voir core/text_rules.py.
+    text_rules_enabled: bool = True
+    text_rules: list = field(default_factory=lambda: [dict(r) for r in DEFAULT_TEXT_RULES])
     # Outils externes (laisser vide = détection automatique)
     tesseract_cmd: str = ""
     soffice_cmd: str = ""

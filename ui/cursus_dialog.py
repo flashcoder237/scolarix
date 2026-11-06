@@ -1,7 +1,6 @@
 """Export / impression du cursus complet d'un étudiant (cas S1.4, S2.1, S2.2)."""
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QThreadPool, Qt
@@ -11,7 +10,7 @@ from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton
 
 from core import pdf_tools
 from core.config import Settings
-from core.database import Database, Releve
+from core.database import Database, Releve, missing_periods
 from core.normalize import norm_text
 from core.printer_service import print_pdf
 
@@ -19,9 +18,10 @@ from .widgets import TONES, Alert, Card, IconChip, Switch, Task, Toast, eyebrow,
 
 
 class CursusDialog(QDialog):
-    def __init__(self, db: Database, settings: Settings, matricule: str, parent=None):
+    def __init__(self, db: Database, settings: Settings, matricule: str, parent=None, previews=None):
         super().__init__(parent)
         self.db, self.s = db, settings
+        self.previews = previews
         self.setWindowTitle("Cursus complet")
         self.resize(820, 760)
         self.rels = db.cursus(matricule)
@@ -48,9 +48,12 @@ class CursusDialog(QDialog):
         if missing:
             card.lay.addWidget(Alert(f"Période(s) introuvable(s) dans l'index : {', '.join(missing)}. "
                                      "Le dossier fusionné sera incomplet.", "red"))
-        if any(not r.is_success for r in self.rels):
-            card.lay.addWidget(Alert("Les relevés non validés sont décochés lorsqu'un relevé validé existe pour le même "
-                                     "semestre (rattrapage ou redoublement).", "amber"))
+        excluded = [r for r in self.rels if r.id not in default]
+        if excluded:
+            card.lay.addWidget(Alert(f"{len(excluded)} relevé(s) non validé(s) décoché(s) : un relevé validé existe pour "
+                                     "le même semestre (rattrapage ou redoublement).", "amber"))
+        elif self.rels and not any(r.is_success for r in self.rels):
+            card.lay.addWidget(Alert("Aucun semestre validé dans ce dossier.", "amber"))
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Inclure", "Période", "Année", "Moyenne", "Décision", "Pages"])
@@ -135,13 +138,7 @@ class CursusDialog(QDialog):
         self.tree.addTopLevelItem(it)
 
     def _missing_levels(self) -> list[str]:
-        sems = {r.semestre for r in self.rels if r.semestre}
-        if sems:  # LMD : semestres attendus de S1 jusqu'au dernier semestre trouvé
-            return [f"S{n}" for n in range(1, max(sems) + 1) if n not in sems]
-        nums = {r.niveau_num for r in self.rels if 0 < r.niveau_num < 100}
-        if not nums:
-            return []
-        return [f"Niveau {n}" for n in range(1, max(nums) + 1) if n not in nums]
+        return missing_periods(self.rels)
 
     def _toggle_link(self, on: bool) -> None:
         if on and not self.extra:
@@ -186,7 +183,14 @@ class CursusDialog(QDialog):
 
     def _build(self, dest: Path) -> tuple[Path, int, list[str]]:
         stamp = pdf_tools.stamp_text() if self.sw_dup.isChecked() else None
-        return pdf_tools.merge_releves(self.selected(), dest, cover=self.sw_cover.isChecked(), stamp=stamp)
+        prepare = self.previews.ensure if self.previews is not None else None
+        from PySide6.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return pdf_tools.merge_releves(self.selected(), dest, cover=self.sw_cover.isChecked(), stamp=stamp,
+                                           prepare=prepare, absent=self._missing_levels())
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _log(self, action: str, detail: str) -> None:
         mat = self.rels[0].matricule if self.rels else None
@@ -204,7 +208,7 @@ class CursusDialog(QDialog):
         self.toast.show_message(f"Exporté : {path} ({n} pages){extra}")
 
     def print_(self) -> None:
-        tmp = Path(tempfile.gettempdir()) / self._filename()
+        tmp = pdf_tools.temp_pdf("cursus_")
         try:
             path, n, _ = self._build(tmp)
         except Exception as exc:

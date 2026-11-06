@@ -10,7 +10,7 @@ from core.normalize import norm_matricule, norm_text
 
 from .widgets import BLUE, INK, MUTED, TONES, flag_tone, mono_font, statut_tone
 
-COLUMNS = ["Matricule", "Nom & prénom", "Filière · niveau", "Année · session", "Statut", "Pages"]
+COLUMNS = ["Matricule", "Nom & prénom", "Filière · niveau", "Année · moyenne", "Statut", "Pages"]
 FIL_SHORT = {"M": "Médecine", "P": "Pharmacie", "B": "Biomédical", "MS": "Master", "D": "Doctorat"}
 ReleveRole = Qt.ItemDataRole.UserRole + 1
 
@@ -52,8 +52,8 @@ class ResultsModel(QAbstractTableModel):
                     r.annee_academique or "?", r.statut or "—", _pages(r)][c]
         if role == Qt.ItemDataRole.AccessibleTextRole:
             return f"{r.matricule} {r.nom_complet} {r.periode} {r.annee_academique} {r.statut}"
-        if role == Qt.ItemDataRole.ToolTipRole and c == 1 and r.flags:
-            return " · ".join(r.flags)
+        if role == Qt.ItemDataRole.ToolTipRole and c == 1:
+            return r.nom_complet + (("\n" + " · ".join(r.flags)) if r.flags else "")
         return None
 
     def releve_at(self, row: int) -> Releve | None:
@@ -74,7 +74,9 @@ def _ligne2(r: Releve) -> str:
         return "Session de rattrapage"
     if r.moyenne:
         return f"Moy. {r.moyenne}" + (f" · {r.grade}" if r.grade else "")
-    return f"Session {(r.session or 'normale').lower()}"
+    if r.session:
+        return f"Session {r.session.lower()}"
+    return ""   # rien d'inventé : l'ancien format n'indique ni moyenne ni session
 
 
 def _pages(r: Releve) -> str:
@@ -106,6 +108,7 @@ class RowDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
         p.save()
+        p.setClipRect(option.rect)   # aucun texte ne déborde sur la colonne voisine
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         # fond de ligne
         if selected:
@@ -140,11 +143,12 @@ class RowDelegate(QStyledItemDelegate):
             line = QRectF(inner.left(), inner.top() + 4, inner.width(), inner.height() / 2) if r.flags else inner
             idx, n = _highlight_span(nom, model.query_name.split(" ")[0] if model.query_name else "")
             x = self._draw_highlighted(p, line, nom.upper(), idx, n, f, QColor(INK))
-            if prenom:
+            if prenom and x + 5 < inner.right():
                 p.setFont(QFont(base))
                 p.setPen(QColor(INK))
-                p.drawText(QRectF(x + 5, line.top(), max(0.0, inner.right() - x - 5), line.height()),
-                           Qt.AlignmentFlag.AlignVCenter, prenom)
+                width = max(0.0, inner.right() - x - 5)
+                p.drawText(QRectF(x + 5, line.top(), width, line.height()), Qt.AlignmentFlag.AlignVCenter,
+                           QFontMetricsF(QFont(base)).elidedText(prenom, Qt.TextElideMode.ElideRight, width))
             if r.flags:
                 fx = inner.left()
                 cy = inner.top() + inner.height() * 0.74
@@ -156,7 +160,8 @@ class RowDelegate(QStyledItemDelegate):
         elif col == 2:
             p.setPen(QColor("#334155"))
             p.setFont(base)
-            p.drawText(inner, Qt.AlignmentFlag.AlignVCenter, index.data())
+            p.drawText(inner, Qt.AlignmentFlag.AlignVCenter,
+                       QFontMetricsF(base).elidedText(index.data(), Qt.TextElideMode.ElideRight, inner.width()))
         elif col == 3:
             p.setFont(base)
             p.setPen(QColor("#334155"))
@@ -180,6 +185,10 @@ class RowDelegate(QStyledItemDelegate):
         fm = QFontMetricsF(font)
         p.setFont(font)
         x = rect.left()
+        if fm.horizontalAdvance(text) > rect.width():   # nom trop long : « … » plutôt qu'un débordement
+            text = fm.elidedText(text, Qt.TextElideMode.ElideRight, rect.width())
+            if idx + n > len(text) - 1:
+                idx, n = -1, 0
         parts = [(text, False)] if idx < 0 or n <= 0 else [(text[:idx], False), (text[idx:idx + n], True), (text[idx + n:], False)]
         for chunk, hl in parts:
             if not chunk:

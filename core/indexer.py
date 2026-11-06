@@ -5,32 +5,48 @@ communique sa progression en lignes JSON sur la sortie standard. Avantages : l'i
 gèle jamais, un plantage de Word/COM n'emporte pas le guichet, et l'agent peut déjà rechercher
 les relevés indexés (SQLite WAL) pendant que le robot travaille.
 
-Chaque fichier est enregistré dans sa propre transaction : arrêter le robot ne laisse jamais
-la base dans un état incohérent, et un lancement « différentiel » reprend là où il s'était arrêté.
+Vitesse (10 000 fichiers et plus) :
+
+* **Processus parallèles** : la lecture et l'analyse des fichiers sont réparties sur plusieurs
+  processus (``ProcessPoolExecutor``). Chaque processus a sa propre instance de Word pour les
+  .doc. Le processus principal est le seul à écrire dans la base (SQLite n'accepte qu'un
+  écrivain à la fois) : chaque fichier y est enregistré dans sa propre transaction, si bien
+  qu'arrêter le robot ne laisse jamais la base incohérente.
+* **.docx lus directement** (python-docx) : pas de conversion Word → PDF pendant l'indexation.
+  Le PDF d'aperçu est produit plus tard, à la première consultation (voir ``core/preview.py``).
+* **Exploration rapide** : ``os.scandir`` (taille et date fournies par le listage du dossier,
+  sans appel supplémentaire sur un partage réseau) et élagage des sous-dossiers exclus.
+* **Différentiel** : les fichiers inchangés (même taille, même date) sont ignorés.
 
 Utilisable aussi en ligne de commande :
     python main.py --index --source "\\\\SRV-FMSP\\Archives" [--only-new] [--no-ocr]
+                   [--workers 4] [--exclude "*DIPLOME*" --exclude "Brouillons"]
     python main.py --check-integrity
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
+import fnmatch
 import json
 import os
 import sys
+import threading
 import time
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from .config import Settings, load_settings
 from .database import Database
 from .extractors import (MIN_TEXT_CHARS, ExtractionError, PageText, WordConverter, configure_tesseract,
-                         detect_type, docx_pages_text, file_signature, ocr_pdf_pages, pdf_pages_text)
+                         detect_type, docx_pages_text, ocr_pdf_pages, pdf_pages_text)
 from .parsing import parse_pages
+from .preview import cache_name_for, intermediate_docx, render_preview
 
 EXTENSIONS = {".pdf", ".doc", ".docx"}
+ALWAYS_SKIPPED = ("~$*", ".~lock*", "Thumbs.db", "desktop.ini")
 Emit = Callable[[dict], None]
 
 
@@ -41,166 +57,454 @@ class Counters:
     blocs: int = 0
     ecrits: int = 0
     ignores: int = 0
+    exclus: int = 0
     echecs: int = 0
     formats: dict = field(default_factory=dict)
 
 
-def scan_sources(root: Path) -> list[Path]:
-    files = []
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in EXTENSIONS and not p.name.startswith(("~$", ".~lock")):
-            files.append(p)
-    files.sort()
-    return files
+# ------------------------------------------------------------------ exclusions
+class Exclusions:
+    """Règles d'exclusion de l'exploration.
+
+    * un chemin de dossier (absolu, ou relatif au dossier racine) : ce dossier et tout son contenu ;
+    * un motif sans séparateur (``*DIPLOME*``, ``Brouillons``, ``*.tmp``) : comparé, sans tenir
+      compte des majuscules ni des accents, au NOM de chaque dossier et de chaque fichier.
+    """
+
+    def __init__(self, root: Path, rules: Iterable[str] = ()):
+        self.root = root
+        self.folders: list[str] = []
+        self.patterns: list[str] = [_fold(p) for p in ALWAYS_SKIPPED]
+        for raw in rules:
+            rule = (raw or "").strip().strip('"')
+            if not rule:
+                continue
+            if any(sep in rule for sep in ("/", "\\")) or (len(rule) > 1 and rule[1] == ":"):
+                p = Path(rule)
+                if not p.is_absolute():
+                    p = root / p
+                self.folders.append(_fold_path(str(p)))
+            else:
+                self.patterns.append(_fold(rule))
+
+    def name_excluded(self, name: str) -> bool:
+        n = _fold(name)
+        return any(fnmatch.fnmatchcase(n, pat) for pat in self.patterns)
+
+    def dir_excluded(self, path: str, name: str) -> bool:
+        if self.name_excluded(name):
+            return True
+        p = _fold_path(path)
+        return any(p == f or p.startswith(f + os.sep) for f in self.folders)
+
+    def path_excluded(self, path: str) -> bool:
+        """Pour un fichier déjà indexé : est-il (ou un de ses dossiers parents) désormais exclu ?"""
+        p = Path(path)
+        try:
+            rel = p.relative_to(self.root)
+        except ValueError:
+            return False
+        if self.name_excluded(p.name):
+            return True
+        cur = self.root
+        for part in rel.parts[:-1]:
+            cur = cur / part
+            if self.dir_excluded(str(cur), part):
+                return True
+        return False
+
+
+def _fold(text: str) -> str:
+    from .normalize import strip_accents
+    return strip_accents(text).casefold()
+
+
+def _fold_path(path: str) -> str:
+    return _fold(os.path.normpath(path)).rstrip("\\/")
+
+
+@dataclass
+class SourceFile:
+    path: str
+    taille: int
+    mtime: float
+
+
+def scan_sources(root: Path, exclusions: Exclusions | None = None,
+                 counters: Counters | None = None) -> list[SourceFile]:
+    """Liste les .pdf/.doc/.docx sous ``root`` en élaguant les dossiers exclus."""
+    exclusions = exclusions or Exclusions(root)
+    out: list[SourceFile] = []
+    stack = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            it = os.scandir(current)
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if exclusions.dir_excluded(entry.path, entry.name):
+                            if counters is not None:
+                                counters.exclus += 1
+                            continue
+                        stack.append(entry.path)
+                    elif entry.is_file():
+                        if os.path.splitext(entry.name)[1].lower() not in EXTENSIONS:
+                            continue
+                        if exclusions.name_excluded(entry.name):
+                            if counters is not None:
+                                counters.exclus += 1
+                            continue
+                        st = entry.stat()  # sous Windows : fourni par le listage, sans accès réseau supplémentaire
+                        out.append(SourceFile(entry.path, st.st_size, st.st_mtime))
+                except OSError:
+                    continue
+    out.sort(key=lambda f: f.path.casefold())
+    return out
 
 
 def cache_path_for(source: Path, cache_dir: Path) -> Path:
-    digest = hashlib.sha1(str(source.resolve()).lower().encode("utf-8")).hexdigest()[:20]
-    return cache_dir / f"{digest}.pdf"
+    return cache_dir / cache_name_for(source)
 
 
+# ------------------------------------------------- traitement d'un fichier (sans base)
+@dataclass
+class FileResult:
+    chemin: str
+    taille: int
+    mtime: float
+    type_fichier: str = "?"
+    nb_pages: int = 0
+    cache_pdf: str | None = None
+    statut: str = "OK"
+    message: str | None = None
+    releves: list = field(default_factory=list)
+    anomalies: list = field(default_factory=list)   # (niveau, message, action)
+    duree: float = 0.0
+
+
+class FileProcessor:
+    """Extraction + analyse d'un fichier. N'écrit jamais dans la base : utilisable dans un sous-processus."""
+
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.cache_dir = settings.resolved_cache_dir()
+        self.ocr_available = settings.ocr_enabled and configure_tesseract(settings)
+        self._converter: WordConverter | None = None
+
+    @property
+    def converter(self) -> WordConverter:
+        if self._converter is None:
+            self._converter = WordConverter(self.s)
+        return self._converter
+
+    def close(self) -> None:
+        if self._converter is not None:
+            self._converter.close()
+            self._converter = None
+
+    def _pages_for(self, res: FileResult, path: Path, kind: str) -> list[PageText]:
+        if kind == "PDF":
+            pages = pdf_pages_text(path)
+            scanned = [p.number for p in pages if len((p.text or "").strip()) < MIN_TEXT_CHARS]
+            if scanned and self.ocr_available:
+                ocr = ocr_pdf_pages(path, scanned, self.s)
+                pages = [ocr.get(p.number, p) for p in pages]
+                low = [n for n, pt in ocr.items() if (pt.ocr_confidence or 0) < 70]
+                if low:
+                    res.anomalies.append(("AVERTISSEMENT",
+                                          f"OCR : confiance faible (< 70 %) sur la/les page(s) "
+                                          f"{', '.join(map(str, low[:8]))}. À vérifier manuellement.", "Revoir la page"))
+                res.type_fichier = "PDF_SCAN"
+                return pages
+            if scanned and len(scanned) == len(pages):
+                res.anomalies.append(("AVERTISSEMENT", "PDF scanné non lu : OCR désactivé ou Tesseract introuvable.",
+                                      "Activer l'OCR"))
+                res.type_fichier = "PDF_SCAN"
+                return pages
+            res.type_fichier = "PDF_TEXT"
+            return pages
+
+        res.type_fichier = kind
+        if self.s.docx_convert_at_index and self.converter.available:
+            # Option « préconvertir » : aperçu immédiat au guichet, au prix d'une indexation bien plus lente.
+            try:
+                name, _ = render_preview(res.chemin, kind, self.s, self.converter)
+                res.cache_pdf = name
+                return pdf_pages_text(self.cache_dir / name)
+            except ExtractionError as exc:
+                if kind != "DOCX" or "mot de passe" in str(exc):
+                    raise
+                res.anomalies.append(("AVERTISSEMENT", f"{exc} Lecture directe du .docx.", "Vérifier Word / LibreOffice"))
+                return docx_pages_text(path)
+        if kind == "DOCX":
+            # Lecture directe, très rapide ; l'aperçu PDF sera produit à la première consultation.
+            return docx_pages_text(path)
+        # .doc (format binaire 97-2003) : Word/LibreOffice l'enregistre en .docx (bien plus rapide qu'un PDF),
+        # puis lecture directe. Le .docx est gardé en cache et resservira pour l'aperçu.
+        if not self.converter.available:
+            raise ExtractionError("Fichier Word 97-2003 (.doc) : Microsoft Word ou LibreOffice est nécessaire.")
+        inter = intermediate_docx(res.chemin, self.cache_dir)
+        if not inter.exists() or inter.stat().st_mtime < res.mtime:
+            self.converter.convert(path, inter, "docx")
+        return docx_pages_text(inter)
+
+    def process(self, src: SourceFile) -> FileResult:
+        started = time.time()
+        res = FileResult(src.path, src.taille, src.mtime)
+        path = Path(src.path)
+        try:
+            kind = detect_type(path)
+            pages = self._pages_for(res, path, kind)
+            res.nb_pages = len(pages)
+            releves, warnings = parse_pages(pages, res.chemin)
+            for w in warnings[:5]:
+                res.anomalies.append(("AVERTISSEMENT", w, "Revoir la page"))
+            if len(warnings) > 5:
+                res.anomalies.append(("AVERTISSEMENT", f"… et {len(warnings) - 5} autres avertissements.", None))
+            linked = [r for r in releves if r["page_fin"] > r["numero_page"]]
+            if linked:
+                ex = linked[0]
+                res.anomalies.append(("INFO", f"{len(linked)} relevé(s) sur plusieurs pages jumelé(s) "
+                                              f"(ex. {ex['matricule']} : pages {ex['numero_page']}–{ex['page_fin']}).", None))
+            if not releves:
+                res.anomalies.append(("AVERTISSEMENT", "Aucun relevé détecté dans ce fichier.", "Revoir le fichier"))
+            res.releves = releves
+        except ExtractionError as exc:
+            self._fail(res, str(exc))
+        except Exception as exc:  # un fichier défectueux ne doit jamais arrêter l'indexation
+            self._fail(res, f"Erreur inattendue : {exc.__class__.__name__}: {exc}")
+        res.duree = time.time() - started
+        return res
+
+    @staticmethod
+    def _fail(res: FileResult, message: str) -> None:
+        res.statut = "ERREUR"
+        res.message = message
+        res.type_fichier = Path(res.chemin).suffix.lower().lstrip(".").upper() or "?"
+        res.releves = []
+        res.anomalies = [("ERREUR", message, "Ouvrir le dossier")]
+
+
+# ------------------------------------------------------- sous-processus (workers)
+_PROCESSOR: FileProcessor | None = None
+
+
+def _worker_init(settings: Settings, parallel: bool) -> None:
+    global _PROCESSOR
+    if parallel:
+        # Tesseract lance ses propres fils d'exécution : avec plusieurs processus, un seul par OCR est plus rapide.
+        os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+    _PROCESSOR = FileProcessor(settings)
+    import multiprocessing.util as mpu
+    mpu.Finalize(None, _worker_close, exitpriority=10)   # ferme Word à la sortie normale du processus
+    # Si le robot principal est tué, on ne laisse ni processus ni Word orphelins.
+    import multiprocessing
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        def watchdog():
+            parent.join()
+            _worker_close()
+            os._exit(0)
+        threading.Thread(target=watchdog, daemon=True).start()
+
+
+def _worker_close() -> None:
+    if _PROCESSOR is not None:
+        _PROCESSOR.close()
+
+
+def _worker_process(src: SourceFile) -> FileResult:
+    assert _PROCESSOR is not None
+    return _PROCESSOR.process(src)
+
+
+def default_workers() -> int:
+    cpu = os.cpu_count() or 2
+    return max(1, min(4, cpu - 1))
+
+
+# ------------------------------------------------------------------ robot
 class Indexer:
     def __init__(self, settings: Settings, db: Database, emit: Emit | None = None):
         self.s = settings
         self.db = db
         self.emit = emit or (lambda e: None)
         self.counters = Counters()
-        self.cache_dir = settings.resolved_cache_dir()
-        self.ocr_available = settings.ocr_enabled and configure_tesseract(settings)
-        self._stop = False
+        self._stop = threading.Event()
+        self._last_emit = 0.0
 
     def stop(self) -> None:
-        self._stop = True
+        self._stop.set()
 
-    # ------------------------------------------------------------ par fichier
-    def _pages_for(self, path: Path, kind: str, converter: WordConverter) -> tuple[list[PageText], str, str | None]:
-        """Renvoie (pages, type_fichier, cache_pdf)."""
-        if kind == "PDF":
-            pages = pdf_pages_text(path)
-            scanned = [p.number for p in pages if len((p.text or "").strip()) < MIN_TEXT_CHARS]
-            if scanned and self.ocr_available:
-                self.emit({"type": "stage", "stage": "ocr", "file": str(path), "pages": len(scanned)})
-                ocr = ocr_pdf_pages(path, scanned, self.s)
-                pages = [ocr.get(p.number, p) for p in pages]
-                low = [n for n, pt in ocr.items() if (pt.ocr_confidence or 0) < 70]
-                if low:
-                    self.db.add_anomaly("AVERTISSEMENT", str(path),
-                                        f"OCR : confiance faible (< 70 %) sur la/les page(s) {', '.join(map(str, low[:8]))}. "
-                                        "À vérifier manuellement.", "Revoir la page")
-                return pages, "PDF_SCAN", None
-            if scanned and len(scanned) == len(pages):
-                self.db.add_anomaly("AVERTISSEMENT", str(path),
-                                    "PDF scanné non lu : OCR désactivé ou Tesseract introuvable.", "Activer l'OCR")
-                return pages, "PDF_SCAN", None
-            return pages, "PDF_TEXT", None
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
 
-        # Word : conversion en PDF dans le cache (pages exactes + aperçu identique)
-        cache = cache_path_for(path, self.cache_dir)
-        need_cache = self.s.preview_cache_enabled or kind == "DOC"
-        if need_cache and converter.available:
-            try:
-                if not cache.exists() or cache.stat().st_mtime < path.stat().st_mtime:
-                    self.emit({"type": "stage", "stage": "conversion", "file": str(path), "backend": converter.backend()})
-                    converter.convert(path, cache)
-                return pdf_pages_text(cache), kind, str(cache)
-            except ExtractionError as exc:
-                if kind != "DOCX" or "mot de passe" in str(exc):
-                    raise
-                # .docx : on peut encore le lire directement (sans aperçu) plutôt que de l'abandonner
-                self.db.add_anomaly("AVERTISSEMENT", str(path), f"{exc} Lecture directe du .docx, aperçu indisponible.",
-                                    "Vérifier Word / LibreOffice")
-                return docx_pages_text(path), kind, None
-        if kind == "DOCX":
-            if need_cache:
-                self.db.add_anomaly("INFO", str(path),
-                                    "Aucun convertisseur Word → PDF : lecture directe, aperçu indisponible "
-                                    "et numéros de page approximatifs.", "Installer Word ou LibreOffice")
-            return docx_pages_text(path), kind, None
-        raise ExtractionError("Fichier Word 97-2003 (.doc) : Microsoft Word ou LibreOffice est nécessaire.")
-
-    def index_file(self, path: Path, converter: WordConverter) -> int:
-        chemin = str(path.resolve())
-        taille, mtime = file_signature(path)
-        self.db.clear_anomalies_for(chemin)
+    # Compatibilité : indexer un fichier isolé, dans le processus courant.
+    def index_file(self, path: Path) -> int:
+        st = path.stat()
+        proc = FileProcessor(self.s)
         try:
-            kind = detect_type(path)
-            pages, type_fichier, cache = self._pages_for(path, kind, converter)
-            self.counters.extraits += 1
-            self.counters.formats[type_fichier] = self.counters.formats.get(type_fichier, 0) + 1
-            releves, warnings = parse_pages(pages, chemin)
-            self.counters.blocs += len(releves)
-            for w in warnings[:5]:
-                self.db.add_anomaly("AVERTISSEMENT", chemin, w, "Revoir la page")
-            if len(warnings) > 5:
-                self.db.add_anomaly("AVERTISSEMENT", chemin, f"… et {len(warnings) - 5} autres avertissements.")
-            linked = [r for r in releves if r["page_fin"] > r["numero_page"]]
-            if linked:
-                ex = linked[0]
-                self.db.add_anomaly("INFO", chemin,
-                                    f"{len(linked)} relevé(s) sur plusieurs pages jumelé(s) "
-                                    f"(ex. {ex['matricule']} : pages {ex['numero_page']}–{ex['page_fin']}).")
-            if not releves:
-                self.db.add_anomaly("AVERTISSEMENT", chemin, "Aucun relevé détecté dans ce fichier.", "Revoir le fichier")
-            self.db.save_file(chemin, type_fichier, taille, mtime, len(pages), cache, "OK", None, releves)
-            self.counters.ecrits += len(releves)
-            return len(releves)
-        except ExtractionError as exc:
-            self._fail(chemin, taille, mtime, str(exc))
-        except Exception as exc:  # un fichier défectueux ne doit jamais arrêter l'indexation
-            self._fail(chemin, taille, mtime, f"Erreur inattendue : {exc.__class__.__name__}: {exc}")
-        return 0
+            res = proc.process(SourceFile(str(path.resolve()), st.st_size, st.st_mtime))
+        finally:
+            proc.close()
+        self._store(res)
+        return len(res.releves)
 
-    def _fail(self, chemin: str, taille: int, mtime: float, message: str) -> None:
-        self.counters.echecs += 1
-        ext = Path(chemin).suffix.lower().lstrip(".").upper() or "?"
-        self.db.save_file(chemin, ext, taille, mtime, 0, None, "ERREUR", message, [])
-        self.db.add_anomaly("ERREUR", chemin, message, "Ouvrir le dossier")
+    def _store(self, res: FileResult) -> None:
+        self.db.store_result(res.chemin, res.type_fichier, res.taille, res.mtime, res.nb_pages, res.cache_pdf,
+                             res.statut, res.message, res.releves, res.anomalies)
+        c = self.counters
+        if res.statut == "OK":
+            c.extraits += 1
+            c.formats[res.type_fichier] = c.formats.get(res.type_fichier, 0) + 1
+            c.blocs += len(res.releves)
+            c.ecrits += len(res.releves)
+        else:
+            c.echecs += 1
 
-    # ---------------------------------------------------------------- global
-    def run(self, root: Path, only_new: bool | None = None) -> Counters:
+    def run(self, root: Path, only_new: bool | None = None, workers: int | None = None) -> Counters:
         only_new = self.s.differential if only_new is None else only_new
         started = time.time()
         if not root.exists():
             raise FileNotFoundError(f"Dossier introuvable : {root}")
+        root = root.resolve()
+        exclusions = Exclusions(root, self.s.exclusions)
         self.emit({"type": "scan", "root": str(root)})
-        files = scan_sources(root)
+        files = scan_sources(root, exclusions, self.counters)
         self.counters.detectes = len(files)
-        self.emit({"type": "start", "total": len(files)})
-        with WordConverter(self.s) as converter:
-            if not converter.available:
-                self.emit({"type": "warning", "message": "Aucun convertisseur Word → PDF (Word ou LibreOffice)."})
-            for i, path in enumerate(files, start=1):
-                if self._stop:
-                    break
-                chemin = str(path.resolve())
-                if only_new:
-                    state = self.db.file_state(chemin)
-                    if state is not None:  # inchangé depuis la dernière passe (même en erreur)
-                        taille, mtime = file_signature(path)
-                        if state["taille"] == taille and abs((state["mtime"] or 0) - mtime) < 1:
-                            self.counters.ignores += 1
-                            self._progress(i, path, started, skipped=True)
-                            continue
-                self._progress(i - 1, path, started)
-                self.index_file(path, converter)
-                self._progress(i, path, started)
+
+        purged = self._purge_excluded(root, exclusions)
+        todo: list[SourceFile] = []
+        if only_new:
+            known = self.db.file_signatures()
+            for f in files:
+                state = known.get(f.path)
+                if state is not None and state[0] == f.taille and abs((state[1] or 0) - f.mtime) < 1:
+                    self.counters.ignores += 1   # inchangé depuis la dernière passe (même en erreur)
+                else:
+                    todo.append(f)
+        else:
+            todo = files
+
+        n_workers = workers if workers is not None else (self.s.index_workers or default_workers())
+        n_workers = max(1, min(int(n_workers), 16, max(1, len(todo))))
+        self.emit({"type": "start", "total": len(files), "a_traiter": len(todo), "workers": n_workers,
+                   "exclus": self.counters.exclus, "retires": purged})
+        done = self.counters.ignores
+        self._progress(done, None, started, force=True)
+
+        if n_workers == 1:
+            proc = FileProcessor(self.s)
+            try:
+                for f in todo:
+                    if self.stopped:
+                        break
+                    self.emit({"type": "stage", "stage": "lecture", "file": f.path})
+                    self._store(proc.process(f))
+                    done += 1
+                    self._progress(done, f.path, started)
+            finally:
+                proc.close()
+        else:
+            done = self._run_parallel(todo, n_workers, done, started)
+
         self.db.set_meta("derniere_indexation", time.strftime("%d/%m/%Y %H:%M"))
         self.db.set_meta("source_root", str(root))
-        summary = self.counters.__dict__ | {"duree_s": round(time.time() - started, 1), "stopped": self._stop}
+        summary = self.counters.__dict__ | {"duree_s": round(time.time() - started, 1), "stopped": self.stopped,
+                                            "workers": n_workers}
         self.emit({"type": "done", **summary})
         return self.counters
 
-    def _progress(self, done: int, path: Path, started: float, skipped: bool = False) -> None:
+    def _run_parallel(self, todo: list[SourceFile], n_workers: int, done: int, started: float) -> int:
+        import multiprocessing
+        from concurrent.futures.process import BrokenProcessPool
+        pending = deque(todo)
+        in_flight: dict[Future, SourceFile] = {}
+        # « spawn » partout (c'est le seul mode sous Windows) : même comportement sur tous les systèmes,
+        # et pas de fork d'un processus qui a déjà des fils d'exécution.
+        ctx = multiprocessing.get_context("spawn")
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers, initializer=_worker_init, initargs=(self.s, True),
+                                     mp_context=ctx) as pool:
+                try:
+                    while pending or in_flight:
+                        # File d'attente courte : un arrêt demandé prend effet en quelques secondes.
+                        while pending and len(in_flight) < n_workers * 2 and not self.stopped:
+                            f = pending.popleft()
+                            in_flight[pool.submit(_worker_process, f)] = f
+                        if not in_flight:
+                            break
+                        finished, _ = wait(in_flight, timeout=0.5, return_when=FIRST_COMPLETED)
+                        for fut in finished:
+                            src = in_flight.pop(fut)
+                            try:
+                                res = fut.result()
+                            except BrokenProcessPool:
+                                pending.appendleft(src)
+                                raise
+                            except Exception as exc:  # erreur inattendue dans un processus : on note et on continue
+                                res = FileResult(src.path, src.taille, src.mtime)
+                                FileProcessor._fail(res, f"Processus de lecture interrompu : "
+                                                         f"{exc.__class__.__name__}: {exc}")
+                            self._store(res)
+                            done += 1
+                            self._progress(done, src.path, started)
+                finally:
+                    for fut in in_flight:
+                        fut.cancel()
+        except BrokenProcessPool:
+            # Un processus de lecture a été tué (Word planté, mémoire, antivirus…) : on termine en séquentiel.
+            rest = list(in_flight.values()) + list(pending)
+            self.emit({"type": "warning", "message": "Processus parallèles interrompus : fin de l'indexation "
+                                                     f"en mode séquentiel ({len(rest)} fichier(s))."})
+            proc = FileProcessor(self.s)
+            try:
+                for f in rest:
+                    if self.stopped:
+                        break
+                    self._store(proc.process(f))
+                    done += 1
+                    self._progress(done, f.path, started)
+            finally:
+                proc.close()
+        return done
+
+    def _purge_excluded(self, root: Path, exclusions: Exclusions) -> int:
+        """Retire de l'index les fichiers déjà indexés qui relèvent désormais d'une exclusion
+        (les fichiers eux-mêmes ne sont jamais touchés)."""
+        if not self.s.exclusions:
+            return 0
+        n = 0
+        prefix = _fold_path(str(root))
+        for chemin in list(self.db.file_signatures()):
+            if _fold_path(chemin).startswith(prefix) and exclusions.path_excluded(chemin):
+                self.db.remove_file(chemin)
+                n += 1
+        return n
+
+    def _progress(self, done: int, path: str | None, started: float, force: bool = False) -> None:
+        now = time.time()
         total = max(1, self.counters.detectes)
-        elapsed = time.time() - started
-        eta = (elapsed / done * (total - done)) if done else None
-        self.emit({"type": "progress", "done": done, "total": total, "file": str(path), "skipped": skipped,
+        if not force and done < total and now - self._last_emit < 0.15:
+            return  # pas plus de ~7 messages par seconde vers l'interface
+        self._last_emit = now
+        elapsed = now - started
+        processed = done - self.counters.ignores
+        rate = processed / elapsed if elapsed > 0 and processed > 0 else None
+        eta = (total - done) / rate if rate else None
+        self.emit({"type": "progress", "done": done, "total": total, "file": path,
                    "elapsed_s": round(elapsed, 1), "eta_s": round(eta, 1) if eta is not None else None,
+                   "rate": round(rate, 2) if rate else None,
                    "counters": {k: v for k, v in self.counters.__dict__.items() if k != "formats"}})
 
 
 def check_integrity(db: Database) -> list[str]:
-    """Liens orphelins : fichiers indexés dont le chemin n'existe plus (S4.3)."""
+    """Liens orphelins : fichiers indexés dont le chemin n'existe plus (S4.3), et aperçus Word manquants."""
     missing = [r["chemin"] for r in db.orphan_files()]
     for chemin in missing:
         db.add_anomaly("AVERTISSEMENT", chemin, "Lien orphelin : fichier déplacé, renommé ou supprimé.", "Relocaliser")
@@ -208,8 +512,13 @@ def check_integrity(db: Database) -> list[str]:
 
 
 def _ensure_stdio() -> None:
-    """Dans l'exécutable fenêtré (PyInstaller --windowed), sys.stdout vaut None. Quand l'interface lance
-    le robot avec QProcess, les tubes existent pourtant au niveau du système : on les rouvre."""
+    """Dans l'exécutable fenêtré (PyInstaller --windowed), sys.stdin/stdout valent None. Quand l'interface
+    lance le robot avec QProcess, les tubes existent pourtant au niveau du système : on les rouvre."""
+    if sys.stdin is None:
+        try:
+            sys.stdin = open(0, "r", encoding="utf-8", closefd=False)
+        except OSError:
+            pass
     for name, fd in (("stdout", 1), ("stderr", 2)):
         stream = getattr(sys, name)
         if stream is None:
@@ -224,6 +533,19 @@ def _ensure_stdio() -> None:
                 pass
 
 
+def _listen_for_stop(indexer: Indexer) -> None:
+    """L'interface écrit « stop » sur l'entrée standard : arrêt propre (fichiers en cours terminés, Word fermé)."""
+    def reader():
+        try:
+            for line in sys.stdin:
+                if line.strip().lower() == "stop":
+                    indexer.stop()
+                    return
+        except (OSError, ValueError, AttributeError):
+            return
+    threading.Thread(target=reader, daemon=True).start()
+
+
 def cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="fmsp-indexer", description="Indexation des relevés FMSP")
     parser.add_argument("--index", action="store_true")
@@ -233,6 +555,10 @@ def cli(argv: list[str]) -> int:
     parser.add_argument("--only-new", action="store_true", help="Indexation différentielle")
     parser.add_argument("--full", action="store_true", help="Tout réindexer")
     parser.add_argument("--no-ocr", action="store_true")
+    parser.add_argument("--workers", type=int, help="Processus parallèles (0 = automatique)")
+    parser.add_argument("--exclude", action="append", default=[],
+                        help="Dossier ou motif à exclure (répétable), en plus de ceux de la configuration")
+    parser.add_argument("--stdin-control", action="store_true", help="Écouter « stop » sur l'entrée standard")
     parser.add_argument("--json", action="store_true", help="Progression en lignes JSON (utilisé par l'interface)")
     args = parser.parse_args(argv)
     _ensure_stdio()
@@ -240,7 +566,9 @@ def cli(argv: list[str]) -> int:
     settings = load_settings()
     if args.no_ocr:
         settings.ocr_enabled = False
-    db = Database(args.db or settings.resolved_db_path())
+    if args.exclude:
+        settings.exclusions = list(settings.exclusions) + args.exclude
+    db = Database(args.db or settings.resolved_db_path(), cache_dir=settings.resolved_cache_dir())
 
     def emit(event: dict) -> None:
         if args.json:
@@ -248,7 +576,7 @@ def cli(argv: list[str]) -> int:
             sys.stdout.flush()
         elif event["type"] in ("start", "done", "warning"):
             print(event)
-        elif event["type"] == "progress" and event["done"] and not event.get("skipped"):
+        elif event["type"] == "progress" and event.get("file"):
             print(f"[{event['done']}/{event['total']}] {event['file']}")
 
     if args.check_integrity:
@@ -260,5 +588,8 @@ def cli(argv: list[str]) -> int:
         print("Dossier source introuvable. Utilisez --source.", file=sys.stderr)
         return 2
     only_new = True if args.only_new else (False if args.full else None)
-    Indexer(settings, db, emit).run(source, only_new=only_new)
+    indexer = Indexer(settings, db, emit)
+    if args.stdin_control:
+        _listen_for_stop(indexer)
+    indexer.run(source, only_new=only_new, workers=args.workers)
     return 0

@@ -18,7 +18,8 @@ from .widgets import Badge, Card, IconChip, PillBars, Segmented, Toast, card_hea
 
 ACTIONS = {"IMPRESSION": "blue", "CONSULTATION": "gray", "DUPLICATA": "amber", "EXPORT PDF": "green",
            "EXTRACTION": "violet", "CURSUS": "green", "VERIFICATION": "red"}
-MENTION_COLORS = [("Très bien", "#0F172A"), ("Bien", "#1D4ED8"), ("Assez bien", "#93B4F5"), ("Passable", "#D6E2FB")]
+MENTION_COLORS = [("Excellent", "#020617"), ("Très bien", "#0F172A"), ("Bien", "#1D4ED8"), ("Assez bien", "#93B4F5"),
+                  ("Passable", "#D6E2FB"), ("Médiocre", "#F6D9A8"), ("Éliminé", "#F4B4B4")]
 
 
 class MentionBar(QWidget):
@@ -249,7 +250,7 @@ class ExtractionPage(QWidget):
         mentions: dict[str, int] = {}
         per_year: dict[str, int] = {}
         for r in self.rows:
-            m = exporter.mention(r.moyenne)
+            m = exporter.mention(r.moyenne, r.grade)
             if m:
                 mentions[m] = mentions.get(m, 0) + 1
             per_year[r.annee_academique or "?"] = per_year.get(r.annee_academique or "?", 0) + 1

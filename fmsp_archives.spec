@@ -1,14 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Construction de l'exécutable Windows :  pyinstaller --noconfirm fmsp_archives.spec
-# Résultat : dist\FMSP_Archives\FMSP_Archives.exe (dossier autonome, sans Python à installer).
-# Le même .exe sert d'interface ET de robot d'indexation (lancé avec --index par l'interface).
+# Résultat : dist\Scolarix\Scolarix.exe (dossier autonome, sans Python à installer).
+# Le même .exe sert d'interface, de robot d'indexation (--index) et de processus de lecture parallèles
+# (multiprocessing.freeze_support dans main.py).
+# L'installateur (installer\scolarix.iss, Inno Setup) empaquette ensuite ce dossier.
 
 a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[("ui/theme_fmsp.qss", "ui")],
-    hiddenimports=["pypdfium2", "olefile", "win32com.client", "pythoncom", "pywintypes"],
+    datas=[("ui/theme_fmsp.qss", "ui"), ("assets/scolarix.ico", "assets"), ("assets/scolarix_256.png", "assets"),
+           ("assets/scolarix.svg", "assets")],
+    hiddenimports=["pypdfium2", "olefile", "lxml", "lxml.etree", "win32com.client", "pythoncom", "pywintypes"],
     excludes=["tkinter", "matplotlib", "IPython", "pytest"],
     noarchive=False,
 )
@@ -18,8 +21,10 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="FMSP_Archives",
+    name="Scolarix",
     console=False,
     upx=False,
+    icon="assets/scolarix.ico",
+    version="installer/version_info.txt",
 )
-coll = COLLECT(exe, a.binaries, a.datas, name="FMSP_Archives", upx=False)
+coll = COLLECT(exe, a.binaries, a.datas, name="Scolarix", upx=False)

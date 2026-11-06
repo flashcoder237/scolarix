@@ -10,14 +10,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QUrl, Signal
+from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
-                               QPushButton, QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+                               QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
                                QAbstractItemView, QHeaderView)
 
 from core.config import Settings, save_settings
 from core.database import Database
+from core.indexer import default_workers
 
 from .icons import icon
 from .widgets import (Badge, Card, HBars, IconChip, OptionTile, PillBars, Segmented, Toast, card_header,
@@ -98,6 +99,7 @@ class IndexingPage(QWidget):
         self.setObjectName("page")
         self.db, self.s = db, settings
         self.proc: QProcess | None = None
+        self._stopping = False
         self._buf = b""
         self._filter = None
 
@@ -178,7 +180,7 @@ class IndexingPage(QWidget):
         stages = QGridLayout()
         stages.setSpacing(10)
         self.stages = [StageCard(1, "Détection MIME", ".doc · .docx · PDF texte · PDF scan"),
-                       StageCard(2, "Extraction texte", "python-docx · Word COM / LibreOffice · pdfplumber · Tesseract"),
+                       StageCard(2, "Extraction texte", "PDFium · python-docx · Word/LibreOffice (.doc) · Tesseract"),
                        StageCard(3, "Parsing regex", "Blocs étudiant : matricule, nom, filière, page"),
                        StageCard(4, "Écriture SQLite", "etudiants_releves + index FTS5")]
         for i, sc in enumerate(self.stages):
@@ -219,8 +221,9 @@ class IndexingPage(QWidget):
                                          "Redresse les scans de travers avant l'OCR.", self.s.ocr_preprocess),
             "word_com_enabled": OptionTile("word", "blue", "Passerelle COM Word",
                                            "Lit les .doc 97-2003 (sinon LibreOffice).", self.s.word_com_enabled),
-            "preview_cache_enabled": OptionTile("eye", "green", "Cache d'aperçu PDF",
-                                                "Aperçu Word identique à un PDF, sans ouvrir Word.", self.s.preview_cache_enabled),
+            "docx_convert_at_index": OptionTile("eye", "green", "Préconvertir les .docx",
+                                                "Aperçu immédiat, mais indexation bien plus lente. Sinon : "
+                                                "aperçu produit à la 1re consultation.", self.s.docx_convert_at_index),
             "differential": OptionTile("refresh", "amber", "Réindexation différentielle",
                                        "Ignore les fichiers inchangés depuis la dernière passe.", self.s.differential),
         }
@@ -233,6 +236,22 @@ class IndexingPage(QWidget):
         integ.clicked.connect(self.check_integrity)
         grid.addWidget(integ, 2, 1)
         conf.lay.addLayout(grid)
+        perf = QHBoxLayout()
+        perf.addWidget(QLabel("Processus parallèles"))
+        self.workers = QSpinBox()
+        self.workers.setRange(0, 16)
+        self.workers.setSpecialValueText(f"Auto ({default_workers()})")
+        self.workers.setValue(int(self.s.index_workers or 0))
+        self.workers.setAccessibleName("Nombre de processus parallèles d'indexation")
+        self.workers.valueChanged.connect(self._set_workers)
+        perf.addWidget(self.workers)
+        perf.addStretch(1)
+        self.excl_btn = QPushButton()
+        self.excl_btn.setObjectName("secondary")
+        self.excl_btn.clicked.connect(self.edit_exclusions)
+        perf.addWidget(self.excl_btn)
+        conf.lay.addLayout(perf)
+        self._update_excl_btn()
         self.toast = Toast()
         conf.lay.addWidget(self.toast)
         row.addWidget(conf, 5)
@@ -288,6 +307,21 @@ class IndexingPage(QWidget):
         setattr(self.s, key, value)
         save_settings(self.s)
 
+    def _set_workers(self, value: int) -> None:
+        self.s.index_workers = int(value)
+        save_settings(self.s)
+
+    def _update_excl_btn(self) -> None:
+        n = len(self.s.exclusions)
+        self.excl_btn.setText(f"Exclusions ({n})…" if n else "Exclure des sous-dossiers…")
+        self.excl_btn.setToolTip("\n".join(self.s.exclusions) or "Aucun dossier ni motif exclu")
+
+    def edit_exclusions(self) -> None:
+        from .settings_dialog import ExclusionsDialog
+        self.s.source_root = self.src.text().strip() or self.s.source_root
+        if ExclusionsDialog(self.s, self).exec():
+            self._update_excl_btn()
+
     def _set_filter(self, value) -> None:
         self._filter = value
         self.refresh_log()
@@ -333,7 +367,15 @@ class IndexingPage(QWidget):
 
     def toggle_run(self) -> None:
         if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
-            self.proc.kill()
+            # Arrêt propre : les fichiers en cours se terminent, les instances de Word sont fermées.
+            if not self._stopping:
+                self._stopping = True
+                self.proc.write(b"stop\n")
+                self.status.set("ARRÊT…", "amber")
+                self.detail.setText("Arrêt demandé : fin des fichiers en cours… (cliquer encore pour forcer)")
+                QTimer.singleShot(20000, self._force_stop)
+            else:
+                self.proc.kill()
             return
         src = self.src.text().strip()
         if not src or not Path(src).exists():
@@ -342,8 +384,9 @@ class IndexingPage(QWidget):
         self.s.source_root = src
         save_settings(self.s)
         program, args = indexer_command()
-        args += ["--index", "--json", "--source", src, "--db", str(self.s.resolved_db_path()),
+        args += ["--index", "--json", "--stdin-control", "--source", src, "--db", str(self.s.resolved_db_path()),
                  "--only-new" if self.s.differential else "--full"]
+        self._stopping = False
         if not self.s.ocr_enabled:
             args.append("--no-ocr")
         self.proc = QProcess(self)
@@ -377,15 +420,26 @@ class IndexingPage(QWidget):
             self.total = ev["total"]
             self.stages[0].value.setText(str(ev["total"]))
             self.stages[0].badge.set("Terminé", "green")
+            bits = [f"{ev.get('a_traiter', ev['total'])} fichier(s) à lire", f"{ev.get('workers', 1)} processus"]
+            if ev.get("exclus"):
+                bits.append(f"{ev['exclus']} élément(s) exclu(s)")
+            if ev.get("retires"):
+                bits.append(f"{ev['retires']} fichier(s) exclu(s) retiré(s) de l'index")
+            self.current.setText(" · ".join(bits))
         elif t == "progress":
             done, total = ev["done"], max(1, ev["total"])
             pct = done * 100 // total
             self.pct.setText(f"{pct} %")
             self.bar.setValue(pct)
             c = ev["counters"]
-            eta = f" · restant ≈ {int(ev['eta_s'] // 60)} min {int(ev['eta_s'] % 60)} s" if ev.get("eta_s") else ""
-            self.detail.setText(f"{done} / {total} fichiers · {c['ignores']} inchangé(s) · {c['echecs']} en échec{eta}")
-            self.current.setText(f"Fichier en cours : {_short(ev['file'], 90)}")
+            eta = ""
+            if ev.get("eta_s"):
+                e = int(ev["eta_s"])
+                eta = f" · restant ≈ {e // 3600} h {e % 3600 // 60:02d} min" if e >= 3600 else f" · restant ≈ {e // 60} min {e % 60} s"
+            rate = f" · {ev['rate']:.1f} fichiers/s" if ev.get("rate") else ""
+            self.detail.setText(f"{done} / {total} fichiers · {c['ignores']} inchangé(s) · {c['echecs']} en échec{rate}{eta}")
+            if ev.get("file"):
+                self.current.setText(f"Dernier fichier lu : {_short(ev['file'], 90)}")
             self.stages[1].value.setText(str(c["extraits"]))
             self.stages[2].value.setText(str(c["blocs"]))
             self.stages[3].value.setText(str(c["ecrits"]))
@@ -401,9 +455,14 @@ class IndexingPage(QWidget):
             self.detail.setText(f"Terminé en {ev['duree_s']} s · {ev['ecrits']} relevé(s) écrit(s) · "
                                 f"{ev['ignores']} inchangé(s) · {ev['echecs']} en échec")
 
+    def _force_stop(self) -> None:
+        if self._stopping and self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
+            self.proc.kill()
+
     def _finished(self, code, status) -> None:
         self._read()
-        stopped = status == QProcess.ExitStatus.CrashExit or code != 0
+        was_stopping, self._stopping = self._stopping, False
+        stopped = status == QProcess.ExitStatus.CrashExit or code != 0 or was_stopping
         if stopped:
             self.status.set("ARRÊTÉ", "amber")
             err = bytes(self.proc.readAllStandardError()).decode("utf-8", "replace").strip().splitlines()

@@ -8,8 +8,8 @@ import re
 import unicodedata
 
 # Matricule FMSP : 2 chiffres (année d'entrée) + 1 à 4 lettres (filière) + 2 à 4 chiffres.
-# Observés sur les vrais relevés : 19MM071 (Médecine), 19MP001 (Pharmacie), 11EM641 (ancienne
-# codification Médecine), 23LSB010 (Licence Sciences biomédicales).
+# Observés sur les vrais relevés : 98MM109 (Médecine), 98MP110 (Pharmacie), 98EM101 (ancienne
+# codification Médecine), 98LSB111 (Licence Sciences biomédicales).
 # Les séparateurs tolérés sont l'espace, le tiret, le slash et le point.
 MATRICULE_RE = re.compile(
     r"(?<![A-Za-z0-9])(\d{2})\s*[-/. ]?\s*([A-Za-z]{1,4})\s*[-/. ]?\s*(\d{2,4})(?![A-Za-z0-9])"

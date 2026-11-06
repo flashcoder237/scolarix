@@ -55,7 +55,10 @@ CREATE TABLE IF NOT EXISTS etudiants_releves (
     niveau           VARCHAR(20),
     niveau_num       INTEGER DEFAULT 0,
     annee_academique VARCHAR(20),
-    semestre         INTEGER,                  -- 1..12 (LMD : un relevé = un semestre)
+    semestre         INTEGER,                  -- 1..14 (LMD : un relevé = un semestre)
+    semestre_fin     INTEGER,                  -- = semestre ; semestre + 1 pour un relevé annuel
+    cycle            VARCHAR(20),              -- LICENCE, MASTER, DOCTORAT
+    option_filiere   VARCHAR(60),
     session          VARCHAR(20),              -- Normale / Rattrapage (si indiqué)
     statut           VARCHAR(30),              -- ADMIS, AJOURNÉ, EXCLUSION, ABANDON, REPORT...
     decision         VARCHAR(80),              -- texte exact : « SEMESTRE VALIDE »...
@@ -116,7 +119,7 @@ RELEVE_COLUMNS = (
     "r.id, r.fichier_id, r.matricule, r.matricule_brut, r.nom, r.prenom, r.nom_complet, r.nom_norm, "
     "r.date_naissance, r.filiere, r.filiere_code, r.niveau, r.niveau_num, r.annee_academique, r.session, "
     "r.statut, r.moyenne, r.numero_page, r.page_fin, r.ocr_confiance, r.extrait, "
-    "r.semestre, r.decision, r.credits, r.grade, r.mgp, r.lieu_naissance, "
+    "r.semestre, r.decision, r.credits, r.grade, r.mgp, r.lieu_naissance, r.semestre_fin, r.cycle, r.option_filiere, "
     "f.chemin, f.type_fichier, f.cache_pdf, f.statut AS fichier_statut"
 )
 
@@ -150,6 +153,9 @@ class Releve:
     grade: str | None
     mgp: str | None
     lieu_naissance: str | None
+    semestre_fin: int | None
+    cycle: str | None
+    option_filiere: str | None
     chemin: str
     type_fichier: str
     cache_pdf: str | None
@@ -182,22 +188,107 @@ class Releve:
     def periode(self) -> str:
         """« Niveau 2 · S3 » (ou « Niveau 2 » si le semestre est inconnu)."""
         base = self.niveau or "Niveau ?"
+        if self.semestre and self.semestre_fin and self.semestre_fin != self.semestre:
+            return f"{base} · S{self.semestre}-S{self.semestre_fin} (annuel)"
         return f"{base} · S{self.semestre}" if self.semestre else base
+
+    @property
+    def decision_deduite(self) -> bool:
+        """Ancien format (2012-2014) : pas de décision semestrielle imprimée, elle est déduite de la colonne JURY."""
+        return bool(self.decision and re.match(r"^\d+ UE ", self.decision))
+
+    @property
+    def date_connue(self) -> str | None:
+        """Date de naissance, sauf les dates fictives des gabarits (00/01/1900…)."""
+        d = self.date_naissance or ""
+        if not d or d.startswith("00") or d[3:5] == "00" or d.endswith("1900"):
+            return None
+        return d
+
+    @property
+    def is_word(self) -> bool:
+        return self.type_fichier in ("DOC", "DOCX")
+
+    @property
+    def annuel(self) -> bool:
+        return bool(self.semestre and self.semestre_fin and self.semestre_fin != self.semestre)
 
     @property
     def periode_key(self) -> tuple:
         return (self.niveau_num, self.semestre or 0)
 
 
-def _row_to_releve(row: sqlite3.Row) -> Releve:
-    return Releve(**{k: row[k] for k in row.keys()})
+def _row_to_releve(row: sqlite3.Row, cache_dir: Path | None = None) -> Releve:
+    rel = Releve(**{k: row[k] for k in row.keys()})
+    rel.cache_pdf = resolve_cache(rel.cache_pdf, cache_dir)
+    return rel
+
+
+def _word_rank(nom_norm: str, words: list[str]) -> int:
+    """0 = chaque mot cherché est un mot entier du nom, 1 = début de mot, 2 = simple sous-chaîne."""
+    toks = nom_norm.split()
+    rank = 0
+    for w in words:
+        if w in toks:
+            continue
+        rank = max(rank, 1 if any(t.startswith(w) for t in toks) else 2)
+    return rank
+
+
+def _result_order(rels: list, words: list[str]):
+    """Tri des résultats : les relevés d'un même étudiant restent groupés et chronologiques
+    (S1, S2, S2 redoublé…), quel que soit l'orthographe du nom dans chaque fichier. Les étudiants
+    sont classés par pertinence (score, mot entier > début de mot > sous-chaîne), puis par nom."""
+    best: dict[str, tuple] = {}
+    latest: dict[str, object] = {}
+    for r in rels:
+        key = (-r.score, _word_rank(r.nom_norm, words) if words else 0)
+        best[r.matricule] = min(best.get(r.matricule, key), key)
+        cur = latest.get(r.matricule)
+        if cur is None or (r.annee_academique or "", r.niveau_num) > (cur.annee_academique or "", cur.niveau_num):
+            latest[r.matricule] = r
+
+    def key(r):
+        return (best[r.matricule], latest[r.matricule].nom_norm, r.matricule, r.niveau_num, r.semestre or 0,
+                r.annee_academique or "", 1 if (r.session or "").lower().startswith("rattrap") else 0)
+    return key
+
+
+def missing_periods(rels: list) -> list[str]:
+    """Périodes attendues mais absentes du dossier d'un étudiant (S1 … dernier semestre trouvé ;
+    un relevé annuel couvre ses deux semestres). Sert à la vue groupée, au cursus et à sa page de garde."""
+    sems: set[int] = set()
+    for r in rels:
+        if r.semestre:
+            sems.update(range(r.semestre, (r.semestre_fin or r.semestre) + 1))
+    if sems:
+        return [f"S{n}" for n in range(1, max(sems) + 1) if n not in sems]
+    nums = {r.niveau_num for r in rels if 0 < r.niveau_num < 100}
+    if not nums:
+        return []
+    return [f"Niveau {n}" for n in range(1, max(nums) + 1) if n not in nums]
+
+
+def resolve_cache(value: str | None, cache_dir: Path | None) -> str | None:
+    """Le cache d'aperçu est enregistré par son seul nom de fichier, résolu dans le dossier de cache
+    du poste : la base peut ainsi être copiée sur un autre poste du guichet avec son dossier de données.
+    Les anciennes bases (chemin absolu) restent lisibles."""
+    if not value:
+        return None
+    p = Path(value)
+    if not p.is_absolute():
+        return str((cache_dir or Path(".")) / p)
+    if not p.exists() and cache_dir is not None and (cache_dir / p.name).exists():
+        return str(cache_dir / p.name)
+    return value
 
 
 class Database:
     """Connexion à la base d'index. Une instance par thread/processus."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, cache_dir: str | Path | None = None):
         self.path = Path(path)
+        self.cache_dir = Path(cache_dir) if cache_dir else None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path), timeout=10, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -217,7 +308,8 @@ class Database:
             self.conn.executescript(SCHEMA)
             cols = {r[1] for r in self.conn.execute("PRAGMA table_info(etudiants_releves)")}
             for col, decl in (("semestre", "INTEGER"), ("decision", "VARCHAR(80)"), ("credits", "INTEGER"),
-                              ("grade", "VARCHAR(4)"), ("mgp", "VARCHAR(6)"), ("lieu_naissance", "VARCHAR(80)")):
+                              ("grade", "VARCHAR(4)"), ("mgp", "VARCHAR(6)"), ("lieu_naissance", "VARCHAR(80)"),
+                              ("semestre_fin", "INTEGER"), ("cycle", "VARCHAR(20)"), ("option_filiere", "VARCHAR(60)")):
                 if col not in cols:  # base créée par une version précédente
                     self.conn.execute(f"ALTER TABLE etudiants_releves ADD COLUMN {col} {decl}")
             row = self.conn.execute("SELECT valeur FROM meta WHERE cle='fts_mode'").fetchone()
@@ -238,7 +330,7 @@ class Database:
                 self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('fts_mode', ?)", (self.fts_mode,))
             if self.fts_mode != "none":
                 self.conn.executescript(FTS_TRIGGERS)
-            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', '2')")
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', '3')")
             self.conn.commit()
 
     def close(self) -> None:
@@ -248,6 +340,48 @@ class Database:
     def file_state(self, chemin: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
 
+    def file_signatures(self) -> dict[str, tuple[int, float]]:
+        """{chemin: (taille, mtime)} de tous les fichiers indexés (une seule requête pour le différentiel)."""
+        return {r[0]: (r[1], r[2]) for r in self.conn.execute("SELECT chemin, taille, mtime FROM fichiers")}
+
+    def store_result(self, chemin: str, type_fichier: str, taille: int, mtime: float, nb_pages: int,
+                     cache_pdf: str | None, statut: str, message: str | None, releves: Iterable[dict],
+                     anomalies: Iterable[tuple]) -> int:
+        """Enregistre un fichier, ses relevés et (si fournies) ses anomalies dans une seule transaction."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                fid = self._save_file_tx(cur, chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut,
+                                         message, releves)
+                if anomalies is not None:
+                    cur.execute("DELETE FROM anomalies WHERE chemin=?", (chemin,))
+                    cur.executemany("INSERT INTO anomalies(niveau, chemin, message, action) VALUES (?,?,?,?)",
+                                    [(niveau, chemin, msg, action) for niveau, msg, action in anomalies])
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+        self._token_index = None
+        return fid
+
+    def releves_of_file(self, fichier_id: int) -> list[Releve]:
+        return self._select("r.fichier_id = ?", [fichier_id], order="r.numero_page, r.id")
+
+    def attach_preview(self, fichier_id: int, cache_name: str, pages: dict[int, tuple[int, int]]) -> None:
+        """Enregistre le PDF d'aperçu produit à la demande et les numéros de page exacts qu'il donne."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                cur.execute("UPDATE fichiers SET cache_pdf=? WHERE id=?", (cache_name, fichier_id))
+                for rid, (debut, fin) in pages.items():
+                    cur.execute("UPDATE etudiants_releves SET numero_page=?, page_fin=? WHERE id=?", (debut, fin, rid))
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
     def all_files(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM fichiers ORDER BY chemin").fetchall()
 
@@ -255,44 +389,41 @@ class Database:
                   cache_pdf: str | None, statut: str, message: str | None,
                   releves: Iterable[dict]) -> int:
         """Remplace (atomiquement) l'enregistrement d'un fichier et ses relevés."""
-        with self._lock:
-            cur = self.conn.cursor()
-            cur.execute("BEGIN")
-            try:
-                old = cur.execute("SELECT id FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
-                if old:
-                    cur.execute("DELETE FROM etudiants_releves WHERE fichier_id=?", (old["id"],))
-                    cur.execute(
-                        "UPDATE fichiers SET type_fichier=?, taille=?, mtime=?, nb_pages=?, cache_pdf=?, statut=?, "
-                        "message=?, date_indexation=datetime('now','localtime') WHERE id=?",
-                        (type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message, old["id"]),
-                    )
-                    fid = old["id"]
-                else:
-                    cur.execute(
-                        "INSERT INTO fichiers(chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message) "
-                        "VALUES (?,?,?,?,?,?,?,?)",
-                        (chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message),
-                    )
-                    fid = cur.lastrowid
-                for r in releves:
-                    cur.execute(
-                        "INSERT INTO etudiants_releves(fichier_id, matricule, matricule_brut, nom, prenom, nom_complet, "
-                        "nom_norm, date_naissance, filiere, filiere_code, niveau, niveau_num, annee_academique, session, "
-                        "statut, moyenne, numero_page, page_fin, ocr_confiance, extrait, semestre, decision, credits, grade, mgp, "
-                        "lieu_naissance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (fid, r["matricule"], r.get("matricule_brut"), r.get("nom"), r.get("prenom"),
-                         r["nom_complet"], norm_text(r["nom_complet"]), r.get("date_naissance"), r.get("filiere"),
-                         r.get("filiere_code"), r.get("niveau"), r.get("niveau_num", 0), r.get("annee_academique"),
-                         r.get("session"), r.get("statut"), r.get("moyenne"), r["numero_page"], r["page_fin"],
-                         r.get("ocr_confiance"), r.get("extrait"), r.get("semestre"), r.get("decision"),
-                         r.get("credits"), r.get("grade"), r.get("mgp"), r.get("lieu_naissance")),
-                    )
-                cur.execute("COMMIT")
-            except Exception:
-                cur.execute("ROLLBACK")
-                raise
-        self._token_index = None
+        return self.store_result(chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message, releves, None)
+
+    def _save_file_tx(self, cur, chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message,
+              releves) -> int:
+        old = cur.execute("SELECT id FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
+        if old:
+            cur.execute("DELETE FROM etudiants_releves WHERE fichier_id=?", (old["id"],))
+            cur.execute(
+                "UPDATE fichiers SET type_fichier=?, taille=?, mtime=?, nb_pages=?, cache_pdf=?, statut=?, "
+                "message=?, date_indexation=datetime('now','localtime') WHERE id=?",
+                (type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message, old["id"]),
+            )
+            fid = old["id"]
+        else:
+            cur.execute(
+                "INSERT INTO fichiers(chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message),
+            )
+            fid = cur.lastrowid
+        for r in releves:
+            cur.execute(
+                "INSERT INTO etudiants_releves(fichier_id, matricule, matricule_brut, nom, prenom, nom_complet, "
+                "nom_norm, date_naissance, filiere, filiere_code, niveau, niveau_num, annee_academique, session, "
+                "statut, moyenne, numero_page, page_fin, ocr_confiance, extrait, semestre, decision, credits, grade, mgp, "
+                "lieu_naissance, semestre_fin, cycle, option_filiere) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (fid, r["matricule"], r.get("matricule_brut"), r.get("nom"), r.get("prenom"),
+                 r["nom_complet"], norm_text(r["nom_complet"]), r.get("date_naissance"), r.get("filiere"),
+                 r.get("filiere_code"), r.get("niveau"), r.get("niveau_num", 0), r.get("annee_academique"),
+                 r.get("session"), r.get("statut"), r.get("moyenne"), r["numero_page"], r["page_fin"],
+                 r.get("ocr_confiance"), r.get("extrait"), r.get("semestre"), r.get("decision"),
+                 r.get("credits"), r.get("grade"), r.get("mgp"), r.get("lieu_naissance"),
+                 r.get("semestre_fin", r.get("semestre")), r.get("cycle"), r.get("option_filiere")),
+            )
         return fid
 
     def remove_file(self, chemin: str) -> None:
@@ -366,7 +497,7 @@ class Database:
             sql += f" ORDER BY {order}"
         if limit:
             sql += f" LIMIT {int(limit)}"
-        return [_row_to_releve(row) for row in self.conn.execute(sql, args).fetchall()]
+        return [_row_to_releve(row, self.cache_dir) for row in self.conn.execute(sql, args).fetchall()]
 
     def get(self, releve_id: int) -> Releve | None:
         res = self._select("r.id = ?", [releve_id])
@@ -400,6 +531,12 @@ class Database:
             for tok, score, _ in process.extract(t, vocab, scorer=fuzz.ratio, score_cutoff=threshold, limit=60):
                 for name in index[tok]:
                     found[name] = max(found.get(name, 0), int(round(score)))
+            # Noms collés dans certains fichiers (« PRENOMNOM ») : le mot cherché est une PARTIE du mot indexé.
+            glued = [v for v in vocab if len(v) >= len(t) + 3]
+            for tok, score, _ in process.extract(t, glued, scorer=fuzz.partial_ratio, score_cutoff=threshold - 5,
+                                                 limit=60):
+                for name in index[tok]:
+                    found[name] = max(found.get(name, 0), int(round(score)) - 5)
             per_token.append(found)
         common = set(per_token[0])
         for d in per_token[1:]:
@@ -412,29 +549,51 @@ class Database:
         if not q:
             return []
         qm = norm_matricule(q)
-        qn = norm_text(q)
         years = re.findall(r"\b((?:19|20)\d{2})\b", q)
-        words = [w for w in qn.split() if not re.fullmatch(r"\d+", w)]
         clauses, args = [], []
 
+        def matricule_clause(t: str) -> None:
+            m2 = re.fullmatch(r"(\d{2}[A-Z]{1,4})(\d{2})", t)
+            if m2:   # zéro omis : « 98MP12 » -> 98MP012 (ou un préfixe de 98MP12x)
+                clauses.append("(r.matricule LIKE ? OR r.matricule = ?)")
+                args.extend([f"{t}%", f"{m2.group(1)}0{m2.group(2)}"])
+            elif re.fullmatch(r"[A-Z]{1,4}\d{2,4}", t):   # sans l'année : « MP112 »
+                clauses.append("r.matricule LIKE ?")
+                args.append(f"%{t}")
+            else:
+                clauses.append("r.matricule LIKE ?")
+                args.append(f"{t}%")
+
+        words: list[str] = []
         if looks_like_matricule(q) or (re.fullmatch(r"\d{2}[A-Z]{1,4}\d{0,4}", qm) and not years):
-            # 1) Matricule complet ou préfixe (« 18M0 », « 19-m/042 »)
-            clauses.append("r.matricule LIKE ?")
-            args.append(f"{qm}%")
-            words = []
+            # 1) Matricule complet ou préfixe (« 18M0 », « 19-m/042 », « 19 MP 031 »)
+            matricule_clause(qm)
         elif qm.isdigit() and not years:
             # Fin de matricule seule (« 042 »)
             clauses.append("r.matricule LIKE ?")
             args.append(f"%{qm}%")
         else:
+            rest = []
+            for tok in q.split():
+                t = norm_matricule(tok)
+                if re.fullmatch(r"\d{2}[A-Z]{1,4}\d{1,4}|[A-Z]{1,4}\d{3,4}", t) and not re.fullmatch(r"(?:19|20)\d{2}", t):
+                    matricule_clause(t)          # saisie mixte : « 98MP112 NOM », « 98MP112 2020 »
+                else:
+                    rest.append(tok)
+            words = [w for w in norm_text(" ".join(rest)).split() if not re.fullmatch(r"\d+", w)]
             # 2) Année(s) académique(s) ET 3) chaque mot du nom
             for y in years:
                 clauses.append("r.annee_academique LIKE ?")
                 args.append(f"%{y}%")
             for w in words:
-                clauses.append("r.nom_norm LIKE ?")
-                args.append(f"%{w}%")
-
+                if len(w) < 3:   # mot très court : mot entier seulement (évite « A » -> 115 résultats)
+                    clauses.append("(' ' || r.nom_norm || ' ') LIKE ?")
+                    args.append(f"% {w} %")
+                else:
+                    clauses.append("r.nom_norm LIKE ?")
+                    args.append(f"%{w}%")
+        has_matricule = any("r.matricule" in c for c in clauses)
+        fuzzy_words = [] if has_matricule else [w for w in words if len(w) >= 3]
         exact: list[Releve] = []
         if clauses:
             where = "(" + " AND ".join(clauses) + ")"
@@ -446,8 +605,8 @@ class Database:
 
         results = {r.id: r for r in exact}
         # 4) Tolérance aux fautes (KOUAM / KOUAME, TCHOUA / TCHOUWA...)
-        if tolerant and words:
-            scores = self._fuzzy_names(" ".join(words), threshold)
+        if tolerant and fuzzy_words:
+            scores = self._fuzzy_names(" ".join(fuzzy_words), threshold)
             names = list(scores)
             if names:
                 placeholders = ",".join("?" * len(names))
@@ -465,8 +624,7 @@ class Database:
                         results[r.id] = r
 
         out = list(results.values())
-        out.sort(key=lambda r: (-r.score, r.nom_norm, r.matricule, r.niveau_num, r.semestre or 0,
-                                r.annee_academique or "", 0 if (r.session or "").lower().startswith("rattrap") else -1))
+        out.sort(key=_result_order(out, words))
         self._flag(out)
         return out[:limit]
 
@@ -559,21 +717,22 @@ class Database:
         if year_to:
             where.append("CAST(substr(r.annee_academique, 1, 4) AS INTEGER) <= ?")
             args.append(year_to)
-        ok = "(upper(r.statut) LIKE 'ADMIS%' OR r.statut = 'VALIDÉ')"
-        if statut == "admis":
-            where.append(ok)
-        elif statut == "non_valides":
-            where.append(f"(r.statut IS NULL OR NOT {ok})")
         rels = self._select(" AND ".join(where), args,
                             order="r.annee_academique, r.nom_norm, r.niveau_num, r.semestre")
         if dernier_niveau:
+            # D'abord le DERNIER relevé de chaque étudiant (tous statuts confondus), ensuite le filtre de statut :
+            # un étudiant qui a validé au redoublement n'apparaît pas parmi les « non validés ».
             best: dict[str, Releve] = {}
             for r in rels:
                 cur = best.get(r.matricule)
-                if cur is None or (r.niveau_num, r.semestre or 0, r.annee_academique or "") > \
-                        (cur.niveau_num, cur.semestre or 0, cur.annee_academique or ""):
+                if cur is None or (r.niveau_num, r.semestre or 0, r.annee_academique or "", r.is_success) > \
+                        (cur.niveau_num, cur.semestre or 0, cur.annee_academique or "", cur.is_success):
                     best[r.matricule] = r
             rels = sorted(best.values(), key=lambda r: (r.annee_academique or "", r.nom_norm))
+        if statut == "admis":
+            rels = [r for r in rels if r.is_success]
+        elif statut == "non_valides":
+            rels = [r for r in rels if not r.is_success]
         return rels
 
     def distinct_years(self) -> list[int]:

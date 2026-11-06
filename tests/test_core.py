@@ -4,20 +4,10 @@
 """
 from __future__ import annotations
 
-import os
-import shutil
-import sys
-from pathlib import Path
-
 import pytest
-
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "tools"))
+from conftest import HAS_CONVERTER, HAS_TESSERACT
 
 from core import pdf_tools  # noqa: E402
-from core.config import Settings  # noqa: E402
-from core.database import Database  # noqa: E402
 from core.extractors import PageText  # noqa: E402
 from core.indexer import Indexer, check_integrity  # noqa: E402
 from core.normalize import find_matricules, norm_matricule, norm_text  # noqa: E402
@@ -72,17 +62,7 @@ def test_hints_from_path():
 
 
 # ---------------------------------------------------- indexation de bout en bout
-@pytest.fixture(scope="module")
-def indexed(tmp_path_factory):
-    import generate_samples
-    base = tmp_path_factory.mktemp("fmsp")
-    archives = base / "archives"
-    generate_samples.generate(archives)
-    os.environ["FMSP_DATA_DIR"] = str(base / "data")
-    settings = Settings(cache_dir=str(base / "cache"), db_path=str(base / "test.db"))
-    db = Database(settings.db_path)
-    counters = Indexer(settings, db).run(archives, only_new=False)
-    return db, settings, archives, counters
+# (fixture « indexed » : voir conftest.py)
 
 
 def test_indexing_counts(indexed):
@@ -114,8 +94,6 @@ def test_cursus_and_rattrapage(indexed):
     assert db.correlated_matricules("18M042")[0]["matricule"] == "15B077"
 
 
-HAS_TESSERACT = bool(shutil.which("tesseract")) or Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe").exists()
-HAS_CONVERTER = bool(shutil.which("soffice") or shutil.which("libreoffice"))
 
 
 @pytest.mark.skipif(not HAS_TESSERACT, reason="Tesseract non installé")
@@ -126,13 +104,16 @@ def test_ocr_scan(indexed):
 
 
 def test_pdf_tools(indexed, tmp_path):
-    db = indexed[0]
+    db, settings = indexed[0], indexed[1]
     rel = next(r for r in db.cursus("18M042") if r.nb_pages == 2)
     out = pdf_tools.extract_pages(rel.preview_pdf, rel.numero_page, rel.page_fin, tmp_path / "x.pdf",
                                   stamp=pdf_tools.stamp_text())
     from pypdf import PdfReader
     assert len(PdfReader(str(out)).pages) == 2
-    path, n, missing = pdf_tools.merge_releves(pdf_tools.select_for_cursus(db.cursus("18M042")), tmp_path / "c.pdf")
+    from core.preview import PreviewService
+    svc = PreviewService(db, settings)
+    path, n, missing = pdf_tools.merge_releves(pdf_tools.select_for_cursus(db.cursus("18M042")), tmp_path / "c.pdf",
+                                               prepare=svc.ensure)
     if HAS_CONVERTER:
         assert n == 1 + 7 and not missing     # page de garde + 7 pages
     else:                                     # .docx sans aperçu : signalés comme manquants, jamais d'erreur
@@ -166,7 +147,7 @@ NOUVEAU = """REPUBLIQUE DU CAMEROUN
 UNIVERSITE DE DOUALA UNIVERSITY OF DOUALA
 FACULTE DE MEDECINE ET DES SCIENCES PHARMACEUTIQUES
 RELEVE DE NOTES /TRANSCRIPT
-N OM ET PRENOM: ETUDIANT TEST ALPHA MATRICULE: 17MM023
+N OM ET PRENOM: ETUDIANT TEST ALPHA MATRICULE: 98MM108
 su rname and name: Registration N°:
 A AWAE
 NÉ(E) LE : 02\\01\\1997
@@ -181,7 +162,7 @@ A + 4.0 Excellent [18-20]
 """
 
 LSB = """RELEVE DE NOTES / TRANSCRIPT
-NOM(S) ET PRENOM(S): ETUDIANTE TEST BETA GAMMA MATRICULE: 23LSB010
+NOM(S) ET PRENOM(S): ETUDIANTE TEST BETA GAMMA MATRICULE: 98LSB111
 surname and name: Registration N°:
 NÉ(E) LE: 22/08/2006 A: VILLE
 CYCLE: LICENCE ANNÉE ACADÉMIQUE: 2024-2025 FILIÈRE: SCIENCES BIOMÉDICALES
@@ -194,7 +175,7 @@ NIVEAU CREDIT
 """
 
 ANCIEN = """RELEVE DE NOTES /TRANSCRIPT
-NOM ET PRENOM : ETUDIANT ANCIEN DELTA MATRICULE: 11EM640
+NOM ET PRENOM : ETUDIANT ANCIEN DELTA MATRICULE: 98EM104
 Surname and name: Registration N°:
 NÉ(E) LE : 18/11/1992 A : VILLE
 NIVEAU: III ANNÉE ACADÉMIQUE: 2013 - 2014 FILIÈRE: MEDECINE
@@ -213,7 +194,7 @@ Il n’est délivré qu’un seul exemplaire de reléve de note , le titulaire p
 def test_format_recent_recap_et_libelles_coupes():
     rels, warns = parse_pages([_page(1, NOUVEAU)], r"X:\Archives\Releve_X_EM1_S2_22-23.pdf")
     r = rels[0]
-    assert (r["matricule"], r["nom_complet"]) == ("17MM023", "ETUDIANT TEST ALPHA")
+    assert (r["matricule"], r["nom_complet"]) == ("98MM108", "ETUDIANT TEST ALPHA")
     assert (r["niveau"], r["semestre"], r["annee_academique"]) == ("Niveau 1", 2, "2022-2023")
     assert (r["moyenne"], r["credits"], r["grade"], r["mgp"]) == ("9,48", 24, "C-", "1,7")
     assert (r["statut"], r["decision"]) == ("NON VALIDÉ", "SEMESTRE NON VALIDE")
@@ -222,7 +203,7 @@ def test_format_recent_recap_et_libelles_coupes():
 
 def test_matricule_lsb_et_sciences_biomedicales():
     r = parse_pages([_page(1, LSB)], "x.pdf")[0][0]
-    assert (r["matricule"], r["filiere_code"], r["niveau"], r["semestre"]) == ("23LSB010", "B", "Niveau 2", 3)
+    assert (r["matricule"], r["filiere_code"], r["niveau"], r["semestre"]) == ("98LSB111", "B", "Niveau 2", 3)
     assert r["statut"] == "VALIDÉ" and r["moyenne"] == "12,31"
 
 
@@ -243,5 +224,5 @@ def test_fichier_collectif_page_vide_et_doublon_avec_entete():
 def test_roman_et_matricules_longs():
     from core.normalize import filiere_code_from_matricule, roman_or_int
     assert [roman_or_int(x) for x in ("I", "IV", "VI", "XII", "3")] == [1, 4, 6, 12, 3]
-    assert find_matricules("MATRICULE :19MP001 et 23LSB010") == ["19MP001", "23LSB010"]
-    assert [filiere_code_from_matricule(m) for m in ("19MM071", "19MP001", "11EM641", "23LSB010")] == ["M", "P", "M", "B"]
+    assert find_matricules("MATRICULE :98MP110 et 98LSB111") == ["98MP110", "98LSB111"]
+    assert [filiere_code_from_matricule(m) for m in ("98MM109", "98MP110", "98EM101", "98LSB111")] == ["M", "P", "M", "B"]

@@ -1,11 +1,13 @@
-# Archives Relevés FMSP
+# Scolarix — Archives des relevés de notes (FMSP)
+
+<img src="assets/scolarix.svg" width="96" align="right" alt="Logo Scolarix">
 
 Application de bureau Windows pour la Cellule Informatique de la FMSP (Université de Douala).
 Elle **indexe les relevés de notes** accumulés au fil des années (Word .doc/.docx, PDF texte, PDF scannés),
 puis permet au guichet de **retrouver, prévisualiser, imprimer et exporter un relevé en moins de 10 secondes**,
 sans ouvrir Word ni Adobe et **sans jamais modifier les originaux**.
 
-Python 3.11+ · PySide6 (Qt 6, QtPdf) · SQLite WAL + FTS5 · pdfplumber · Tesseract · pypdf · reportlab
+Python 3.11+ · PySide6 (Qt 6, QtPdf) · SQLite WAL + FTS5 · pypdfium2 · python-docx · Tesseract · pypdf · reportlab
 
 ![Guichet](docs/captures/guichet.png)
 
@@ -15,7 +17,8 @@ Python 3.11+ · PySide6 (Qt 6, QtPdf) · SQLite WAL + FTS5 · pdfplumber · Tess
 |---|---|---|
 | **Guichet** | Omnibox avec recherche au fil de la frappe (délai de 120 ms après la dernière touche) et normalisation `19-m/042 → 19M042`. Tolérance aux fautes, filtres par filière. Tableau avec surlignage de la frappe et pastilles (ADMIS, AJOURNÉ, RATTRAPAGE, 2 PAGES LIÉES, PROCHE À 92 %, DOUBLON NIVEAU, SCAN OCR). Aperçu PDF haute définition dans un split-view 55/45. Bandeaux d'alerte (échec/rattrapage, pages liées, OCR, résultat approché). Impression directe, export PDF unitaire, timbre « Duplicata conforme », vue groupée par étudiant. | S1.1–S1.4, S2.1, S2.4, S3.3, S4.2 |
 | **Cursus** | Fusion chronologique N1 → N7 en un seul PDF avec page de garde. Les échecs sont exclus quand un rattrapage ADMIS existe. Les niveaux manquants sont signalés. Un ancien matricule peut être rattaché (même nom + date de naissance). | S1.4, S2.1, S2.2 |
-| **Indexation** | Robot dans un processus séparé qui ne gèle jamais l'interface. Le guichet reste utilisable pendant qu'il travaille. Conversion Word → PDF (COM Word ou LibreOffice), OCR avec redressement et seuillage Otsu. Mode différentiel, vérification d'intégrité (liens orphelins), journal d'anomalies, statistiques du fonds. | S4.1, S4.3, S4.4 |
+| **Indexation** | Robot dans un processus séparé qui ne gèle jamais l'interface, avec **plusieurs processus de lecture en parallèle**. Le guichet reste utilisable pendant qu'il travaille. Les `.docx` sont lus directement (pas de conversion), les `.doc` passent par Word/LibreOffice en `.docx`, les scans par l'OCR (redressement + Otsu). **Exclusion de sous-dossiers et de motifs** (`*DIPLOME*`…). Arrêt propre, mode différentiel, vérification d'intégrité, journal d'anomalies, statistiques du fonds. | S4.1, S4.3, S4.4 |
+| **Corrections Word** | Sur les seuls fichiers Word, corrections de texte appliquées à une **copie** au moment de l'aperçu, de l'impression et de l'export : retrait de l'ancien téléphone, « Ref N° » devant le titre, nouvelle référence `/FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE`. Règles modifiables (Réglages › Corrections), essai en direct, mention dans le journal. | — |
 | **Extraction & journal** | Listes pour le Décanat (filière, plage d'années, statut, dernier niveau) exportées en Excel ou CSV. Journal non modifiable des consultations, impressions, exports, duplicatas et vérifications. | S3.2, traçabilité |
 | **Vérification** | Document soumis et original affichés côte à côte, comparaison champ par champ (notes, moyenne, décision), rapport PDF et journalisation. | S3.1 |
 
@@ -30,7 +33,15 @@ Raccourcis :
 | `Ctrl+Maj+E` | Cursus complet |
 | `Ctrl+1…4` | Changer d'écran |
 
-## Installation (poste de la Cellule Informatique, Windows 10/11)
+## Installation
+
+**Le plus simple : l'installateur** `Scolarix_Setup_x.y.z.exe` (artefact « Scolarix_Installateur_Windows » des
+GitHub Actions, ou page *Releases*). Il installe Scolarix dans *Program Files*, crée les raccourcis (menu
+Démarrer, bureau en option) et un désinstallateur (Paramètres › Applications). Les données (index, cache,
+configuration) restent dans `%APPDATA%\FMSP_Archives` et ne sont pas effacées à la désinstallation.
+Une version portable (zip) est aussi produite.
+
+### Poste de développement (Windows 10/11)
 
 1. **Python 3.11 ou plus récent** — https://www.python.org (cocher « Add to PATH »).
 2. **Tesseract OCR** avec la langue française — https://github.com/UB-Mannheim/tesseract/wiki
@@ -52,7 +63,23 @@ run_dev.bat
 build_windows.bat
 ```
 
-Le script lance les tests, puis produit `dist\FMSP_Archives\FMSP_Archives.exe`. Copiez ce dossier sur les postes du guichet : Python n'y est plus nécessaire. Tesseract et Word/LibreOffice restent nécessaires **uniquement sur le poste qui indexe**.
+Le script lance les tests, produit `dist\Scolarix\Scolarix.exe`, puis l'installateur `Output\Scolarix_Setup_x.y.z.exe` si [Inno Setup 6](https://jrsoftware.org/isinfo.php) est installé. Tesseract est nécessaire **uniquement sur le poste qui indexe** ; Word ou LibreOffice sur le poste qui indexe des `.doc` **et** sur les postes qui affichent ou impriment des relevés Word (l'aperçu PDF est produit à la première consultation, puis gardé en cache).
+
+## Vitesse d'indexation
+
+Mesures sur les relevés réels fournis (14 fichiers, 127 relevés) et sur un lot de 560 fichiers :
+
+| Étape | Avant | Maintenant |
+|---|---|---|
+| Texte d'un PDF collectif de 87 pages | ≈ 24 s (pdfplumber) | ≈ 0,3 s (pypdfium2, même texte) |
+| Relevé `.docx` | conversion Word → PDF (plusieurs secondes) | lecture directe ≈ 0,05 s ; aperçu produit à la 1re consultation |
+| Relevé `.doc` 97-2003 | Word → PDF | Word → `.docx` (plus rapide), puis lecture directe |
+| 560 fichiers, 1 processus | — | 31 s (18 fichiers/s) |
+| 560 fichiers, 2 processus (2 cœurs) | — | 16 s (35 fichiers/s) |
+| Relance différentielle (rien de changé) | — | 0,01 s |
+
+Les gains réels dépendent du partage réseau et de la part de scans (OCR) et de `.doc`. Réglages › Indexation :
+nombre de processus (automatique = cœurs − 1, au plus 4) et exclusions.
 
 ## Tester tout de suite, sans les vraies archives
 
@@ -107,7 +134,9 @@ fmsp_archive_app/
 │   ├── database.py            # SQLite WAL, FTS5 trigram, recherche floue rapidfuzz, journal
 │   ├── extractors.py          # PDF, OCR (deskew + Otsu), Word → PDF (COM / LibreOffice), .docx
 │   ├── parsing.py             # blocs étudiant, relevés sur plusieurs pages, métadonnées
-│   ├── indexer.py             # robot (processus séparé, JSON lines, différentiel, intégrité)
+│   ├── indexer.py             # robot : processus parallèles, exclusions, différentiel, arrêt propre
+│   ├── preview.py             # aperçu PDF des relevés Word produit à la demande (+ pages recalculées)
+│   ├── text_rules.py          # corrections de texte des .docx (copie, en-têtes, runs découpés)
 │   ├── pdf_tools.py           # découpe, fusion du cursus, timbre Duplicata
 │   ├── printer_service.py     # impression silencieuse (SumatraPDF / PDFtoPrinter / Qt)
 │   ├── exporter.py            # Excel / CSV
@@ -121,7 +150,10 @@ fmsp_archive_app/
 │   └── widgets.py · icons.py · settings_dialog.py
 ├── tools/generate_samples.py  # faux fonds d'archives pour tester
 ├── tools/screenshots.py       # captures automatiques
-└── tests/test_core.py         # 18 tests (normalisation, parsing, indexation de bout en bout)
+├── assets/                    # logo (SVG, ICO, PNG) et images de l'installateur
+├── installer/scolarix.iss     # installateur Inno Setup
+└── tests/                     # 82 tests : parsing (formats réels anonymisés), indexation parallèle,
+                               # exclusions, corrections Word, aperçu à la demande, recherche, exports, interface
 ```
 
 **Règles métier respectées**
@@ -133,7 +165,7 @@ fmsp_archive_app/
 **Écarts corrigés par rapport au plan directeur**
 
 - **Schéma SQL.** `VARCHAR INDEXED` n'existe pas en SQLite : les index sont créés séparément. La table FTS5 est synchronisée par des triggers.
-- **Numéros de page Word.** Un document Word n'a pas de pages fixes. Chaque Word est donc converti en PDF à l'indexation, ce qui donne à la fois les **vrais** numéros de page et un aperçu identique.
+- **Numéros de page Word.** Un document Word n'a pas de pages fixes. À l'indexation, la pagination est estimée (sauts de page enregistrés par Word, en-têtes de relevé) ; à la première consultation, le PDF rendu par Word donne les **vrais** numéros de page, et chaque relevé du fichier y est retrouvé par son matricule avant tout affichage ou impression.
 - **Levenshtein.** SQLite ne le propose pas : la recherche combine FTS5/`LIKE` et `rapidfuzz`.
 
 ## Limites connues / suite possible

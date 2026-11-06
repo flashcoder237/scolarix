@@ -1,18 +1,18 @@
 """Extraction du texte page par page, pour chaque format d'archive.
 
 Stratégie :
-- PDF texte      : pdfplumber, page par page ;
+- PDF texte      : PDFium (pypdfium2), page par page — pdfplumber en secours ;
 - PDF scanné     : rendu 300 DPI (pypdfium2) + pré-traitement (redressement, seuillage Otsu) + Tesseract ;
-- Word .doc/.docx: conversion en PDF dans le cache (COM Word sous Windows, sinon LibreOffice),
-                   puis lecture du PDF. On obtient ainsi les VRAIS numéros de page et l'aperçu
-                   identique au guichet. Sans convertisseur, les .docx sont lus avec python-docx
-                   (pagination d'après les sauts de page enregistrés par Word) mais sans aperçu.
+- Word .docx     : lecture directe python-docx (pagination d'après les sauts de page enregistrés par
+                   Word et les en-têtes de relevé) ; l'aperçu PDF est produit à la demande (core/preview.py) ;
+- Word .doc      : Word (COM) ou LibreOffice l'enregistre en .docx dans le cache, puis lecture directe.
 
 Aucune fonction de ce module n'écrit dans le dossier source : les conversions vont dans le cache.
 """
 from __future__ import annotations
 
 import os
+import re
 import platform
 import shutil
 import subprocess
@@ -84,6 +84,45 @@ def _check_ole_word(path: Path) -> None:
 
 # ---------------------------------------------------------------- PDF texte
 def pdf_pages_text(pdf_path: Path) -> list[PageText]:
+    """Texte de chaque page. Moteur PDFium (pypdfium2) : ~50 fois plus rapide que pdfplumber sur les
+    relevés FMSP (87 pages : 0,3 s contre 15 s), résultat identique, et il démêle mieux les textes
+    superposés. pdfplumber reste un recours si PDFium échoue sur un fichier."""
+    try:
+        return _pages_pdfium(pdf_path)
+    except ExtractionError:
+        raise
+    except Exception:
+        return _pages_pdfplumber(pdf_path)
+
+
+def _pages_pdfium(pdf_path: Path) -> list[PageText]:
+    import pypdfium2 as pdfium
+    try:
+        doc = pdfium.PdfDocument(str(pdf_path))
+    except pdfium.PdfiumError as exc:
+        msg = str(exc).lower()
+        if "password" in msg:
+            raise ExtractionError("PDF protégé par mot de passe : ignoré.") from exc
+        raise
+    pages: list[PageText] = []
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            try:
+                tp = page.get_textpage()
+                text = (tp.get_text_bounded() or "").replace("\r\n", "\n").replace("\r", "\n")
+                tp.close()
+            except Exception:  # page abîmée : on continue
+                text = ""
+            finally:
+                page.close()
+            pages.append(PageText(i + 1, text))
+    finally:
+        doc.close()
+    return pages
+
+
+def _pages_pdfplumber(pdf_path: Path) -> list[PageText]:
     import pdfplumber
     pages: list[PageText] = []
     try:
@@ -91,7 +130,7 @@ def pdf_pages_text(pdf_path: Path) -> list[PageText]:
             for i, page in enumerate(pdf.pages, start=1):
                 try:
                     text = page.extract_text() or ""
-                except Exception:  # page abîmée : on continue
+                except Exception:
                     text = ""
                 pages.append(PageText(i, text))
     except Exception as exc:
@@ -257,12 +296,13 @@ class WordConverter:
             self._word.DisplayAlerts = 0
         return self._word
 
-    def convert(self, src: Path, dest: Path) -> None:
+    def convert(self, src: Path, dest: Path, fmt: str = "pdf") -> None:
+        """Convertit ``src`` en ``fmt`` (« pdf » ou « docx ») vers ``dest``. L'original n'est jamais modifié."""
         dest.parent.mkdir(parents=True, exist_ok=True)
         errors = []
         if self._com_ok:
             try:
-                self._convert_com(src, dest)
+                self._convert_com(src, dest, fmt)
                 return
             except ExtractionError:
                 raise
@@ -271,14 +311,14 @@ class WordConverter:
                 self.close()
         if self._soffice:
             try:
-                self._convert_lo(src, dest)
+                self._convert_lo(src, dest, fmt)
                 return
             except Exception as exc:
                 errors.append(f"LibreOffice : {exc}")
-        raise ExtractionError("Conversion en PDF impossible. " + " | ".join(errors) if errors
+        raise ExtractionError(f"Conversion en {fmt.upper()} impossible. " + " | ".join(errors) if errors
                               else "Aucun convertisseur Word → PDF disponible (installer Word ou LibreOffice).")
 
-    def _convert_com(self, src: Path, dest: Path) -> None:
+    def _convert_com(self, src: Path, dest: Path, fmt: str = "pdf") -> None:
         word = self._word_app()
         try:
             # Mot de passe factice : un document protégé lève une erreur au lieu d'ouvrir une boîte de dialogue.
@@ -291,26 +331,35 @@ class WordConverter:
                 raise ExtractionError("Fichier protégé par mot de passe : ignoré, indexation poursuivie.") from exc
             raise ExtractionError(f"Word ne peut pas ouvrir le fichier (endommagé ?) : {exc}") from exc
         try:
-            doc.ExportAsFixedFormat(str(dest.resolve()), 17)  # 17 = wdExportFormatPDF
+            if fmt == "docx":
+                doc.SaveAs2(str(dest.resolve()), FileFormat=16)   # 16 = wdFormatDocumentDefault (.docx)
+            else:
+                doc.ExportAsFixedFormat(str(dest.resolve()), 17)  # 17 = wdExportFormatPDF
         finally:
             doc.Close(SaveChanges=0)
 
-    def _convert_lo(self, src: Path, dest: Path) -> None:
+    def _convert_lo(self, src: Path, dest: Path, fmt: str = "pdf") -> None:
         with tempfile.TemporaryDirectory(prefix="fmsp_conv_") as tmp:
             # Copie temporaire : LibreOffice ne touche jamais l'original (règle de non-destruction).
             tmp_src = Path(tmp) / ("source" + src.suffix.lower())
             shutil.copy2(src, tmp_src)
             cmd = [self._soffice, f"-env:UserInstallation={self._lo_profile.as_uri()}", "--headless",
-                   "--norestore", "--convert-to", "pdf", "--outdir", tmp, str(tmp_src)]
+                   "--norestore", "--convert-to", fmt, "--outdir", tmp, str(tmp_src)]
             proc = subprocess.run(cmd, capture_output=True, timeout=180,
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            produced = Path(tmp) / "source.pdf"
+            produced = Path(tmp) / f"source.{fmt}"
+            if tmp_src.suffix.lower() == f".{fmt}":   # .docx -> .docx : LibreOffice écrirait sur la copie
+                produced = tmp_src
             if proc.returncode != 0 or not produced.exists():
                 raise ExtractionError("LibreOffice n'a pas pu convertir le fichier (protégé ou endommagé ?).")
             shutil.move(str(produced), dest)
 
 
 # --------------------------------------------------- .docx sans convertisseur
+_DOCX_HEADER_RE = re.compile(r"\s*NOMS?\s*(?:ET|&)\s*PR[ÉE]NOMS?\b", re.IGNORECASE)
+_DOCX_MATRICULE_RE = re.compile(r"MATRICULE\s*:?\s*\d{2}\s?[A-Z]{1,4}\s?\d{2,4}", re.IGNORECASE)
+
+
 def docx_pages_text(path: Path) -> list[PageText]:
     """Lecture python-docx, pagination d'après les sauts de page explicites et ceux mémorisés par Word."""
     import docx
@@ -323,13 +372,22 @@ def docx_pages_text(path: Path) -> list[PageText]:
 
     pages: list[list[str]] = [[]]
 
+    def add(text: str) -> None:
+        # Un relevé qui commence alors que la page courante en contient déjà un : Word l'a placé sur
+        # une nouvelle page par simple débordement (aucun saut enregistré dans le fichier).
+        if _DOCX_HEADER_RE.match(text) and any(_DOCX_MATRICULE_RE.search(x) for x in pages[-1]):
+            pages.append([])
+        pages[-1].append(text)
+
     def walk(element):
         for child in element.iterchildren():
             tag = child.tag
             if tag == qn("w:p"):
                 line = []
                 for node in child.iter():
-                    if node.tag == qn("w:t") and node.text:
+                    if node.tag == qn("w:p") and node is not child:
+                        line.append("\n")  # paragraphe imbriqué (zone de texte) : ne pas coller les mots
+                    elif node.tag == qn("w:t") and node.text:
                         line.append(node.text)
                     elif node.tag == qn("w:tab"):
                         line.append("\t")
@@ -338,12 +396,12 @@ def docx_pages_text(path: Path) -> list[PageText]:
                         # Word enregistre souvent un saut explicite ET un saut « rendu » : on ne coupe
                         # qu'une fois, et seulement si la page courante contient déjà du texte.
                         if "".join(line).strip():
-                            pages[-1].append("".join(line))
+                            add("".join(line))
                             line = []
                         if any(s.strip() for s in pages[-1]):
                             pages.append([])
                 if "".join(line).strip():
-                    pages[-1].append("".join(line))
+                    add("".join(line))
                 ppr = child.find(qn("w:pPr"))
                 if ppr is not None and ppr.find(qn("w:sectPr")) is not None and any(s.strip() for s in pages[-1]):
                     pages.append([])
@@ -352,7 +410,7 @@ def docx_pages_text(path: Path) -> list[PageText]:
                     cells = []
                     for cell in row.iter(qn("w:tc")):
                         cells.append(" ".join(t.text for t in cell.iter(qn("w:t")) if t.text))
-                    pages[-1].append("  ".join(cells))
+                    add("  ".join(cells))
 
     walk(document.element.body)
     texts = ["\n".join(p).strip() for p in pages]

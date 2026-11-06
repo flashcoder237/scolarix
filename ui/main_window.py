@@ -19,9 +19,13 @@ from .widgets import NavButton, shadow
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, db: Database, settings: Settings):
+    def __init__(self, db: Database, settings: Settings, previews=None):
         super().__init__()
         self.db, self.s = db, settings
+        if previews is None:
+            from core.preview import PreviewService
+            previews = PreviewService(db, settings)
+        self.previews = previews
         self.setWindowTitle(f"{APP_NAME} — v{APP_VERSION}")
         self.resize(1480, 940)
         self.setMinimumSize(1100, 700)
@@ -44,20 +48,29 @@ class MainWindow(QMainWindow):
         logo = QLabel()
         logo.setFixedSize(52, 52)
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setPixmap(pixmap("doc", "#FFFFFF", 24))
-        logo.setStyleSheet("QLabel{background:#0F172A;border-radius:16px;}")
+        from .app import resource_path
+        logo_png = resource_path("assets", "scolarix_256.png")
+        if logo_png.exists():
+            from PySide6.QtGui import QPixmap
+            logo.setPixmap(QPixmap(str(logo_png)).scaled(52, 52, Qt.AspectRatioMode.KeepAspectRatio,
+                                                         Qt.TransformationMode.SmoothTransformation))
+        else:
+            logo.setPixmap(pixmap("doc", "#FFFFFF", 24))
+            logo.setStyleSheet("QLabel{background:#0F172A;border-radius:16px;}")
+        logo.setToolTip("Scolarix — Archives des relevés de notes")
         rl.addWidget(logo, 0, Qt.AlignmentFlag.AlignHCenter)
-        brand = QLabel("FMSP")
+        brand = QLabel("SCOLARIX")
         brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        brand.setStyleSheet("font-size:8pt;font-weight:800;letter-spacing:3px;")
+        brand.setStyleSheet("font-size:7pt;font-weight:800;letter-spacing:1px;")
         rl.addWidget(brand)
         rl.addSpacing(18)
 
         self.stack = QStackedWidget()
-        self.guichet = GuichetPage(db, settings)
+        self.guichet = GuichetPage(db, settings, previews)
         self.indexing = IndexingPage(db, settings)
         self.extraction = ExtractionPage(db, settings)
         self.verification = VerificationPage(db, settings)
+        self.verification.previews = previews
         for page in (self.guichet, self.indexing, self.extraction, self.verification):
             self.stack.addWidget(page)
 
@@ -125,6 +138,9 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         if SettingsDialog(self.s, self).exec():
             self.guichet.refresh_header()
+            self.guichet.preview.rules_active = self.s.text_rules_enabled and any(
+                r.get("actif", True) for r in self.s.text_rules)
+            self.indexing._update_excl_btn()
             self.avatar.setText(_initials(self.s.operateur))
 
     def closeEvent(self, event):
