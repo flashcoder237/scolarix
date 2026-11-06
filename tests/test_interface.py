@@ -129,6 +129,18 @@ def test_reglages_regles_et_exclusions(app, window):
     assert rules.table.rowCount() == len(DEFAULT_TEXT_RULES)
     rules.preview()
     assert "3 remplacement" in rules.result.text() and "Ref N°" in rules.result.text()
+    # mise en forme : police, taille, gras, italique de la règle sélectionnée
+    rules.table.setCurrentCell(1, 1)
+    rules.font.setCurrentText("Times New Roman")
+    rules.size.setValue(9.5)
+    rules.bold.setCurrentIndex(rules.bold.findData(True))
+    rules.italic.setCurrentIndex(rules.italic.findData(False))
+    r1 = rules.rules()[1]
+    assert (r1["police"], r1["taille"], r1["gras"], r1["italique"]) == ("Times New Roman", 9.5, True, False)
+    assert "Times New Roman" in rules.table.item(1, 5).text()
+    assert rules.sample_fmt.font().family() == "Times New Roman" and rules.sample_fmt.font().bold()
+    rules.table.setCurrentCell(0, 1)
+    assert rules.font.currentText() == "(police d'origine)"          # chaque règle garde sa mise en forme
     rules.add_rule()
     rules.table.item(rules.table.rowCount() - 1, 2).setText("(")
     rules.table.item(rules.table.rowCount() - 1, 4).setCheckState(Qt.CheckState.Checked)

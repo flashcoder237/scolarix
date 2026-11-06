@@ -5,8 +5,9 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-                               QFormLayout,
+                               QFormLayout, QFrame,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QPushButton,
                                QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
@@ -108,13 +109,28 @@ class ExclusionsDialog(QDialog):
 
 
 # ------------------------------------------------------------ corrections Word
-RULE_COLS = ("Actif", "Description", "Chercher", "Remplacer par", "Regex", "Police", "Taille (pt)", "Gras",
-             "Italique", "Style appliqué à")
-C_ACT, C_DESC, C_FIND, C_REPL, C_RX, C_FONT, C_SIZE, C_BOLD, C_ITAL, C_SCOPE = range(len(RULE_COLS))
+RULE_COLS = ("Actif", "Description", "Chercher", "Remplacer par", "Regex", "Mise en forme")
+C_ACT, C_DESC, C_FIND, C_REPL, C_RX, C_FMT = range(len(RULE_COLS))
+STYLE_KEYS = ("police", "taille", "gras", "italique", "style_sur")
 ORIGINE = "(police d'origine)"
-COMMON_FONTS = ["Arial", "Times New Roman", "Calibri", "Cambria", "Book Antiqua", "Century Gothic", "Garamond",
-                "Georgia", "Tahoma", "Verdana", "Segoe UI", "Arial Narrow", "Bookman Old Style"]
-TRI = {None: Qt.CheckState.PartiallyChecked, True: Qt.CheckState.Checked, False: Qt.CheckState.Unchecked}
+COMMON_FONTS = ["Arial", "Arial Narrow", "Book Antiqua", "Bookman Old Style", "Calibri", "Cambria", "Century Gothic",
+                "Garamond", "Georgia", "Segoe UI", "Tahoma", "Times New Roman", "Verdana"]
+TRI_LABELS = (("Comme l'original", None), ("Oui", True), ("Non", False))
+
+
+def style_summary(st: dict) -> str:
+    bits = []
+    if st.get("police"):
+        bits.append(st["police"])
+    if st.get("taille"):
+        bits.append(f"{st['taille']:g} pt")
+    if st.get("gras") is not None:
+        bits.append("gras" if st["gras"] else "non gras")
+    if st.get("italique") is not None:
+        bits.append("italique" if st["italique"] else "droit")
+    if bits and st.get("style_sur") == "tout":
+        bits.append("tout le résultat")
+    return " · ".join(bits) or "d'origine"
 
 
 class RulesEditor(QWidget):
@@ -130,19 +146,19 @@ class RulesEditor(QWidget):
         self.table.setObjectName("rules")
         self.table.setHorizontalHeaderLabels(RULE_COLS)
         self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         hh = self.table.horizontalHeader()
-        for i in range(len(RULE_COLS)):
-            hh.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+        for c in range(len(RULE_COLS)):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(C_FIND, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(C_REPL, QHeaderView.ResizeMode.Stretch)
-        for col, w in ((C_ACT, 46), (C_DESC, 150), (C_RX, 52), (C_FONT, 150), (C_SIZE, 76), (C_BOLD, 52),
-                       (C_ITAL, 60), (C_SCOPE, 130)):
+        for col, w in ((C_ACT, 48), (C_DESC, 190), (C_RX, 56), (C_FMT, 170)):
             self.table.setColumnWidth(col, w)
-        self.table.setToolTip("Gras / Italique : case grisée = comme le texte d'origine, cochée = oui, vide = non.\n"
-                              "Style appliqué à : « Texte ajouté » ne met en forme que ce qui change (ex. « Ref N° » "
-                              "ajouté devant le titre) ; « Tout le résultat » met en forme tout le texte de remplacement.")
+        self._loading = True
         for r in settings.text_rules:
             self._append(r)
+        self._loading = False
         lay.addWidget(self.table, 1)
         row = QHBoxLayout()
         for label, slot, name in (("Ajouter", self.add_rule, "secondary"), ("Supprimer", self.remove_rule, "ghost"),
@@ -153,11 +169,75 @@ class RulesEditor(QWidget):
             row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
+
+        # ---- mise en forme du texte de remplacement (règle sélectionnée)
+        box = QFrame()
+        box.setObjectName("soft")
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(12, 10, 12, 10)
+        bl.setSpacing(8)
+        self.fmt_title = QLabel("Mise en forme du texte de remplacement")
+        f = self.fmt_title.font()
+        f.setWeight(QFont.Weight.DemiBold)
+        self.fmt_title.setFont(f)
+        bl.addWidget(self.fmt_title)
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
+        self.font = QComboBox()
+        self.font.setEditable(True)
+        self.font.setMinimumWidth(210)
+        self.font.addItem(ORIGINE)
+        try:
+            installed = set(QFontDatabase.families())
+        except Exception:
+            installed = set()
+        self.font.addItems(sorted(set(COMMON_FONTS) | installed))
+        self.font.setToolTip("Police du texte de remplacement. Elle doit être installée sur le poste qui produit "
+                             "l'aperçu (sinon Word en substitue une autre).")
+        self.size = QDoubleSpinBox()
+        self.size.setRange(0, 72)
+        self.size.setDecimals(1)
+        self.size.setSingleStep(0.5)
+        self.size.setSuffix(" pt")
+        self.size.setSpecialValueText("taille d'origine")
+        self.size.setMinimumWidth(140)
+        self.bold = QComboBox()
+        self.italic = QComboBox()
+        for combo in (self.bold, self.italic):
+            for label, value in TRI_LABELS:
+                combo.addItem(label, value)
+        self.scope = QComboBox()
+        self.scope.addItem("au texte ajouté seulement", "ajout")
+        self.scope.addItem("à tout le texte de remplacement", "tout")
+        self.scope.setToolTip("« Texte ajouté » : seul ce qui change est mis en forme (« Ref N° » ajouté devant le "
+                              "titre ne réduit pas le titre). « Tout le texte » : utile pour changer la police ou la "
+                              "taille d'un texte existant (remplacer un texte par lui-même).")
+        for label, w in (("Police", self.font), ("Taille", self.size), ("Gras", self.bold), ("Italique", self.italic),
+                         ("Appliquer", self.scope)):
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            col.addWidget(muted(label, 8.5))
+            col.addWidget(w)
+            controls.addLayout(col)
+        controls.addStretch(1)
+        bl.addLayout(controls)
+        self.sample_fmt = QLabel()
+        self.sample_fmt.setMinimumHeight(44)
+        self.sample_fmt.setStyleSheet("QLabel{background:#FFFFFF;color:#0F172A;border:1px solid #E3E7EF;"
+                                      "border-radius:10px;padding:6px 12px;}")
+        bl.addWidget(self.sample_fmt)
+        lay.addWidget(box)
+        self.font.currentTextChanged.connect(self._style_changed)
+        self.size.valueChanged.connect(self._style_changed)
+        for combo in (self.bold, self.italic, self.scope):
+            combo.currentIndexChanged.connect(self._style_changed)
+        self.table.currentCellChanged.connect(lambda *_: self._load_style())
+
         test = QHBoxLayout()
         self.sample = QLineEdit("Tel  : 33 01 41 39  / 33 01 41 29.  RELEVE DE NOTES /TRANSCRIPT   FMSP/VDAAP/VDSSSE/SSSE")
         self.sample.setObjectName("field")
         self.sample.textChanged.connect(self.preview)
-        self.table.itemChanged.connect(lambda *_: self.preview())
+        self.table.itemChanged.connect(lambda *_: (self.preview(), self._refresh_sample()))
         test.addWidget(QLabel("Essai :"))
         test.addWidget(self.sample, 1)
         lay.addLayout(test)
@@ -167,64 +247,97 @@ class RulesEditor(QWidget):
         self.result.setStyleSheet("QLabel{background:#0F172A;color:#E2E8F0;border-radius:12px;padding:8px 12px;}")
         lay.addWidget(self.result)
         lay.addWidget(muted("Uniquement les fichiers Word : la correction est faite sur une COPIE au moment de produire "
-                            "l'aperçu, l'original n'est jamais modifié et les PDF/scans ne sont pas concernés. En texte "
-                            "simple, les espaces acceptent n'importe quel nombre d'espaces. « Taille » met le texte ajouté "
-                            "dans cette taille (utile pour ne pas allonger l'en-tête). Toute modification d'une règle "
-                            "refait les aperçus à la consultation suivante. Police, taille, gras et italique mettent en forme le texte "
-                            "de remplacement ; la police doit être installée sur le poste qui produit l'aperçu.", 8.5))
+                            "l'aperçu ; l'original n'est jamais modifié et les PDF/scans ne sont pas concernés. En texte "
+                            "simple, les espaces acceptent n'importe quel nombre d'espaces. Une taille plus petite évite "
+                            "d'allonger l'en-tête. Toute modification refait les aperçus à la consultation suivante.", 8.5))
+        if self.table.rowCount():
+            self.table.setCurrentCell(0, C_DESC)
+        self._load_style()
         self.preview()
 
+    # ------------------------------------------------------------ lignes
     def _append(self, r: dict) -> None:
         i = self.table.rowCount()
         self.table.insertRow(i)
 
-        def check(col, state, tristate=False):
+        def check(col, on):
             it = QTableWidgetItem()
-            flags = it.flags() | Qt.ItemFlag.ItemIsUserCheckable
-            if tristate:
-                flags |= Qt.ItemFlag.ItemIsUserTristate
-            it.setFlags(flags & ~Qt.ItemFlag.ItemIsEditable)
-            it.setCheckState(state)
+            it.setFlags((it.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsEditable)
+            it.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
             self.table.setItem(i, col, it)
 
-        check(C_ACT, TRI[bool(r.get("actif", True))])
+        check(C_ACT, r.get("actif", True))
         for col, key in ((C_DESC, "description"), (C_FIND, "chercher"), (C_REPL, "remplacer")):
             self.table.setItem(i, col, QTableWidgetItem(str(r.get(key) or "")))
-        check(C_RX, TRI[bool(r.get("regex"))])
-        font = QComboBox()
-        font.setEditable(True)
-        font.addItem(ORIGINE)
-        try:
-            from PySide6.QtGui import QFontDatabase
-            installed = set(QFontDatabase.families())
-        except Exception:
-            installed = set()
-        font.addItems(sorted(set(COMMON_FONTS) | installed))
-        font.setCurrentText(r.get("police") or ORIGINE)
-        font.setToolTip("Police du texte de remplacement (doit être installée sur le poste qui produit l'aperçu)")
-        font.currentTextChanged.connect(lambda *_: self.preview())
-        self.table.setCellWidget(i, C_FONT, font)
-        size = QDoubleSpinBox()
-        size.setRange(0, 72)
-        size.setDecimals(1)
-        size.setSingleStep(0.5)
-        size.setSpecialValueText("origine")
-        size.setValue(float(r.get("taille") or 0))
-        size.setToolTip("Taille en points du texte de remplacement (« origine » = taille du texte remplacé)")
-        self.table.setCellWidget(i, C_SIZE, size)
-        check(C_BOLD, TRI[r.get("gras") if r.get("gras") in (True, False) else None], tristate=True)
-        check(C_ITAL, TRI[r.get("italique") if r.get("italique") in (True, False) else None], tristate=True)
-        scope = QComboBox()
-        scope.addItem("Texte ajouté", "ajout")
-        scope.addItem("Tout le résultat", "tout")
-        scope.setCurrentIndex(1 if r.get("style_sur") == "tout" else 0)
-        self.table.setCellWidget(i, C_SCOPE, scope)
+        check(C_RX, r.get("regex"))
+        style = {k: r.get(k) for k in STYLE_KEYS if r.get(k) not in (None, "")}
+        fmt = QTableWidgetItem(style_summary(style))
+        fmt.setFlags(fmt.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        fmt.setData(Qt.ItemDataRole.UserRole, style)
+        fmt.setToolTip("Sélectionnez la règle pour modifier la police, la taille, le gras et l'italique ci-dessous.")
+        self.table.setItem(i, C_FMT, fmt)
+
+    def _style_item(self) -> QTableWidgetItem | None:
+        row = self.table.currentRow()
+        return self.table.item(row, C_FMT) if row >= 0 else None
+
+    def _load_style(self) -> None:
+        it = self._style_item()
+        st = dict(it.data(Qt.ItemDataRole.UserRole) or {}) if it else {}
+        self._loading = True
+        self.font.setCurrentText(st.get("police") or ORIGINE)
+        self.size.setValue(float(st.get("taille") or 0))
+        self.bold.setCurrentIndex(self.bold.findData(st.get("gras")) if st.get("gras") is not None else 0)
+        self.italic.setCurrentIndex(self.italic.findData(st.get("italique")) if st.get("italique") is not None else 0)
+        self.scope.setCurrentIndex(1 if st.get("style_sur") == "tout" else 0)
+        self._loading = False
+        enabled = it is not None
+        for w in (self.font, self.size, self.bold, self.italic, self.scope):
+            w.setEnabled(enabled)
+        desc = self.table.item(self.table.currentRow(), C_DESC) if enabled else None
+        self.fmt_title.setText("Mise en forme du texte de remplacement"
+                               + (f" — {desc.text()}" if desc and desc.text() else ""))
+        self._refresh_sample()
+
+    def _current_style(self) -> dict:
+        st = {}
+        font = self.font.currentText().strip()
+        if font and font != ORIGINE:
+            st["police"] = font
+        if self.size.value() > 0:
+            st["taille"] = round(self.size.value(), 1)
+        for key, combo in (("gras", self.bold), ("italique", self.italic)):
+            if combo.currentData() is not None:
+                st[key] = combo.currentData()
+        if self.scope.currentData() == "tout":
+            st["style_sur"] = "tout"
+        return st
+
+    def _style_changed(self, *_):
+        if self._loading:
+            return
+        it = self._style_item()
+        if it is None:
+            return
+        st = self._current_style()
+        it.setData(Qt.ItemDataRole.UserRole, st)
+        it.setText(style_summary(st))   # déclenche itemChanged -> essai et aperçu mis à jour
+
+    def _refresh_sample(self) -> None:
+        """Le texte de remplacement de la règle sélectionnée, dans sa police et sa taille (aperçu à l'écran)."""
+        row = self.table.currentRow()
+        repl = self.table.item(row, C_REPL).text() if row >= 0 and self.table.item(row, C_REPL) else ""
+        st = self._current_style() if row >= 0 else {}
+        f = QFont(self.font.font())
+        if st.get("police"):
+            f.setFamily(st["police"])
+        f.setPointSizeF(min(float(st.get("taille") or 11), 28))
+        f.setBold(bool(st.get("gras")))
+        f.setItalic(bool(st.get("italique")))
+        self.sample_fmt.setFont(f)
+        self.sample_fmt.setText(repl if repl else "(suppression : aucun texte de remplacement)")
 
     def rules(self) -> list[dict]:
-        def tri(it):
-            st = it.checkState() if it else Qt.CheckState.PartiallyChecked
-            return None if st == Qt.CheckState.PartiallyChecked else st == Qt.CheckState.Checked
-
         out = []
         for i in range(self.table.rowCount()):
             def txt(c):
@@ -233,34 +346,28 @@ class RulesEditor(QWidget):
             rule = {"actif": self.table.item(i, C_ACT).checkState() == Qt.CheckState.Checked,
                     "description": txt(C_DESC), "chercher": txt(C_FIND), "remplacer": txt(C_REPL),
                     "regex": self.table.item(i, C_RX).checkState() == Qt.CheckState.Checked}
-            font = self.table.cellWidget(i, C_FONT).currentText().strip()
-            if font and font != ORIGINE:
-                rule["police"] = font
-            size = self.table.cellWidget(i, C_SIZE).value()
-            if size > 0:
-                rule["taille"] = size
-            for key, col in (("gras", C_BOLD), ("italique", C_ITAL)):
-                v = tri(self.table.item(i, col))
-                if v is not None:
-                    rule[key] = v
-            if self.table.cellWidget(i, C_SCOPE).currentData() == "tout":
-                rule["style_sur"] = "tout"
+            rule.update(self.table.item(i, C_FMT).data(Qt.ItemDataRole.UserRole) or {})
             out.append(rule)
         return out
 
     def add_rule(self) -> None:
         self._append({"actif": True, "description": "Nouvelle règle", "chercher": "", "remplacer": "", "regex": False})
+        self.table.setCurrentCell(self.table.rowCount() - 1, C_FIND)
 
     def remove_rule(self) -> None:
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
         for r in rows:
             self.table.removeRow(r)
+        self._load_style()
         self.preview()
 
     def reset(self) -> None:
         self.table.setRowCount(0)
         for r in DEFAULT_TEXT_RULES:
             self._append(dict(r))
+        if self.table.rowCount():
+            self.table.setCurrentCell(0, C_DESC)
+        self._load_style()
         self.preview()
 
     def validate(self) -> str | None:
@@ -284,7 +391,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.s = settings
         self.setWindowTitle("Réglages du poste")
-        self.resize(1120, 700)
+        self.resize(1040, 760)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 20)
         card = Card(padding=20, spacing=14, soft_shadow=False)
