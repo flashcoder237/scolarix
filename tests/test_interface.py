@@ -187,3 +187,43 @@ def test_extraction_et_verification(app, window, tmp_path):
     if hasattr(ver, "find_original"):
         ver.find_original()
         assert ver.original is None or ver.original.matricule == "18M042"
+
+
+def test_demandes_au_guichet(app, window, tmp_path, monkeypatch):
+    """Une personne demande plusieurs relevés : demande, ajout (Ctrl+D), préparation, impression, remise."""
+    from PySide6.QtWidgets import QInputDialog
+
+    import ui.demandes_ui as dui
+    window.s.exports_root = str(tmp_path / "Exports")
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("Le père de l'étudiant", True)))
+    printed = []
+    monkeypatch.setattr(dui, "print_pdf", lambda path, s: printed.append(path) or "test")
+    g = window.guichet
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() >= 3)
+    for row in (0, 1, 2):
+        g.on_row(row)
+        g.add_to_demande()                                   # 1er ajout : crée la demande
+    bar = g.demande_bar
+    did = bar.active
+    assert did and window.db.demande(did)["n"] == 3 and window.db.demande(did)["demandeur"] == "Le père de l'étudiant"
+    g.on_row(0)
+    g.add_to_demande()
+    assert window.db.demande(did)["n"] == 3                  # pas de doublon
+    assert sum("DANS LA DEMANDE" in r.flags for r in g.model.rows) == 3
+    dlg = dui.DemandeDialog(window.db, window.s, did, window, previews=window.previews)
+    dlg.print_all()                                          # prépare d'abord, puis imprime
+    assert wait_for(app, lambda: window.db.demande(did)["statut"] == "IMPRIMÉE", 120)
+    assert wait_for(app, lambda: len(printed) == 2, 30)      # bordereau + A_IMPRIMER_TOUT
+    folder = window.db.demande(did)["dossier"]
+    assert "Demandes" in folder and window.db.demande(did)["numero"] in folder
+    dlg.mark_done()
+    assert window.db.demande(did)["statut"] == "REMISE"
+    page = window.demandes
+    page.seg.set_value("remises")
+    page.refresh()
+    assert page.table.rowCount() >= 1 and page.table.item(0, 5).text() == "REMISE"
+    page.table.selectRow(0)
+    page.activate_selected()
+    assert window.stack.currentIndex() == 0
+    dlg.deleteLater()

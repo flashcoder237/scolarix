@@ -30,7 +30,7 @@ from .config import Settings
 
 RELEVES, DUPLICATAS, CURSUS, EXTRACTIONS, VERIFICATIONS, JOURNAL = (
     "Releves", "Duplicatas", "Cursus", "Extractions", "Verifications", "Journal")
-PURGEABLE = (RELEVES, CURSUS, VERIFICATIONS)
+PURGEABLE = (RELEVES, CURSUS, VERIFICATIONS, "Demandes")   # recopiables depuis les archives ; le registre reste
 
 
 def stamp_now() -> str:

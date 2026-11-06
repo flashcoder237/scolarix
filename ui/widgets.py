@@ -41,8 +41,10 @@ def statut_tone(statut: str | None) -> str:
 def flag_tone(flag: str) -> str:
     if flag in ("SCAN OCR",):
         return "gray"
-    if flag in ("FICHIER INTROUVABLE",):
+    if flag in ("FICHIER INTROUVABLE", "MATRICULE ILLISIBLE"):
         return "red"
+    if flag == "DANS LA DEMANDE":
+        return "green"
     return "amber"
 
 

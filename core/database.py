@@ -120,6 +120,36 @@ CREATE TABLE IF NOT EXISTS delivrances (
 );
 CREATE INDEX IF NOT EXISTS idx_deliv_sha ON delivrances(sha256);
 CREATE INDEX IF NOT EXISTS idx_deliv_mat ON delivrances(matricule);
+
+-- Demandes du guichet : une personne demande un ou plusieurs relevés (plusieurs années, plusieurs
+-- semestres). Les relevés sont réunis dans la demande, préparés ensemble dans un dossier à part
+-- (bordereau + fichiers numérotés + un PDF « à imprimer »), imprimés puis remis.
+CREATE TABLE IF NOT EXISTS demandes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    numero     TEXT UNIQUE NOT NULL,
+    creee_le   TEXT DEFAULT (datetime('now','localtime')),
+    maj_le     TEXT DEFAULT (datetime('now','localtime')),
+    matricule  TEXT,
+    nom        TEXT,
+    demandeur  TEXT,
+    motif      TEXT,
+    duplicata  INTEGER DEFAULT 0,
+    statut     TEXT DEFAULT 'EN COURS',          -- EN COURS, PRÊTE, IMPRIMÉE, REMISE, ANNULÉE
+    dossier    TEXT,
+    operateur  TEXT,
+    poste      TEXT,
+    notes      TEXT
+);
+CREATE TABLE IF NOT EXISTS demande_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    demande_id  INTEGER NOT NULL REFERENCES demandes(id) ON DELETE CASCADE,
+    releve_id   INTEGER NOT NULL,
+    ordre       INTEGER NOT NULL,
+    reference   TEXT,                            -- numéro de délivrance attribué à la préparation
+    fichier     TEXT,
+    etat        TEXT,                            -- PRÊT, BLOQUÉ : motif
+    UNIQUE (demande_id, releve_id)
+);
 """
 
 FTS_TRIGGERS = """
@@ -591,6 +621,98 @@ class Database:
             return self.conn.execute("SELECT * FROM delivrances WHERE matricule=? ORDER BY id DESC LIMIT ?",
                                      (matricule, limit)).fetchall()
         return self.conn.execute("SELECT * FROM delivrances ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    # ---------------------------------------------------------------- demandes
+    def create_demande(self, poste: str, operateur: str, matricule: str | None = None, nom: str | None = None,
+                       demandeur: str = "", motif: str = "") -> int:
+        import datetime as _dt
+        year = _dt.date.today().year
+        code = re.sub(r"[^A-Za-z0-9-]", "", poste or "") or "P"
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                n = cur.execute("SELECT COUNT(*) + 1 FROM demandes WHERE numero LIKE ?",
+                                (f"{year}-{code}-%",)).fetchone()[0]
+                numero = f"{year}-{code}-{n:04d}"
+                while cur.execute("SELECT 1 FROM demandes WHERE numero=?", (numero,)).fetchone():
+                    n += 1
+                    numero = f"{year}-{code}-{n:04d}"
+                cur.execute("INSERT INTO demandes(numero, matricule, nom, demandeur, motif, operateur, poste) "
+                            "VALUES (?,?,?,?,?,?,?)", (numero, matricule, nom, demandeur, motif, operateur, code))
+                did = cur.lastrowid
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+        return did
+
+    def demande(self, did: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT d.*, (SELECT COUNT(*) FROM demande_items i WHERE i.demande_id=d.id) AS n "
+            "FROM demandes d WHERE d.id=?", (did,)).fetchone()
+
+    def demandes(self, statuts: Iterable[str] | None = None, limit: int = 500) -> list[sqlite3.Row]:
+        sql = ("SELECT d.*, (SELECT COUNT(*) FROM demande_items i WHERE i.demande_id=d.id) AS n FROM demandes d")
+        args: list = []
+        if statuts:
+            st = list(statuts)
+            sql += f" WHERE d.statut IN ({','.join('?' * len(st))})"
+            args = st
+        return self.conn.execute(sql + " ORDER BY d.id DESC LIMIT ?", (*args, limit)).fetchall()
+
+    def update_demande(self, did: int, **fields) -> None:
+        allowed = {"matricule", "nom", "demandeur", "motif", "duplicata", "statut", "dossier", "notes"}
+        cols = {k: v for k, v in fields.items() if k in allowed}
+        if not cols:
+            return
+        with self._lock:
+            self.conn.execute(f"UPDATE demandes SET {', '.join(f'{k}=?' for k in cols)}, "
+                              "maj_le=datetime('now','localtime') WHERE id=?", (*cols.values(), did))
+            self.conn.commit()
+
+    def demande_items(self, did: int) -> list[tuple[sqlite3.Row, Releve | None]]:
+        rows = self.conn.execute("SELECT * FROM demande_items WHERE demande_id=? ORDER BY ordre, id",
+                                 (did,)).fetchall()
+        return [(row, self.get(row["releve_id"])) for row in rows]
+
+    def add_demande_item(self, did: int, releve_id: int) -> bool:
+        """Ajoute un relevé à la demande (une seule fois). Toute modification renvoie la demande « EN COURS »."""
+        with self._lock:
+            n = self.conn.execute("SELECT IFNULL(MAX(ordre), 0) + 1 FROM demande_items WHERE demande_id=?",
+                                  (did,)).fetchone()[0]
+            cur = self.conn.execute("INSERT OR IGNORE INTO demande_items(demande_id, releve_id, ordre) VALUES (?,?,?)",
+                                    (did, releve_id, n))
+            added = cur.rowcount > 0
+            if added:
+                self.conn.execute("UPDATE demandes SET statut='EN COURS', maj_le=datetime('now','localtime') "
+                                  "WHERE id=? AND statut <> 'EN COURS'", (did,))
+            self.conn.commit()
+        return added
+
+    def remove_demande_item(self, did: int, releve_id: int) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM demande_items WHERE demande_id=? AND releve_id=?", (did, releve_id))
+            self.conn.execute("UPDATE demandes SET statut='EN COURS', maj_le=datetime('now','localtime') WHERE id=?",
+                              (did,))
+            self.conn.commit()
+
+    def reorder_demande(self, did: int, releve_ids: list[int]) -> None:
+        with self._lock:
+            for k, rid in enumerate(releve_ids, start=1):
+                self.conn.execute("UPDATE demande_items SET ordre=? WHERE demande_id=? AND releve_id=?", (k, did, rid))
+            self.conn.execute("UPDATE demandes SET statut='EN COURS' WHERE id=? AND statut='PRÊTE'", (did,))
+            self.conn.commit()
+
+    def set_item_result(self, item_id: int, reference: str | None, fichier: str | None, etat: str) -> None:
+        with self._lock:
+            self.conn.execute("UPDATE demande_items SET reference=?, fichier=?, etat=? WHERE id=?",
+                              (reference, fichier, etat, item_id))
+            self.conn.commit()
+
+    def demandes_of_releve(self, releve_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT d.numero, d.statut FROM demande_items i JOIN demandes d ON d.id=i.demande_id "
+                                 "WHERE i.releve_id=? ORDER BY d.id DESC", (releve_id,)).fetchall()
 
     def journal(self, matricule: str | None = None, since: str | None = None, limit: int = 1000) -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM journal WHERE 1=1", []

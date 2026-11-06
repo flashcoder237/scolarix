@@ -31,7 +31,9 @@ Raccourcis :
 | `Ctrl+P` | Imprimer le relevé affiché |
 | `Ctrl+E` | Exporter le relevé affiché |
 | `Ctrl+Maj+E` | Cursus complet |
-| `Ctrl+1…4` | Changer d'écran |
+| `Ctrl+1…5` | Changer d'écran (Guichet, Demandes, Indexation, Extraction, Vérification) |
+| `Ctrl+D` | Ajouter le relevé affiché à la demande en cours |
+| `Ctrl+N` | Nouvelle demande |
 
 ## Installation
 
@@ -65,6 +67,25 @@ build_windows.bat
 
 Le script lance les tests, produit `dist\Scolarix\Scolarix.exe`, puis l'installateur `Output\Scolarix_Setup_x.y.z.exe` si [Inno Setup 6](https://jrsoftware.org/isinfo.php) est installé. Tesseract est nécessaire **uniquement sur le poste qui indexe** ; Word ou LibreOffice sur le poste qui indexe des `.doc` **et** sur les postes qui affichent ou impriment des relevés Word (l'aperçu PDF est produit à la première consultation, puis gardé en cache).
 
+## Demandes : plusieurs relevés pour une même personne
+
+Une personne qui se présente = une **demande** (écran *Demandes*, ou barre « Demande en cours » du guichet).
+On y ajoute les relevés au fil des recherches (`Ctrl+D`), sur autant d'années et de semestres que nécessaire,
+on peut les réordonner ou ajouter d'un coup le cursus validé. **Préparer le dossier** contrôle chaque relevé
+(contrôle de dernière ligne) et crée :
+
+```
+Exports Scolarix\Demandes\2026\11\2026-G1-0042_98EM101_NOM\
+├─ 00_BORDEREAU.pdf            qui, quoi, combien de pages, n° de délivrance, cases « imprimé / remis »
+├─ 01_FMSP_98EM101_NOM_2021_Niv1_S1.pdf
+├─ 02_FMSP_98EM101_NOM_2021_Niv1_S2.pdf
+└─ A_IMPRIMER_TOUT.pdf         tous les relevés de la demande, dans l'ordre, en un seul fichier
+```
+
+Le statut dit ce qui reste à faire : **EN COURS** (à préparer) → **PRÊTE** (à imprimer) → **IMPRIMÉE**
+(à remettre) → **REMISE**. Un relevé bloqué est écarté et signalé sur le bordereau ; modifier une
+demande la renvoie « EN COURS ». Plusieurs demandes peuvent être ouvertes en même temps (une par personne).
+
 ## Dossier des exports
 
 Réglages › Exports. Par défaut `Documents\Exports Scolarix` du poste ; un dossier partagé du service
@@ -72,6 +93,7 @@ Réglages › Exports. Par défaut `Documents\Exports Scolarix` du poste ; un do
 
 ```
 Exports Scolarix\
+├─ Demandes\AAAA\MM\      <n° demande>_<matricule>_<NOM>\  (voir ci-dessus)
 ├─ Releves\AAAA\MM\       FMSP_<matricule>_<NOM>_<année>_Niv<n>_S<s>_<AAAAMMJJ-HHMM>.pdf
 ├─ Duplicatas\AAAA\MM\    …_DUPLICATA_<horodatage>.pdf                 (conservés)
 ├─ Cursus\AAAA\MM\        FMSP_<matricule>_<NOM>_Cursus_<horodatage>.pdf

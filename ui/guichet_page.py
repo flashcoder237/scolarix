@@ -21,6 +21,7 @@ from core.guard import PrintBlocked, check_before_print
 from core.printer_service import print_pdf
 
 from .cursus_dialog import CursusDialog
+from .demandes_ui import DemandeBar
 from .omnibox_widget import Omnibox
 from .pdf_preview_panel import PreviewPanel
 from .results_table_model import ResultsModel, RowDelegate
@@ -87,6 +88,12 @@ class GuichetPage(QWidget):
         for i, c in enumerate((self.card_index, self.card_indexing, self.card_prints, self.card_anom)):
             stats.addWidget(c, 0, i)
         root.addLayout(stats)
+
+        # --------------------------------------------------- demande en cours (une personne = une demande)
+        self.demande_bar = DemandeBar(db, settings, lambda: self.current)
+        self.demande_bar.previews = previews
+        self.demande_bar.changed.connect(self._mark_demande)
+        root.addWidget(self.demande_bar)
 
         # --------------------------------------------------- Zone A : Omnibox + filtres
         search = Card(padding=16, spacing=12)
@@ -275,6 +282,10 @@ class GuichetPage(QWidget):
         n_st = len({r.matricule for r in self.results})
         self.count.setText(f"{len(self.results)} relevé{'s' if len(self.results) > 1 else ''} · "
                            f"{n_st} étudiant{'s' if n_st > 1 else ''}" if self.omni.text().strip() else "Prêt")
+        ids = self.demande_bar.releve_ids()
+        for r in self.results:
+            if r.id in ids and "DANS LA DEMANDE" not in r.flags:
+                r.flags.append("DANS LA DEMANDE")
         self.model.set_results(self.results, self.omni.text())
         if self.stack.currentIndex() == 1:   # vue groupée affichée seulement : pas de requêtes inutiles
             self._fill_tree()
@@ -369,6 +380,25 @@ class GuichetPage(QWidget):
             self._consulted.add(rel.id)
             self.db.log("CONSULTATION", self.s.operateur, self.s.poste, rel.id, rel.matricule,
                         f"{rel.periode} · {rel.annee_academique} · {rel.statut or '?'} · {rel.pages_label}")
+
+    def add_to_demande(self) -> None:
+        msg = self.demande_bar.add_current()
+        if msg:
+            self.preview.toast.show_message(msg, "amber" if msg.startswith(("Attention", "Ce relevé est déjà",
+                                                                              "Sélectionnez")) else "green")
+
+    def _mark_demande(self) -> None:
+        """Les relevés déjà dans la demande en cours sont signalés dans la liste des résultats."""
+        ids = self.demande_bar.releve_ids()
+        for r in getattr(self.model, "rows", []):
+            had = "DANS LA DEMANDE" in r.flags
+            if (r.id in ids) != had:
+                if had:
+                    r.flags.remove("DANS LA DEMANDE")
+                else:
+                    r.flags.append("DANS LA DEMANDE")
+        if hasattr(self.model, "layoutChanged"):
+            self.model.layoutChanged.emit()
 
     def _on_releve_updated(self, rel: Releve) -> None:
         """Aperçu Word produit : les numéros de page exacts remplacent l'estimation dans la liste."""

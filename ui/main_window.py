@@ -11,6 +11,7 @@ from core.database import Database
 
 from .extraction_page import ExtractionPage
 from .guichet_page import GuichetPage
+from .demandes_ui import DemandesPage
 from .icons import pixmap
 from .indexing_page import IndexingPage
 from .settings_dialog import SettingsDialog
@@ -71,12 +72,14 @@ class MainWindow(QMainWindow):
         self.extraction = ExtractionPage(db, settings)
         self.verification = VerificationPage(db, settings)
         self.verification.previews = previews
-        for page in (self.guichet, self.indexing, self.extraction, self.verification):
+        self.demandes = DemandesPage(db, settings)
+        self.demandes.previews = previews
+        for page in (self.guichet, self.demandes, self.indexing, self.extraction, self.verification):
             self.stack.addWidget(page)
 
         self.nav = QButtonGroup(self)
         self.nav.setExclusive(True)
-        for i, (ic, label) in enumerate((("search", "Guichet"), ("database", "Indexation"),
+        for i, (ic, label) in enumerate((("search", "Guichet"), ("folder", "Demandes"), ("database", "Indexation"),
                                          ("chart", "Extraction"), ("shield", "Vérification"))):
             b = NavButton(ic, label)
             b.clicked.connect(lambda _=False, idx=i: self.go(idx))
@@ -101,6 +104,8 @@ class MainWindow(QMainWindow):
         self.guichet.open_settings.connect(self.open_settings)
         self.indexing.progress.connect(self.guichet.on_indexing_progress)
         self.indexing.finished.connect(self._after_indexing)
+        self.demandes.activate.connect(self._activate_demande)
+        self.stack.currentChanged.connect(self._page_changed)
 
         # ----------------------------------------------- raccourcis (loi n° 5 : 100 % clavier)
         for seq in ("Esc", "Ctrl+F"):
@@ -108,10 +113,23 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+P"), self, activated=lambda: self._on_guichet(self.guichet.print_current))
         QShortcut(QKeySequence("Ctrl+E"), self, activated=lambda: self._on_guichet(self.guichet.export_current))
         QShortcut(QKeySequence("Ctrl+Shift+E"), self, activated=lambda: self._on_guichet(self.guichet.open_cursus))
-        for i in range(4):
+        QShortcut(QKeySequence("Ctrl+D"), self, activated=lambda: self._on_guichet(self.guichet.add_to_demande))
+        QShortcut(QKeySequence("Ctrl+N"), self, activated=lambda: self._on_guichet(self.guichet.demande_bar.create))
+        for i in range(5):
             QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self, activated=lambda idx=i: self.go(idx))
 
         self.focus_search()
+
+    def _activate_demande(self, did: int) -> None:
+        self.guichet.demande_bar.set_active(did)
+        self.go(0)
+        self.focus_search()
+
+    def _page_changed(self, idx: int) -> None:
+        if self.stack.widget(idx) is self.demandes:
+            self.demandes.refresh()
+        elif self.stack.widget(idx) is self.guichet:
+            self.guichet.demande_bar.refresh()
 
     def go(self, idx: int) -> None:
         self.stack.setCurrentIndex(idx)
