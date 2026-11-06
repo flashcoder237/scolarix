@@ -78,8 +78,14 @@ jobs:
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
           if ($env:SIGN_PFX) {
-            $cmd = "`"$env:SIGNTOOL`" sign /f `"$env:SIGN_PFX`" /p $env:SIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d `$qScolarix`$q `$f"
-            & $iscc /DAppVersion=1.2.0 /DSIGN "/Ssigntool=$cmd" installer\scolarix.iss
+            # Petit script appelé par Inno Setup pour chaque fichier à signer (installateur, désinstallateur) ;
+            # les chemins et le mot de passe viennent des variables d'environnement (masquées dans les journaux).
+            $cmdFile = Join-Path $env:RUNNER_TEMP "sign.cmd"
+            Set-Content -Path $cmdFile -Encoding ascii -Value @(
+              '@echo off',
+              '"%SIGNTOOL%" sign /f "%SIGN_PFX%" /p "%SIGN_PFX_PASSWORD%" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d Scolarix %1'
+            )
+            & $iscc /DAppVersion=1.2.0 /DSIGN "/Ssigntool=$cmdFile `$f" installer\scolarix.iss
           } else {
             Write-Host "Secrets de signature absents : installateur NON signé."
             & $iscc /DAppVersion=1.2.0 installer\scolarix.iss
