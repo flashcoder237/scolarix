@@ -55,7 +55,7 @@ jobs:
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
-          & $iscc /DAppVersion=1.1.0 installer\scolarix.iss
+          & $iscc /DAppVersion=1.2.0 installer\scolarix.iss
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-ChildItem Output
 

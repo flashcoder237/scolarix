@@ -17,7 +17,7 @@ from pathlib import Path
 
 APP_NAME = "Scolarix"
 APP_SUBTITLE = "Archives des relevés de notes · FMSP"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # Corrections d'en-tête par défaut des relevés Word (modifiables dans Réglages).
 DEFAULT_TEXT_RULES = (
