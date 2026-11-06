@@ -35,7 +35,7 @@ def window(app, indexed, tmp_path, monkeypatch):
     from core.config import Settings
     from ui.main_window import MainWindow
     db, settings = indexed[0], indexed[1]
-    monkeypatch.setattr(Settings, "export_dir", lambda self: tmp_path)
+    monkeypatch.setattr(Settings, "export_dir", lambda self, nature="Releves": tmp_path)
     monkeypatch.setattr("ui.settings_dialog.save_settings", lambda s: None)
     monkeypatch.setattr("ui.indexing_page.save_settings", lambda s: None)
     win = MainWindow(db, settings)
@@ -60,6 +60,8 @@ def test_guichet_recherche_apercu_export(app, window, tmp_path):
     g.export_current()
     assert list(tmp_path.glob("FMSP_18M042_*.pdf"))
     assert window.db.journal(matricule="18M042")
+    d = window.db.deliveries("18M042")[0]                  # numéro de délivrance + empreinte enregistrés
+    assert d["reference"].endswith(f"/{__import__('datetime').date.today().year}") and d["sha256"]
 
 
 def test_guichet_releve_word_apercu_a_la_demande(app, window):
@@ -117,8 +119,8 @@ def test_cursus_dialog(app, window, tmp_path):
     dlg = CursusDialog(window.db, window.s, "18M042", window, previews=window.previews)
     assert dlg.tree.topLevelItemCount() >= 6
     dlg.export()                                   # fusion en arrière-plan
-    assert wait_for(app, lambda: list(tmp_path.glob("FMSP_18M042_*_Cursus.pdf")) and not dlg._busy, 120)
-    out = list(tmp_path.glob("FMSP_18M042_*_Cursus.pdf"))
+    assert wait_for(app, lambda: list(tmp_path.glob("FMSP_18M042_*_Cursus_*.pdf")) and not dlg._busy, 120)
+    out = list(tmp_path.glob("FMSP_18M042_*_Cursus_*.pdf"))
     assert out and out[0].stat().st_size > 1000
     dlg.deleteLater()
 

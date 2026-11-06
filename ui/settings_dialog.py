@@ -455,6 +455,52 @@ class SettingsDialog(QDialog):
         il.addWidget(self.exclusions, 1)
         self.tabs.addTab(idx, "Indexation")
 
+        # ---- Exports
+        exp = QWidget()
+        el = QVBoxLayout(exp)
+        f3 = QFormLayout()
+        f3.setSpacing(10)
+        try:
+            default_root = str(settings.exports_root_dir()) if not settings.exports_root else ""
+        except OSError:
+            default_root = ""
+        f3.addRow("Dossier des exports", self._line("exports_root", default_root or "Documents\\Exports Scolarix", "dir"))
+        self.retention = QSpinBox()
+        self.retention.setRange(0, 3650)
+        self.retention.setSuffix(" jours")
+        self.retention.setSpecialValueText("jamais")
+        self.retention.setValue(int(settings.exports_retention_days or 0))
+        f3.addRow("Conserver relevés, cursus et vérifications", self.retention)
+        self.ref_stamp = QCheckBox("Imprimer le numéro de délivrance en bas de chaque page délivrée")
+        self.ref_stamp.setChecked(settings.delivery_ref_stamp)
+        f3.addRow("", self.ref_stamp)
+        el.addLayout(f3)
+        tree = QLabel("<pre style='font-family:Consolas,monospace;font-size:9pt;color:#334155'>"
+                      "Exports Scolarix\\\n"
+                      "├─ Releves\\2026\\11\\     FMSP_98EM101_NOM_2023_Niv1_S1_20261106-0812.pdf\n"
+                      "├─ Duplicatas\\2026\\11\\  …_DUPLICATA_20261106-0815.pdf      (conservés)\n"
+                      "├─ Cursus\\2026\\11\\      FMSP_98EM101_NOM_Cursus_20261106-0820.pdf\n"
+                      "├─ Extractions\\2026\\11\\ Decanat_M_admis_2022-2024_20261106-0900.xlsx (conservées)\n"
+                      "├─ Verifications\\2026\\11\\\n"
+                      "└─ Journal\\                                                  (conservés)</pre>")
+        tree.setTextFormat(Qt.TextFormat.RichText)
+        el.addWidget(tree)
+        el.addWidget(muted("Classement par nature de demande puis par mois ; un fichier n'est jamais écrasé (date et "
+                           "heure dans le nom). Chaque document délivré (impression, export, duplicata, cursus) reçoit "
+                           "un numéro de délivrance « 00042/POSTE/2026 » et son empreinte est enregistrée : l'écran "
+                           "Vérification reconnaît ensuite un fichier sorti du guichet. Un dossier partagé du service "
+                           "(\\\\serveur\\Scolarité\\Exports) réunit les exports de tous les guichets ; réservez-en "
+                           "l'accès au personnel habilité (les documents contiennent des notes).", 8.5))
+        open_btn = QPushButton("Ouvrir le dossier des exports")
+        open_btn.setObjectName("secondary")
+        open_btn.clicked.connect(self._open_exports)
+        row_open = QHBoxLayout()
+        row_open.addWidget(open_btn)
+        row_open.addStretch(1)
+        el.addLayout(row_open)
+        el.addStretch(1)
+        self.tabs.addTab(exp, "Exports")
+
         # ---- Corrections Word
         self.rules = RulesEditor(settings)
         self.tabs.addTab(self.rules, "Corrections des relevés Word")
@@ -463,6 +509,14 @@ class SettingsDialog(QDialog):
         self.error.setStyleSheet("color:#B91C1C;")
         card.lay.addWidget(self.error)
         card.lay.addLayout(_buttons(self))
+
+    def _open_exports(self) -> None:
+        from core.exports import reveal
+        root = self.fields["exports_root"].text().strip()
+        try:
+            reveal(root if root and Path(root).exists() else self.s.exports_root_dir())
+        except Exception as exc:
+            self.error.setText(f"Dossier inaccessible : {exc}")
 
     def _line(self, key, placeholder="", browse=None):
         e = QLineEdit(str(getattr(self.s, key) or ""))
@@ -507,6 +561,8 @@ class SettingsDialog(QDialog):
         self.s.printer_name = self.printer.currentData() or ""
         self.s.duplex = self.duplex.isChecked()
         self.s.index_workers = self.workers.value()
+        self.s.exports_retention_days = self.retention.value()
+        self.s.delivery_ref_stamp = self.ref_stamp.isChecked()
         self.s.docx_convert_at_index = self.preconvert.isChecked()
         self.s.exclusions = self.exclusions.items()
         self.s.text_rules = self.rules.rules()

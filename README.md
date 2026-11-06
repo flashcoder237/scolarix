@@ -65,6 +65,29 @@ build_windows.bat
 
 Le script lance les tests, produit `dist\Scolarix\Scolarix.exe`, puis l'installateur `Output\Scolarix_Setup_x.y.z.exe` si [Inno Setup 6](https://jrsoftware.org/isinfo.php) est installé. Tesseract est nécessaire **uniquement sur le poste qui indexe** ; Word ou LibreOffice sur le poste qui indexe des `.doc` **et** sur les postes qui affichent ou impriment des relevés Word (l'aperçu PDF est produit à la première consultation, puis gardé en cache).
 
+## Dossier des exports
+
+Réglages › Exports. Par défaut `Documents\Exports Scolarix` du poste ; un dossier partagé du service
+(`\\serveur\Scolarité\Exports`, accès réservé au personnel habilité) réunit les exports de tous les guichets.
+
+```
+Exports Scolarix\
+├─ Releves\AAAA\MM\       FMSP_<matricule>_<NOM>_<année>_Niv<n>_S<s>_<AAAAMMJJ-HHMM>.pdf
+├─ Duplicatas\AAAA\MM\    …_DUPLICATA_<horodatage>.pdf                 (conservés)
+├─ Cursus\AAAA\MM\        FMSP_<matricule>_<NOM>_Cursus_<horodatage>.pdf
+├─ Extractions\AAAA\MM\   Decanat_<filtres>_<horodatage>.xlsx           (conservées)
+├─ Verifications\AAAA\MM\ Verification_<matricule>_<horodatage>.pdf
+└─ Journal\                 Journal_<horodatage>.csv                      (conservés)
+```
+
+- Classement par nature de demande puis par mois ; aucun fichier n'est jamais écrasé.
+- Chaque document délivré (impression, export, duplicata, cursus) reçoit un **numéro de délivrance**
+  `00042/<poste>/2026`, inscrit au journal avec l'emplacement et l'empreinte SHA-256 du fichier ;
+  l'écran Vérification reconnaît ensuite un fichier sorti du guichet. Option : imprimer ce numéro en bas de page.
+- Conservation : relevés, cursus et vérifications (recopiables depuis les archives) supprimés après
+  30 jours (réglable) ; duplicatas, extractions et journaux conservés.
+- Après chaque export, un bouton « Ouvrir le dossier » montre le fichier dans l'explorateur.
+
 ## Vitesse d'indexation
 
 Mesures sur les relevés réels fournis (14 fichiers, 127 relevés) et sur un lot de 560 fichiers :

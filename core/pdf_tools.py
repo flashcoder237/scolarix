@@ -101,17 +101,34 @@ def stamp_text(kind: str = "DUPLICATA CONFORME") -> tuple[str, str]:
     return kind, f"Cellule Informatique FMSP · {datetime.now():%d/%m/%Y %H:%M}"
 
 
+def footer_text(ref: str) -> str:
+    return f"Délivré sous la référence N° {ref} le {datetime.now():%d/%m/%Y à %H:%M} — Scolarix, FMSP"
+
+
+def _footer_page(width: float, height: float, text: str):
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(width, height))
+    c.setFont("Helvetica", 7)
+    c.setFillColor(Color(0.25, 0.28, 0.35, alpha=0.9))
+    c.drawCentredString(width / 2, 12, text)
+    c.save()
+    buf.seek(0)
+    return PdfReader(buf).pages[0]
+
+
 def extract_pages(src_pdf: str | Path, first: int, last: int, dest: str | Path | None = None,
-                  stamp: tuple[str, str] | None = None) -> Path:
-    """Copie les pages [first, last] (1-based) dans un nouveau PDF, avec timbre optionnel."""
+                  stamp: tuple[str, str] | None = None, footer: str | None = None) -> Path:
+    """Copie les pages [first, last] (1-based) dans un nouveau PDF, avec timbre et pied de page optionnels."""
     reader = PdfReader(str(src_pdf))
     writer = PdfWriter()
     last = min(last, len(reader.pages))
     for i in range(first - 1, last):
         page = writer.add_page(reader.pages[i])
+        w, h = float(page.mediabox.width), float(page.mediabox.height)
         if stamp:
-            w, h = float(page.mediabox.width), float(page.mediabox.height)
             page.merge_page(_stamp_page(w, h, *stamp))
+        if footer:
+            page.merge_page(_footer_page(w, h, footer))
     if dest is None:
         dest = temp_pdf()
     with open(dest, "wb") as fh:
@@ -168,7 +185,8 @@ def _cover_page(rels: list[Releve], title: str, page_labels: list[str] | None = 
 
 def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
                   stamp: tuple[str, str] | None = None, title: str = "Cursus académique",
-                  prepare=None, absent: list[str] | None = None) -> tuple[Path, int, list[str]]:
+                  prepare=None, absent: list[str] | None = None,
+                  footer: str | None = None) -> tuple[Path, int, list[str]]:
     """Fusionne plusieurs relevés (dans l'ordre donné) en un seul PDF. Renvoie (chemin, nb pages, manquants).
 
     ``prepare(rel) -> rel`` produit au besoin l'aperçu PDF d'un relevé Word (voir core/preview.py).
@@ -205,6 +223,8 @@ def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
             page = writer.add_page(reader.pages[i])
             if stamp:
                 page.merge_page(_stamp_page(float(page.mediabox.width), float(page.mediabox.height), *stamp))
+            if footer:
+                page.merge_page(_footer_page(float(page.mediabox.width), float(page.mediabox.height), footer))
     with open(dest, "wb") as fh:
         writer.write(fh)
     return Path(dest), len(writer.pages), missing

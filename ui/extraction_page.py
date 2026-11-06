@@ -3,13 +3,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QPushButton, QScrollArea, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
-from core import exporter
+from core import exporter, exports
 from core.config import Settings
 from core.database import Database, Releve
 
@@ -275,13 +277,13 @@ class ExtractionPage(QWidget):
         fil = self.fil.currentData() or "Toutes"
         y1 = self.y_from.currentData() or "debut"
         y2 = (self.y_to.currentData() + 1) if self.y_to.currentData() else "fin"
-        return f"FMSP_Extraction_{fil}_{self.statut}_{y1}-{y2}.{ext}"
+        return f"Decanat_{fil}_{self.statut}_{y1}-{y2}.{ext}"
 
     def export(self, kind: str) -> None:
         if not self.rows:
             self.toast.show_message("Aucune ligne à exporter avec ces filtres.", "amber")
             return
-        default = str(self.s.export_dir() / self._filename(kind))
+        default = str(exports.dest_for(self.s, exports.EXTRACTIONS, self._filename(kind)))
         path, _ = QFileDialog.getSaveFileName(self, "Exporter", default,
                                               "Classeur Excel (*.xlsx)" if kind == "xlsx" else "CSV (*.csv)")
         if not path:
@@ -295,8 +297,10 @@ class ExtractionPage(QWidget):
             self.toast.show_message(f"Export impossible : {exc}", "red")
             return
         self.db.log("EXTRACTION", self.s.operateur, self.s.poste, None, None,
-                    f"{self.scope.text()} · {self.seg.value()} · {len(self.rows)} lignes · {kind}")
-        self.toast.show_message(f"Exporté : {path} ({len(self.rows)} lignes) · extraction journalisée")
+                    f"{self.scope.text()} · {self.seg.value()} · {len(self.rows)} lignes · {path} · "
+                    f"SHA-256 {exports.sha256_file(path)[:16]}…")
+        self.toast.show_message(f"Exporté : {Path(path).name} ({len(self.rows)} lignes) · extraction journalisée",
+                                ms=15000, action=("Ouvrir le dossier", lambda: exports.reveal(path)))
         self.refresh_journal()
 
     def refresh_journal(self) -> None:
@@ -320,7 +324,9 @@ class ExtractionPage(QWidget):
 
     def export_journal(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Exporter le journal",
-                                              str(self.s.export_dir() / "FMSP_Journal.csv"), "CSV (*.csv)")
+                                              str(exports.dest_for(self.s, exports.JOURNAL, "Journal.csv")),
+                                              "CSV (*.csv)")
         if path:
             exporter.export_journal_csv(getattr(self, "_journal_rows", []), path)
-            self.toast.show_message(f"Journal exporté : {path}")
+            self.toast.show_message(f"Journal exporté : {Path(path).name}", ms=12000,
+                                    action=("Ouvrir le dossier", lambda: exports.reveal(path)))

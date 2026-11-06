@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFrame
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
 from core.guard import PrintBlocked, check_before_print
-from core import pdf_tools, verification
+from core import exports, pdf_tools, verification
 from core.config import Settings
 from core.database import Database, Releve
 from core.extractors import pdf_pages_text
@@ -220,7 +220,24 @@ class VerificationPage(QWidget):
                                                Qt.TransformationMode.SmoothTransformation))
             self.sub_image.show()
         self.sub_badge.set("LECTURE…", "blue")
+        self._check_registry(path)
         self.compare()
+
+    def _check_registry(self, path: str) -> None:
+        """Le fichier soumis est-il, à l'octet près, un document délivré par le guichet ?"""
+        try:
+            row = self.db.find_delivery(exports.sha256_file(path))
+        except OSError:
+            row = None
+        if row:
+            self.toast.show_message(
+                f"Fichier identique au document délivré le {row['horodatage'][:16].replace('-', '/')} sous la "
+                f"référence {row['reference']} ({row['nature'].lower()}, matricule {row['matricule'] or '?'}, "
+                f"par {row['operateur'] or '?'}).", "green", 20000)
+        elif path.lower().endswith(".pdf"):
+            self.toast.show_message("Ce fichier ne correspond à aucun document délivré par le guichet (il a pu être "
+                                    "modifié, réimprimé puis scanné, ou délivré avant Scolarix) : comparaison du "
+                                    "contenu ci-dessous.", "amber", 12000)
 
     def compare(self) -> None:
         if not (self.original and self.submitted_path):
@@ -274,10 +291,13 @@ class VerificationPage(QWidget):
         if not (self.rows and self.original):
             self.toast.show_message("Comparez d'abord un document soumis avec l'original.", "amber")
             return
-        dest = self.s.export_dir() / f"FMSP_Verification_{self.original.matricule}.pdf"
+        dest = exports.dest_for(self.s, exports.VERIFICATIONS, f"Verification_{self.original.matricule}.pdf")
         verification.report_pdf(self.rows, self.original, dest, self.demandeur.text(), self.reference.text(),
                                 self.s.operateur)
-        self.toast.show_message(f"Rapport généré : {dest}")
+        self.db.log("VERIFICATION", self.s.operateur, self.s.poste, self.original.id, self.original.matricule,
+                    f"Rapport {dest}")
+        self.toast.show_message(f"Rapport généré : {dest.name}", ms=12000,
+                                action=("Ouvrir le dossier", lambda: exports.reveal(dest)))
 
     def print_original(self) -> None:
         o = self.original

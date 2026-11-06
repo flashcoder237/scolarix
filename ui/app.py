@@ -60,6 +60,10 @@ def run_gui(argv: list[str]) -> int:
         kill_orphan_words()
     except Exception:
         pass
+    import threading
+
+    from core.exports import purge_old
+    threading.Thread(target=purge_old, args=(settings,), daemon=True).start()   # durée de conservation
     win = MainWindow(db, settings, previews)
     win.show()
     return app.exec()

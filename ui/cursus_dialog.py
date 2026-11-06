@@ -8,7 +8,7 @@ from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout)
 
-from core import pdf_tools
+from core import exports, pdf_tools
 from core.config import Settings
 from core.database import Database, Releve, missing_periods
 from core.guard import check_before_print
@@ -190,18 +190,26 @@ class CursusDialog(QDialog):
         check_before_print(rel)
         return rel
 
-    def _build(self, dest: Path) -> tuple[Path, int, list[str]]:
+    def _build(self, dest: Path, ref: str | None = None) -> tuple[Path, int, list[str]]:
         stamp = pdf_tools.stamp_text() if self.sw_dup.isChecked() else None
-        return pdf_tools.merge_releves(self.selected(), dest, cover=self.sw_cover.isChecked(), stamp=stamp,
-                                       prepare=self._prepare, absent=self._missing_levels())
+        footer = pdf_tools.footer_text(ref) if ref and self.s.delivery_ref_stamp else None
+        out = pdf_tools.merge_releves(self.selected(), dest, cover=self.sw_cover.isChecked(), stamp=stamp,
+                                      prepare=self._prepare, absent=self._missing_levels(), footer=footer)
+        if ref:
+            self.db.complete_delivery(ref, str(dest) if not str(dest).startswith(str(pdf_tools.TEMP_DIR)) else None,
+                                      exports.sha256_file(dest))
+        return out
 
-    def _run(self, dest: Path, on_done) -> None:
+    def _run(self, dest: Path, on_done, nature: str = "CURSUS") -> None:
         """Fusion en arrière-plan (conversions Word possibles) : la fenêtre ne gèle jamais."""
         self.btn_merge.setEnabled(False)
         self.btn_print.setEnabled(False)
         self.toast.show_message("Préparation du dossier fusionné…", "blue", 60000)
         self._busy = True
-        task = Task(self._build, dest)
+        mat = self.rels[0].matricule if self.rels else None
+        ref = self.db.new_delivery(nature, self.s.poste, self.s.operateur, mat)
+        self._ref = ref
+        task = Task(self._build, dest, ref)
 
         def finish(*_):
             self._busy = False
@@ -221,16 +229,19 @@ class CursusDialog(QDialog):
 
     def export(self) -> None:
         def done(path, n, missing):
-            self._log("CURSUS", f"{path.name} · {n} pages" + (" · DUPLICATA" if self.sw_dup.isChecked() else "")
+            self._log("CURSUS", f"Réf. {self._ref} · {path} · {n} pages"
+                      + (" · DUPLICATA" if self.sw_dup.isChecked() else "")
                       + (f" · écartés : {', '.join(missing)}" if missing else ""))
             extra = f" — écartés : {', '.join(missing)}" if missing else ""
-            self.toast.show_message(f"Exporté : {path} ({n} pages){extra}", "amber" if missing else "green", 12000)
-        self._run(self.s.export_dir() / self._filename(), done)
+            self.toast.show_message(f"Exporté (réf. {self._ref}) : {path.name} ({n} pages){extra}",
+                                    "amber" if missing else "green", 15000,
+                                    action=("Ouvrir le dossier", lambda: exports.reveal(path)))
+        self._run(exports.dest_for(self.s, exports.CURSUS, self._filename()), done)
 
     def print_(self) -> None:
         def done(path, n, missing):
             task = Task(print_pdf, path, self.s)
-            task.signals.done.connect(lambda how: (self._log("IMPRESSION", f"Cursus {n} pages ({how})"),
+            task.signals.done.connect(lambda how: (self._log("IMPRESSION", f"Réf. {self._ref} · Cursus {n} pages ({how})"),
                                                    self.toast.show_message(f"Cursus envoyé à l'imprimante : {n} pages."
                                                                            + (f" Écartés : {', '.join(missing)}"
                                                                               if missing else "")),
@@ -238,7 +249,7 @@ class CursusDialog(QDialog):
             task.signals.failed.connect(lambda e: (self.toast.show_message(f"Impression impossible : {e}", "red"),
                                                    _unlink(path)))
             QThreadPool.globalInstance().start(task)
-        self._run(pdf_tools.temp_pdf("cursus_"), done)
+        self._run(pdf_tools.temp_pdf("cursus_"), done, "CURSUS IMPRIMÉ")
 
 
 def _unlink(path) -> None:

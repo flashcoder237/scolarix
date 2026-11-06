@@ -101,6 +101,25 @@ CREATE TABLE IF NOT EXISTS journal (
 );
 CREATE INDEX IF NOT EXISTS idx_journal_date ON journal(horodatage);
 CREATE INDEX IF NOT EXISTS idx_journal_mat  ON journal(matricule);
+
+-- Registre des documents délivrés (impression, export, duplicata, cursus) : numéro de référence,
+-- empreinte SHA-256 du fichier remis, emplacement. Sert à prouver plus tard qu'un document vient du guichet.
+CREATE TABLE IF NOT EXISTS delivrances (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference  TEXT UNIQUE NOT NULL,
+    annee      INTEGER NOT NULL,
+    poste      TEXT,
+    numero     INTEGER NOT NULL,
+    horodatage TEXT DEFAULT (datetime('now','localtime')),
+    nature     TEXT NOT NULL,
+    matricule  TEXT,
+    releve_id  INTEGER,
+    chemin     TEXT,
+    sha256     TEXT,
+    operateur  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_deliv_sha ON delivrances(sha256);
+CREATE INDEX IF NOT EXISTS idx_deliv_mat ON delivrances(matricule);
 """
 
 FTS_TRIGGERS = """
@@ -535,6 +554,43 @@ class Database:
                 "INSERT INTO journal(operateur, poste, action, releve_id, matricule, detail) VALUES (?,?,?,?,?,?)",
                 (operateur, poste, action, releve_id, matricule, detail))
             self.conn.commit()
+
+    # ------------------------------------------------------------- délivrances
+    def new_delivery(self, nature: str, poste: str, operateur: str, matricule: str | None = None,
+                     releve_id: int | None = None, year: int | None = None) -> str:
+        """Réserve le prochain numéro de délivrance de ce poste pour l'année : « 00042/G1/2026 »."""
+        import datetime as _dt
+        year = year or _dt.date.today().year
+        code = re.sub(r"[^A-Za-z0-9-]", "", poste or "") or "P"
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                n = cur.execute("SELECT IFNULL(MAX(numero), 0) + 1 FROM delivrances WHERE annee=? AND poste=?",
+                                (year, code)).fetchone()[0]
+                ref = f"{n:05d}/{code}/{year}"
+                cur.execute("INSERT INTO delivrances(reference, annee, poste, numero, nature, matricule, releve_id, "
+                            "operateur) VALUES (?,?,?,?,?,?,?,?)", (ref, year, code, n, nature, matricule, releve_id,
+                                                                     operateur))
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+        return ref
+
+    def complete_delivery(self, ref: str, chemin: str | None, sha256: str | None) -> None:
+        with self._lock:
+            self.conn.execute("UPDATE delivrances SET chemin=?, sha256=? WHERE reference=?", (chemin, sha256, ref))
+            self.conn.commit()
+
+    def find_delivery(self, sha256: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM delivrances WHERE sha256=? ORDER BY id LIMIT 1", (sha256,)).fetchone()
+
+    def deliveries(self, matricule: str | None = None, limit: int = 500) -> list[sqlite3.Row]:
+        if matricule:
+            return self.conn.execute("SELECT * FROM delivrances WHERE matricule=? ORDER BY id DESC LIMIT ?",
+                                     (matricule, limit)).fetchall()
+        return self.conn.execute("SELECT * FROM delivrances ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
     def journal(self, matricule: str | None = None, since: str | None = None, limit: int = 1000) -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM journal WHERE 1=1", []

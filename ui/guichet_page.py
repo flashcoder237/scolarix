@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QFrame, QGridLay
                                QLabel, QPushButton, QScrollArea, QSplitter, QStackedWidget, QTableView, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from core import pdf_tools
+from core import exports, pdf_tools
 from core.config import Settings
 from core.database import Database, Releve, missing_periods
 from core.guard import PrintBlocked, check_before_print
@@ -415,18 +415,22 @@ class GuichetPage(QWidget):
         if not rel:
             return
         dup = self.preview.duplicata
+        ref = self.db.new_delivery("DUPLICATA IMPRIMÉ" if dup else "IMPRESSION", self.s.poste, self.s.operateur,
+                                   rel.matricule, rel.id)
         tmp = pdf_tools.extract_pages(rel.preview_pdf, rel.numero_page, rel.page_fin,
-                                      stamp=pdf_tools.stamp_text() if dup else None)
+                                      stamp=pdf_tools.stamp_text() if dup else None,
+                                      footer=pdf_tools.footer_text(ref) if self.s.delivery_ref_stamp else None)
+        self.db.complete_delivery(ref, None, exports.sha256_file(tmp))
         self.preview.toast.show_message(f"Envoi à l'imprimante… ({rel.pages_label})", "blue", 4000)
         task = Task(print_pdf, tmp, self.s)
 
         def ok(how):
             self.db.log("DUPLICATA" if dup else "IMPRESSION", self.s.operateur, self.s.poste, rel.id, rel.matricule,
-                        f"{rel.periode} · {rel.annee_academique} · {rel.pages_label}" + (" · recto-verso" if rel.nb_pages > 1 else "")
-                        + self._trace(rel))
+                        f"Réf. {ref} · {rel.periode} · {rel.annee_academique} · {rel.pages_label}"
+                        + (" · recto-verso" if rel.nb_pages > 1 else "") + self._trace(rel))
             self.preview.toast.show_message(
                 f"Envoyé à l'imprimante — {rel.pages_label}" + (" · timbre Duplicata apposé" if dup else "")
-                + " · impression journalisée")
+                + f" · réf. {ref}")
             self.refresh_stats()
             _cleanup(tmp)
 
@@ -443,16 +447,24 @@ class GuichetPage(QWidget):
         if not rel:
             return
         dup = self.preview.duplicata
-        dest = self.s.export_dir() / pdf_tools.export_filename(rel, "_DUPLICATA" if dup else "")
         try:
+            dest = exports.dest_for(self.s, exports.DUPLICATAS if dup else exports.RELEVES,
+                                    pdf_tools.export_filename(rel, "_DUPLICATA" if dup else ""))
+            ref = self.db.new_delivery("DUPLICATA" if dup else "EXPORT PDF", self.s.poste, self.s.operateur,
+                                       rel.matricule, rel.id)
             pdf_tools.extract_pages(rel.preview_pdf, rel.numero_page, rel.page_fin, dest,
-                                    stamp=pdf_tools.stamp_text() if dup else None)
+                                    stamp=pdf_tools.stamp_text() if dup else None,
+                                    footer=pdf_tools.footer_text(ref) if self.s.delivery_ref_stamp else None)
+            self.db.complete_delivery(ref, str(dest), exports.sha256_file(dest))
         except Exception as exc:
             self.preview.toast.show_message(f"Export impossible : {exc}", "red")
             return
         self.db.log("EXPORT PDF", self.s.operateur, self.s.poste, rel.id, rel.matricule,
-                    dest.name + (" · DUPLICATA" if dup else "") + self._trace(rel))
-        self.preview.toast.show_message(f"Exporté : {dest}")
+                    f"Réf. {ref} · {dest}" + (" · DUPLICATA" if dup else "") + self._trace(rel))
+        self.last_export = dest
+        self.preview.toast.show_message(f"Exporté (réf. {ref}) : {dest.name} — dossier "
+                                        f"{exports.short_location(self.s, dest)}", ms=15000,
+                                        action=("Ouvrir le dossier", lambda: exports.reveal(dest)))
 
     def open_cursus(self) -> None:
         rel = self.current

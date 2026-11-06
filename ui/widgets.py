@@ -328,12 +328,22 @@ class Toast(QFrame):
         self.lab.setWordWrap(True)
         self.lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lay.addWidget(self.lab, 1)
+        self.action_btn = QPushButton()
+        self.action_btn.setObjectName("secondary")
+        self.action_btn.hide()
+        self.action_btn.clicked.connect(lambda: self._action and self._action())
+        self.lay.addWidget(self.action_btn)
+        self._action = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.hide)
         self.hide()
 
-    def show_message(self, text: str, tone: str = "green", ms: int = 8000) -> None:
+    def show_message(self, text: str, tone: str = "green", ms: int = 8000, action=None) -> None:
+        """``action`` = (libellé, fonction) : bouton dans le message (ex. « Ouvrir le dossier »)."""
+        self._action = action[1] if action else None
+        self.action_btn.setText(action[0] if action else "")
+        self.action_btn.setVisible(bool(action))
         fg, bg = TONES.get(tone, TONES["green"])
         self.setObjectName("toast")
         self.setStyleSheet(f"QFrame#toast{{background:{bg};border-radius:14px;}} QLabel{{color:{fg};font-weight:600;background:transparent;}}")

@@ -69,7 +69,10 @@ class Settings:
     preview_cache_enabled: bool = True     # aperçu PDF des fichiers Word (produit à la première consultation)
     docx_convert_at_index: bool = False    # préconvertir les .docx pendant l'indexation (aperçu immédiat, très lent)
     differential: bool = True
-    index_workers: int = 0                 # processus parallèles ; 0 = automatique (cœurs - 1, au plus 4)
+    index_workers: int = 0
+    exports_root: str = ""                 # vide = Documents\Exports Scolarix ; sinon dossier (partagé) du service
+    exports_retention_days: int = 30       # relevés, cursus, vérifications : supprimés après N jours (0 = jamais)
+    delivery_ref_stamp: bool = False       # imprimer le numéro de délivrance en bas de chaque page délivrée                 # processus parallèles ; 0 = automatique (cœurs - 1, au plus 4)
     # Dossiers (chemin absolu ou relatif à la racine) et motifs de noms (*DIPLOME*, Brouillons…) à ignorer
     exclusions: list = field(default_factory=list)
     # Corrections de texte appliquées aux SEULS fichiers Word, sur une copie, à l'aperçu, à l'impression
@@ -98,14 +101,24 @@ class Settings:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    def export_dir(self) -> Path:
-        desktop = Path.home() / "Desktop"
-        if not desktop.exists():
-            desktop = Path.home() / "Bureau"
-        if not desktop.exists():
-            desktop = data_dir() / "exports"
-            desktop.mkdir(parents=True, exist_ok=True)
-        return desktop
+    def exports_root_dir(self) -> Path:
+        """Racine des exports : réglable (dossier partagé du service, ou local). Par défaut
+        Documents\\Exports Scolarix — pas le Bureau, souvent synchronisé et visible de tous."""
+        if self.exports_root:
+            root = Path(self.exports_root)
+        else:
+            docs = next((d for d in (Path.home() / "Documents", Path.home() / "Mes documents") if d.exists()), None)
+            root = (docs / "Exports Scolarix") if docs else data_dir() / "exports"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def export_dir(self, nature: str = "Releves") -> Path:
+        """Dossier du mois pour une nature de document : <racine>/<Nature>/<AAAA>/<MM>."""
+        from datetime import date
+        d = date.today()
+        folder = self.exports_root_dir() / nature / f"{d:%Y}" / f"{d:%m}"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
 
 
 def config_path() -> Path:
