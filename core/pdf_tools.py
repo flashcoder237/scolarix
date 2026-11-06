@@ -216,12 +216,16 @@ def select_for_cursus(rels: list[Releve]) -> list[Releve]:
     et on ne garde que le plus récent s'il y a plusieurs exemplaires validés."""
     by_period: dict[tuple, list[Releve]] = {}
     for r in rels:
-        by_period.setdefault((r.matricule, r.niveau, r.semestre or 0), []).append(r)
+        # Semestre inconnu : on ne regroupe JAMAIS (S3 et S4 non lus seraient confondus et l'un masqué).
+        key = (r.matricule, r.niveau, r.semestre, r.semestre_fin) if r.semestre else ("?", r.id)
+        by_period.setdefault(key, []).append(r)
     keep = []
     for group in by_period.values():
         ok = [r for r in group if r.is_success]
         if ok:
             keep.append(max(ok, key=lambda r: (r.annee_academique or "", r.id)))
+            # décision illisible ou à vérifier : jamais écartée en silence
+            keep.extend(r for r in group if not r.is_success and not r.statut_negatif)
         else:
             keep.extend(group)
     keep.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",

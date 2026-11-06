@@ -88,11 +88,24 @@ def pdf_pages_text(pdf_path: Path) -> list[PageText]:
     relevés FMSP (87 pages : 0,3 s contre 15 s), résultat identique, et il démêle mieux les textes
     superposés. pdfplumber reste un recours si PDFium échoue sur un fichier."""
     try:
-        return _pages_pdfium(pdf_path)
+        pages = _pages_pdfium(pdf_path)
     except ExtractionError:
         raise
     except Exception:
         return _pages_pdfplumber(pdf_path)
+    # PDFium rend le texte dans l'ordre du flux du PDF : sur une page qui porte DEUX relevés, le tableau
+    # du 2e étudiant peut précéder son en-tête et être rattaché au 1er. Ces pages (rares) sont relues
+    # avec pdfplumber, qui suit l'ordre visuel.
+    multi = [p.number for p in pages if len(re.findall(r"M\s?A\s?T\s?R\s?I\s?C\s?U\s?L\s?E", p.text, re.I)) >= 2]
+    if multi:
+        try:
+            import pdfplumber
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                for n in multi:
+                    pages[n - 1] = PageText(n, pdf.pages[n - 1].extract_text() or pages[n - 1].text)
+        except Exception:
+            pass
+    return pages
 
 
 def page_count_and_text(pdf_path: Path, numbers: list[int]) -> tuple[int, dict[int, str]]:
@@ -535,7 +548,7 @@ class WordConverter:
 
 # --------------------------------------------------- .docx sans convertisseur
 _DOCX_HEADER_RE = re.compile(r"\s*NOMS?\s*(?:ET|&)\s*PR[ÉE]NOMS?\b", re.IGNORECASE)
-_DOCX_MATRICULE_RE = re.compile(r"MATRICULE\s*:?\s*\d{2}\s?[A-Z]{1,4}\s?\d{2,4}", re.IGNORECASE)
+_DOCX_MATRICULE_RE = re.compile(r"MATRICULE\s*:?\s*\d{2}\s*[-/. ]?\s*[A-Z]{1,4}\s*[-/. ]?\s*\d{2,4}", re.IGNORECASE)
 
 
 def docx_pages_text(path: Path) -> list[PageText]:
@@ -549,6 +562,11 @@ def docx_pages_text(path: Path) -> list[PageText]:
         raise ExtractionError(f"Document Word illisible ({exc.__class__.__name__}).") from exc
 
     pages: list[list[str]] = [[]]
+    # Zones de texte : Word écrit la même zone deux fois (mc:Choice moderne + mc:Fallback VML) ;
+    # on ne lit que la première (en mémoire seulement, le fichier n'est pas modifié).
+    mc_fallback = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+    for fb in list(document.element.body.iter(mc_fallback)):
+        fb.getparent().remove(fb)
 
     def add(text: str) -> None:
         # Un relevé qui commence alors que la page courante en contient déjà un : Word l'a placé sur
@@ -584,9 +602,9 @@ def docx_pages_text(path: Path) -> list[PageText]:
                 if ppr is not None and ppr.find(qn("w:sectPr")) is not None and any(s.strip() for s in pages[-1]):
                     pages.append([])
             elif tag == qn("w:tbl"):
-                for row in child.iter(qn("w:tr")):
+                for row in child.findall(qn("w:tr")):        # lignes DIRECTES (pas celles d'un tableau imbriqué)
                     cells = []
-                    for cell in row.iter(qn("w:tc")):
+                    for cell in row.findall(qn("w:tc")):
                         cells.append(" ".join(t.text for t in cell.iter(qn("w:t")) if t.text))
                     add("  ".join(cells))
 

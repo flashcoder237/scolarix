@@ -190,6 +190,11 @@ class Releve:
         return (self.statut or "").upper().startswith("ADMIS") or (self.statut or "").upper() == "VALIDÉ"
 
     @property
+    def statut_negatif(self) -> bool:
+        """Décision explicitement défavorable (et lue) : NON VALIDÉ, AJOURNÉ, EXCLUSION..."""
+        return bool(self.statut) and not self.is_success and self.statut != "À VÉRIFIER"
+
+    @property
     def periode(self) -> str:
         """« Niveau 2 · S3 » (ou « Niveau 2 » si le semestre est inconnu)."""
         base = self.niveau or "Niveau ?"
@@ -654,8 +659,9 @@ class Database:
                     clauses.append("(' ' || r.nom_norm || ' ') LIKE ?")
                     args.append(f"% {w} %")
                 else:
-                    clauses.append("r.nom_norm LIKE ?")
-                    args.append(f"%{w}%")
+                    # aussi sans espaces : « ANNESOPHIE » trouve « ANNE-SOPHIE », « NOM PRENOM » trouve « NOMPRENOM »
+                    clauses.append("(r.nom_norm LIKE ? OR replace(r.nom_norm, ' ', '') LIKE ?)")
+                    args.extend([f"%{w}%", f"%{w}%"])
         has_matricule = any("r.matricule" in c for c in clauses)
         fuzzy_words = [] if has_matricule else [w for w in words if len(w) >= 3]
         exact: list[Releve] = []
@@ -715,6 +721,10 @@ class Database:
                 r.flags.append(f"{n_same} RELEVÉS S{r.semestre}" if r.semestre else "DOUBLON NIVEAU")
             if r.type_fichier == "PDF_SCAN":
                 r.flags.append("SCAN OCR")
+            if r.matricule.startswith("ILLISIBLE"):
+                r.flags.append("MATRICULE ILLISIBLE")
+            if (r.statut or "") == "À VÉRIFIER":
+                r.flags.append("DÉCISION À VÉRIFIER")
             if r.fichier_statut == "ERREUR" or not _exists_cached(r.chemin):
                 r.flags.append("FICHIER INTROUVABLE")
 
@@ -747,11 +757,13 @@ class Database:
         base = self._select("r.matricule = ?", [norm_matricule(matricule)])
         if not base:
             return []
-        name = base[0].nom_norm
         dob = next((r.date_naissance for r in base if r.date_naissance), None)
+        # comparaison sans espaces : les noms collés de certains fichiers désignent la même personne
+        names = {r.nom_norm.replace(" ", "") for r in base}
         rows = self.conn.execute(
-            "SELECT matricule, MIN(filiere) filiere, COUNT(*) n, MAX(date_naissance) dob FROM etudiants_releves "
-            "WHERE nom_norm = ? AND matricule <> ? GROUP BY matricule", (name, base[0].matricule)).fetchall()
+            f"SELECT matricule, MIN(filiere) filiere, COUNT(*) n, MAX(date_naissance) dob FROM etudiants_releves "
+            f"WHERE replace(nom_norm, ' ', '') IN ({','.join('?' * len(names))}) AND matricule <> ? "
+            f"GROUP BY matricule", (*names, base[0].matricule)).fetchall()
         out = []
         for row in rows:
             if dob and row["dob"] and row["dob"] != dob:

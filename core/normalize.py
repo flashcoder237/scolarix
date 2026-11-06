@@ -76,7 +76,8 @@ def find_matricules(text: str) -> list[str]:
     for m in MATRICULE_RE.finditer(text or ""):
         letters = m.group(2).upper()
         # Évite les faux positifs du type « 12 de 2021 », « 20 h 30 »
-        if letters in {"H", "DE", "LE", "LA", "ET", "AU", "EN", "DU", "LES", "DES", "AUX", "SUR", "UE"}:
+        if letters in {"H", "DE", "LE", "LA", "ET", "AU", "EN", "DU", "LES", "DES", "AUX", "SUR", "UE",
+                       "BP", "TEL", "FAX", "NO", "N", "UDO", "RUE", "KM", "AV", "CP", "PAGE", "P"}:
             continue
         mat = f"{m.group(1)}{letters}{m.group(3)}"
         if mat not in seen:

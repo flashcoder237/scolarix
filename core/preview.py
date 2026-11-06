@@ -145,6 +145,11 @@ def remap_pages(pdf: Path, releves: list[Releve], source: str) -> tuple[dict[int
             missing.extend(rels)         # absent ou ambigu : on ne devine pas, on bloque
             continue
         for rel, cand in zip(rels, cands):
+            # contrôle de cohérence : même moyenne et même décision que le relevé indexé
+            if any(getattr(rel, a, None) and cand.get(a) and getattr(rel, a) != cand.get(a)
+                   for a in ("moyenne", "decision")):
+                missing.append(rel)
+                continue
             mapping[rel.id] = (cand["numero_page"], cand["page_fin"])
     return mapping, missing
 

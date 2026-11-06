@@ -400,6 +400,18 @@ class PreviewPanel(QWidget):
             conf = f" (confiance {rel.ocr_confiance:.0f} %)" if rel.ocr_confiance is not None else ""
             tone = "amber" if (rel.ocr_confiance or 100) < 70 else "blue"
             out.append((f"Texte issu de l'OCR{conf} : contrôlez le matricule sur l'image avant impression.", tone))
+        if rel.matricule.startswith("ILLISIBLE"):
+            out.append(("Matricule illisible sur ce relevé : identifiez l'étudiant sur l'aperçu. L'impression est "
+                        "bloquée tant que le fichier n'est pas corrigé ou réindexé.", "red"))
+        if (rel.statut or "") == "À VÉRIFIER":
+            out.append(("Décision et crédits incohérents (ou décision ambiguë) : vérifiez la décision du jury sur "
+                        "l'aperçu avant de délivrer.", "amber"))
+        if rel.matricule.startswith("ILLISIBLE"):
+            out.append(("Matricule illisible sur ce relevé : identifiez l'étudiant sur l'aperçu. L'impression est "
+                        "bloquée tant que le fichier n'est pas corrigé ou réindexé.", "red"))
+        if (rel.statut or "") == "À VÉRIFIER":
+            out.append(("Décision et crédits incohérents (ou décision ambiguë) : vérifiez la décision du jury sur "
+                        "l'aperçu avant de délivrer.", "amber"))
         if rel.decision_deduite:
             out.append(("Ancien format (2012-2014) : aucune décision semestrielle n'est imprimée sur ce relevé ; "
                         "le statut est déduit de la colonne JURY des UE. Vérifiez sur l'aperçu.", "blue"))

@@ -33,6 +33,8 @@ def statut_tone(statut: str | None) -> str:
         return "green"
     if not s:
         return "gray"
+    if "VÉRIFIER" in s or "VERIFIER" in s:
+        return "amber"
     return "red"
 
 

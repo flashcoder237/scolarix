@@ -29,6 +29,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -219,6 +220,10 @@ class FileProcessor:
         if kind == "PDF":
             pages = pdf_pages_text(path)
             scanned = [p.number for p in pages if len((p.text or "").strip()) < MIN_TEXT_CHARS]
+            if self.ocr_available and not any(re.search(r"MATRICULE|\d{2}\s?[A-Z]{1,4}\s?\d{2,4}", p.text or "", re.I)
+                                              for p in pages):
+                # Scan portant un peu de texte (tampon, numéro de page) mais aucun matricule : OCR de toutes les pages
+                scanned = [p.number for p in pages]
             if scanned and self.ocr_available:
                 ocr = ocr_pdf_pages(path, scanned, self.s)
                 pages = [ocr.get(p.number, p) for p in pages]
@@ -270,10 +275,14 @@ class FileProcessor:
             pages = self._pages_for(res, path, kind)
             res.nb_pages = len(pages)
             releves, warnings = parse_pages(pages, res.chemin)
-            for w in warnings[:5]:
+            # Les avertissements de sécurité (matricule illisible, décision à vérifier, blocs mélangés) sont
+            # TOUS gardés ; les autres sont limités pour ne pas noyer le journal.
+            serious = [w for w in warnings if any(k in w.lower() for k in ("illisible", "vérifier", "mélang", "rattach"))]
+            others = [w for w in warnings if w not in serious]
+            for w in serious + others[:10]:
                 res.anomalies.append(("AVERTISSEMENT", w, "Revoir la page"))
-            if len(warnings) > 5:
-                res.anomalies.append(("AVERTISSEMENT", f"… et {len(warnings) - 5} autres avertissements.", None))
+            if len(others) > 10:
+                res.anomalies.append(("AVERTISSEMENT", f"… et {len(others) - 10} autres avertissements.", None))
             linked = [r for r in releves if r["page_fin"] > r["numero_page"]]
             if linked:
                 ex = linked[0]
