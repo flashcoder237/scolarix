@@ -140,13 +140,13 @@ def test_reglages_regles_et_exclusions(app, window):
     rules.italic.setCurrentIndex(rules.italic.findData(False))
     r1 = rules.rules()[1]
     assert (r1["police"], r1["taille"], r1["gras"], r1["italique"]) == ("Times New Roman", 9.5, True, False)
-    assert "Times New Roman" in rules.table.item(1, 5).text()
+    assert "Times New Roman" in rules.table.item(1, 6).text()
     assert rules.sample_fmt.font().family() == "Times New Roman" and rules.sample_fmt.font().bold()
     rules.table.setCurrentCell(0, 1)
     assert rules.font.currentText() == "(police d'origine)"          # chaque règle garde sa mise en forme
     rules.add_rule()
     rules.table.item(rules.table.rowCount() - 1, 2).setText("(")
-    rules.table.item(rules.table.rowCount() - 1, 4).setCheckState(Qt.CheckState.Checked)
+    rules.table.item(rules.table.rowCount() - 1, 5).setCheckState(Qt.CheckState.Checked)
     assert rules.validate() is not None                       # expression invalide refusée
     dlg.save()
     assert dlg.result() == 0                                  # non enregistré

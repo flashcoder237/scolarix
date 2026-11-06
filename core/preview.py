@@ -54,7 +54,7 @@ def preview_name(source: str, settings: Settings) -> str:
     return cache_name_for(source).replace(".pdf", f"_{digest}.pdf")
 
 
-ENGINE_VERSION = "3"   # à incrémenter quand le rendu ou les corrections changent : refait les aperçus
+ENGINE_VERSION = "4"   # à incrémenter quand le rendu ou les corrections changent : refait les aperçus
 
 
 def _signature(src: Path, extra: str = "") -> str:

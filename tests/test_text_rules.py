@@ -191,3 +191,36 @@ def test_regles_par_defaut_respectent_le_schema(tmp_path):
     out = tmp_path / "o.docx"
     rewrite_docx(src, out, DEFAULTS)
     assert _rpr_order_ok(out)
+
+
+def test_ref_deja_present_sur_la_ligne_pas_de_doublon(tmp_path):
+    """Relevé Word déjà corrigé à la main : « Ref N° » en début de ligne (run séparé), nouvelle référence déjà là."""
+    doc = Document()
+    p = doc.sections[0].header.paragraphs[0]
+    for text, size in (("Ref N°", 14), ("                    ", 14), ("RELEVE DE NOTES", 16), (" /TRANSCRIPT", 16),
+                       ("        ", 16), ("/FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE", 9)):
+        r = p.add_run(text)
+        r.font.size = Pt(size)
+    doc.add_paragraph("NOM ET PRENOM: TEST   MATRICULE: 98EM101")
+    src, out = tmp_path / "r.docx", tmp_path / "o.docx"
+    doc.save(str(src))
+    assert rewrite_docx(src, out, DEFAULTS) == 0
+    h = header_text(out)
+    assert h.count("Ref N") == 1 and h.count("CDAASSR") == 1
+
+
+def test_essai_respecte_sauf_si():
+    text, n = apply_text("Ref N°      RELEVE DE NOTES /TRANSCRIPT   /FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE", DEFAULTS)
+    assert n == 0 and text.count("Ref N") == 1
+
+
+def test_anciennes_regles_enregistrees_mises_a_niveau(tmp_path, monkeypatch):
+    import json
+
+    from core import config
+    old_rules = [{k: v for k, v in r.items() if k != "sauf_si"} for r in DEFAULT_TEXT_RULES]
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"text_rules": old_rules}), encoding="utf-8")
+    monkeypatch.setattr(config, "config_path", lambda: cfg)
+    s = config.load_settings()
+    assert s.text_rules[1]["sauf_si"] == DEFAULT_TEXT_RULES[1]["sauf_si"]

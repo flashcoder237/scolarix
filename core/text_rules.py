@@ -43,6 +43,7 @@ class CompiledRule:
     font: str | None = None        # police (« Arial », « Times New Roman »…) ; None = celle d'origine
     italic: bool | None = None
     whole: bool = False            # True : le style s'applique à tout le résultat, pas seulement au texte ajouté
+    unless: re.Pattern | None = None   # ne rien faire si l'en-tête / le document contient déjà ce texte
 
     @property
     def styled(self) -> bool:
@@ -79,10 +80,18 @@ def compile_rules(rules: Iterable[dict]) -> list[CompiledRule]:
             size = None
         bold, italic = r.get("gras"), r.get("italique")
         font = (r.get("police") or "").strip() or None
+        unless = None
+        guard = (r.get("sauf_si") or "").strip()
+        if guard:
+            expr_u = guard if r.get("regex") else r"\s*".join(re.escape(part) for part in guard.split())
+            try:
+                unless = re.compile(expr_u, re.IGNORECASE)
+            except re.error as exc:
+                raise RuleError(f"Règle {i} : « sauf si » invalide ({exc}).") from exc
         out.append(CompiledRule(pat, repl, r.get("description") or search, size,
                                 bold if bold in (True, False) else None, font,
                                 italic if italic in (True, False) else None,
-                                (r.get("style_sur") or "ajout") == "tout"))
+                                (r.get("style_sur") or "ajout") == "tout", unless))
     return out
 
 
@@ -91,18 +100,33 @@ def rules_digest(rules: Iterable[dict], enabled: bool = True) -> str:
     if not enabled:
         return "brut"
     active = [{k: r.get(k) for k in ("regex", "chercher", "remplacer", "taille", "gras", "police", "italique",
-                                     "style_sur")} for r in rules or [] if r.get("actif", True)
+                                     "style_sur", "sauf_si")} for r in rules or [] if r.get("actif", True)
               and (r.get("chercher") or "").strip()]
     if not active:
         return "brut"
     return hashlib.sha1(json.dumps(active, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
 
 
+def _already_done(m: re.Match, rule: CompiledRule) -> bool:
+    """Le texte trouvé est déjà le texte voulu (relevé corrigé à la main) : ne pas le remplacer à nouveau."""
+    return not rule.whole and m.group(0).strip() == m.expand(rule.replacement).strip()
+
+
+def applicable(rules: list[CompiledRule], text: str) -> list[CompiledRule]:
+    """Règles à appliquer à ce texte : celles dont le « sauf si » n'y figure pas déjà."""
+    return [r for r in rules if not (r.unless and r.unless.search(text))]
+
+
 def apply_text(text: str, rules: list[CompiledRule]) -> tuple[str, int]:
     n = 0
-    for rule in rules:
-        text, k = rule.pattern.subn(rule.replacement, text)
-        n += k
+    for rule in applicable(rules, text):
+        def sub(m, rule=rule):
+            nonlocal n
+            if _already_done(m, rule):
+                return m.group(0)
+            n += 1
+            return m.expand(rule.replacement)
+        text = rule.pattern.sub(sub, text)
     return text, n
 
 
@@ -253,7 +277,7 @@ def _replace_in_paragraph(paragraph, rules: list[CompiledRule]) -> int:
             return count
         texts = [t.text or "" for t in nodes]
         full = "".join(texts)
-        matches = [m for m in rule.pattern.finditer(full) if m.end() > m.start()]
+        matches = [m for m in rule.pattern.finditer(full) if m.end() > m.start() and not _already_done(m, rule)]
         if not matches:
             continue
         starts = []
@@ -323,7 +347,11 @@ def rewrite_docx(src: Path, dest: Path, rules: list[CompiledRule]) -> int:
                 except etree.XMLSyntaxError:
                     root = None
                 if root is not None:
-                    n = sum(_replace_in_paragraph(p, rules) for p in list(root.iter(W + "p")))
+                    # « Sauf si » vérifié sur toute la partie (en-tête de section, corps…) : un « Ref N° » déjà
+                    # présent ailleurs sur la ligne ou dans une zone de texte voisine suffit à ne pas en ajouter un.
+                    part_text = "".join(t.text or "" for t in root.iter(W + "t"))
+                    part_rules = applicable(rules, part_text)
+                    n = sum(_replace_in_paragraph(p, part_rules) for p in list(root.iter(W + "p"))) if part_rules else 0
                     if n:
                         total += n
                         data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)

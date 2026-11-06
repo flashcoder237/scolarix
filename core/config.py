@@ -25,10 +25,10 @@ DEFAULT_TEXT_RULES = (
      "chercher": r"Tel\s*:\s*33\s*01\s*41\s*39\s*/\s*33\s*01\s*41\s*29\s*[.,]?", "remplacer": ""},
     {"actif": True, "regex": True, "description": "Ajouter « Ref N° » devant le titre",
      "chercher": r"(?<!N° )RELEVE\s+DE\s+NOTES\s*/\s*TRANSCRIPT", "remplacer": "Ref N° RELEVE DE NOTES /TRANSCRIPT",
-     "taille": 8, "gras": False},
+     "taille": 8, "gras": False, "sauf_si": r"R[ée]f\.?\s*N\s*[°o]"},
     {"actif": True, "regex": True, "description": "Nouvelle référence des services",
      "chercher": r"/?FMSP(?:/[A-Z]{2,8})+", "remplacer": " /FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE",
-     "taille": 7},
+     "taille": 7, "sauf_si": r"/FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE"},
 )
 
 
@@ -138,7 +138,18 @@ def load_settings() -> Settings:
                     setattr(s, k, v)
         except (OSError, ValueError):
             pass
+    _upgrade_rules(s)
     return s
+
+
+def _upgrade_rules(s: "Settings") -> None:
+    """Règles enregistrées avant l'option « sauf si » : on ajoute la protection des règles d'origine
+    (évite « Ref N° » en double sur un relevé déjà corrigé à la main)."""
+    defaults = {r["chercher"]: r for r in DEFAULT_TEXT_RULES}
+    for rule in s.text_rules or []:
+        d = defaults.get(rule.get("chercher"))
+        if d and d.get("sauf_si") and "sauf_si" not in rule:
+            rule["sauf_si"] = d["sauf_si"]
 
 
 def save_settings(s: Settings) -> None:

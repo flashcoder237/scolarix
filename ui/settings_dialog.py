@@ -109,8 +109,8 @@ class ExclusionsDialog(QDialog):
 
 
 # ------------------------------------------------------------ corrections Word
-RULE_COLS = ("Actif", "Description", "Chercher", "Remplacer par", "Regex", "Mise en forme")
-C_ACT, C_DESC, C_FIND, C_REPL, C_RX, C_FMT = range(len(RULE_COLS))
+RULE_COLS = ("Actif", "Description", "Chercher", "Remplacer par", "Sauf si déjà présent", "Regex", "Mise en forme")
+C_ACT, C_DESC, C_FIND, C_REPL, C_UNLESS, C_RX, C_FMT = range(len(RULE_COLS))
 STYLE_KEYS = ("police", "taille", "gras", "italique", "style_sur")
 ORIGINE = "(police d'origine)"
 COMMON_FONTS = ["Arial", "Arial Narrow", "Book Antiqua", "Bookman Old Style", "Calibri", "Cambria", "Century Gothic",
@@ -153,7 +153,7 @@ class RulesEditor(QWidget):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(C_FIND, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(C_REPL, QHeaderView.ResizeMode.Stretch)
-        for col, w in ((C_ACT, 48), (C_DESC, 190), (C_RX, 56), (C_FMT, 170)):
+        for col, w in ((C_ACT, 48), (C_DESC, 170), (C_UNLESS, 170), (C_RX, 56), (C_FMT, 150)):
             self.table.setColumnWidth(col, w)
         self._loading = True
         for r in settings.text_rules:
@@ -246,6 +246,9 @@ class RulesEditor(QWidget):
         self.result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.result.setStyleSheet("QLabel{background:#0F172A;color:#E2E8F0;border-radius:12px;padding:8px 12px;}")
         lay.addWidget(self.result)
+        lay.addWidget(muted("« Sauf si déjà présent » : la règle est ignorée pour un en-tête qui contient déjà ce texte "
+                            "(un relevé déjà corrigé à la main ne reçoit pas un second « Ref N° ») ; un texte trouvé "
+                            "qui est déjà exactement le texte voulu n'est jamais remplacé.", 8.5))
         lay.addWidget(muted("Uniquement les fichiers Word : la correction est faite sur une COPIE au moment de produire "
                             "l'aperçu ; l'original n'est jamais modifié et les PDF/scans ne sont pas concernés. En texte "
                             "simple, les espaces acceptent n'importe quel nombre d'espaces. Une taille plus petite évite "
@@ -267,7 +270,8 @@ class RulesEditor(QWidget):
             self.table.setItem(i, col, it)
 
         check(C_ACT, r.get("actif", True))
-        for col, key in ((C_DESC, "description"), (C_FIND, "chercher"), (C_REPL, "remplacer")):
+        for col, key in ((C_DESC, "description"), (C_FIND, "chercher"), (C_REPL, "remplacer"),
+                         (C_UNLESS, "sauf_si")):
             self.table.setItem(i, col, QTableWidgetItem(str(r.get(key) or "")))
         check(C_RX, r.get("regex"))
         style = {k: r.get(k) for k in STYLE_KEYS if r.get(k) not in (None, "")}
@@ -345,6 +349,7 @@ class RulesEditor(QWidget):
                 return it.text() if it else ""
             rule = {"actif": self.table.item(i, C_ACT).checkState() == Qt.CheckState.Checked,
                     "description": txt(C_DESC), "chercher": txt(C_FIND), "remplacer": txt(C_REPL),
+                    "sauf_si": txt(C_UNLESS).strip(),
                     "regex": self.table.item(i, C_RX).checkState() == Qt.CheckState.Checked}
             rule.update(self.table.item(i, C_FMT).data(Qt.ItemDataRole.UserRole) or {})
             out.append(rule)
