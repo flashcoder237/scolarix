@@ -100,6 +100,8 @@ class IndexingPage(QWidget):
         self.db, self.s = db, settings
         self.proc: QProcess | None = None
         self._stopping = False
+        self._run_gen = 0
+        self._run_gen += 1
         self._buf = b""
         self._filter = None
 
@@ -373,7 +375,8 @@ class IndexingPage(QWidget):
                 self.proc.write(b"stop\n")
                 self.status.set("ARRÊT…", "amber")
                 self.detail.setText("Arrêt demandé : fin des fichiers en cours… (cliquer encore pour forcer)")
-                QTimer.singleShot(20000, self._force_stop)
+                gen = self._run_gen
+                QTimer.singleShot(60000, lambda: self._force_stop(gen))
             else:
                 self.proc.kill()
             return
@@ -387,6 +390,7 @@ class IndexingPage(QWidget):
         args += ["--index", "--json", "--stdin-control", "--source", src, "--db", str(self.s.resolved_db_path()),
                  "--only-new" if self.s.differential else "--full"]
         self._stopping = False
+        self._run_gen += 1
         if not self.s.ocr_enabled:
             args.append("--no-ocr")
         self.proc = QProcess(self)
@@ -455,9 +459,25 @@ class IndexingPage(QWidget):
             self.detail.setText(f"Terminé en {ev['duree_s']} s · {ev['ecrits']} relevé(s) écrit(s) · "
                                 f"{ev['ignores']} inchangé(s) · {ev['echecs']} en échec")
 
-    def _force_stop(self) -> None:
+    def _force_stop(self, gen: int | None = None) -> None:
+        if gen is not None and gen != self._run_gen:
+            return   # minuteur d'un arrêt précédent : ne touche pas à la nouvelle indexation
         if self._stopping and self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
             self.proc.kill()
+            from core.extractors import kill_orphan_words
+            QTimer.singleShot(1500, kill_orphan_words)
+
+    def stop_and_wait(self, timeout_ms: int = 30000) -> None:
+        """Fermeture de l'application : arrêt propre (Word fermé par le robot), sinon arrêt forcé."""
+        if not self.is_running():
+            return
+        self._stopping = True
+        self.proc.write(b"stop\n")
+        if not self.proc.waitForFinished(timeout_ms):
+            self.proc.kill()
+            self.proc.waitForFinished(3000)
+        from core.extractors import kill_orphan_words
+        kill_orphan_words()
 
     def _finished(self, code, status) -> None:
         self._read()

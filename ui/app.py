@@ -46,15 +46,20 @@ def run_gui(argv: list[str]) -> int:
     if ico.exists():
         from PySide6.QtGui import QIcon
         app.setWindowIcon(QIcon(str(ico)))
-    purge_temp()
-    import atexit
-    atexit.register(purge_temp)
+    purge_temp(max_age=3600)          # restes d'une session précédente (plus d'une heure)
+    app.aboutToQuit.connect(purge_temp)   # fichiers de cette session
     qss = resource_path("ui", "theme_fmsp.qss")
     if qss.exists():
         app.setStyleSheet(qss.read_text(encoding="utf-8"))
     settings = load_settings()
     db = Database(settings.resolved_db_path(), cache_dir=settings.resolved_cache_dir())
     previews = PreviewService(db, settings)
+    app.aboutToQuit.connect(previews.close)
+    try:   # instances de Word laissées par une session précédente interrompue (plantage, coupure)
+        from core.extractors import kill_orphan_words
+        kill_orphan_words()
+    except Exception:
+        pass
     win = MainWindow(db, settings, previews)
     win.show()
     return app.exec()

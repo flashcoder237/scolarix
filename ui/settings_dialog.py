@@ -490,6 +490,13 @@ class SettingsDialog(QDialog):
             edit.setText(str(Path(p)))
 
     def save(self) -> None:
+        from core.config import is_network_path
+        db_path = self.fields["db_path"].text().strip()
+        if db_path and is_network_path(db_path):
+            self.tabs.setCurrentIndex(0)
+            self.error.setText("La base d'index doit rester sur le disque local du poste (pas sur un partage réseau : "
+                               "risque de corruption avec plusieurs guichets).")
+            return
         err = self.rules.validate()
         if err:
             self.tabs.setCurrentWidget(self.rules)

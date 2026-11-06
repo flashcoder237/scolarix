@@ -127,4 +127,22 @@ def load_settings() -> Settings:
 
 
 def save_settings(s: Settings) -> None:
-    config_path().write_text(json.dumps(asdict(s), indent=2, ensure_ascii=False), encoding="utf-8")
+    """Écriture atomique : le robot relit ce fichier à son démarrage, il ne doit jamais le trouver tronqué."""
+    path = config_path()
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(asdict(s), indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def is_network_path(path: str) -> bool:
+    """Chemin sur un partage réseau (UNC ou lecteur réseau) : la base SQLite (WAL) ne doit pas y être."""
+    p = str(path or "")
+    if p.startswith(("\\\\", "//")):
+        return True
+    if os.name == "nt" and len(p) >= 2 and p[1] == ":":
+        try:
+            import ctypes
+            return ctypes.windll.kernel32.GetDriveTypeW(p[:2] + "\\") == 4   # DRIVE_REMOTE
+        except Exception:
+            return False
+    return False

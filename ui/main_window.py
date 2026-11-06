@@ -151,8 +151,13 @@ class MainWindow(QMainWindow):
             if r != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self.indexing.proc.kill()
-            self.indexing.proc.waitForFinished(3000)
+            from PySide6.QtWidgets import QApplication
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.indexing.stop_and_wait(30000)
+            finally:
+                QApplication.restoreOverrideCursor()
+        self.previews.close()    # ferme Word (aperçus) avant l'arrêt de l'interpréteur
         super().closeEvent(event)
 
 

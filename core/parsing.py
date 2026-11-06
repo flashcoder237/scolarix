@@ -208,6 +208,13 @@ def split_blocks(pages: list[PageText]) -> tuple[list[Block], list[str]]:
                 current.ocr.append(page.ocr_confidence)
 
         if not labeled:
+            if current is not None and (_has_student_header(text) or page.number != current.page_fin + 1):
+                # En-tête d'un AUTRE étudiant dont le matricule est illisible (OCR « 1O2 » pour « 102 »…),
+                # ou page non contiguë : surtout ne pas l'imprimer avec le relevé précédent.
+                warnings.append(f"Page {page.number} : en-tête d'étudiant sans matricule lisible, non rattachée "
+                                f"à {current.matricule} (à revoir).")
+                current = None
+                continue
             if current is not None and not re.search(r"\d{1,2}[,.]\d{2}", text):
                 # Page de fin vide (gabarit sans notes) : on ne l'imprime pas avec le relevé
                 warnings.append(f"Page {page.number} : page sans notes ignorée (suite vide du relevé "

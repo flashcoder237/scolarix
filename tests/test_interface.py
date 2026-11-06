@@ -116,7 +116,8 @@ def test_cursus_dialog(app, window, tmp_path):
     from ui.cursus_dialog import CursusDialog
     dlg = CursusDialog(window.db, window.s, "18M042", window, previews=window.previews)
     assert dlg.tree.topLevelItemCount() >= 6
-    dlg.export()
+    dlg.export()                                   # fusion en arrière-plan
+    assert wait_for(app, lambda: list(tmp_path.glob("FMSP_18M042_*_Cursus.pdf")) and not dlg._busy, 120)
     out = list(tmp_path.glob("FMSP_18M042_*_Cursus.pdf"))
     assert out and out[0].stat().st_size > 1000
     dlg.deleteLater()

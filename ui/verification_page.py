@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFrame
                                QHeaderView, QLabel, QLineEdit, QPushButton, QScrollArea, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
+from core.guard import PrintBlocked, check_before_print
 from core import pdf_tools, verification
 from core.config import Settings
 from core.database import Database, Releve
@@ -185,14 +186,19 @@ class VerificationPage(QWidget):
         self.original = self.db.get(rid) if rid else None
         previews = getattr(self, "previews", None)
         if self.original and previews is not None and previews.needs_render(self.original):
-            from PySide6.QtWidgets import QApplication
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                self.original = previews.ensure(self.original)
-            except Exception as exc:
-                self.toast.show_message(f"Aperçu Word impossible : {exc}", "red")
-            finally:
-                QApplication.restoreOverrideCursor()
+            # Aperçu Word produit en arrière-plan ; la comparaison reprend quand il est prêt
+            self.orig_viewer.show_message("Préparation de l'aperçu Word…")
+            task = Task(previews.ensure, self.original)
+
+            def ready(rel):
+                if self.original and rel.id == self.original.id:
+                    self.original = rel
+                    self.orig_viewer.show_page(rel.preview_pdf, rel.numero_page - 1)
+                    self.compare()
+            task.signals.done.connect(ready)
+            task.signals.failed.connect(lambda e: self.toast.show_message(f"Aperçu Word impossible : {e}", "red"))
+            QThreadPool.globalInstance().start(task)
+            return
         if self.original:
             self.orig_viewer.show_page(self.original.preview_pdf, self.original.numero_page - 1)
             self.compare()
@@ -277,6 +283,11 @@ class VerificationPage(QWidget):
         o = self.original
         if not o or not o.preview_pdf:
             self.toast.show_message("Aucun original sélectionné.", "amber")
+            return
+        try:
+            check_before_print(o)
+        except PrintBlocked as exc:
+            self.toast.show_message(str(exc), "red")
             return
         tmp = pdf_tools.extract_pages(o.preview_pdf, o.numero_page, o.page_fin, stamp=pdf_tools.stamp_text("VÉRIFIÉ"))
         task = Task(print_pdf, tmp, self.s)

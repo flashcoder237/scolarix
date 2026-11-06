@@ -52,13 +52,18 @@ class PdfViewer(QFrame):
         self.setMinimumHeight(420)
 
     def _doc(self, path: str) -> QPdfDocument | None:
-        if path in self._docs:
-            self._docs.move_to_end(path)
-            return self._docs[path]
+        try:
+            st = os.stat(path)
+            key = (path, st.st_mtime_ns, st.st_size)   # fichier remplacé => nouveau document, jamais l'ancien
+        except OSError:
+            return None
+        if key in self._docs:
+            self._docs.move_to_end(key)
+            return self._docs[key]
         doc = QPdfDocument(self)
         if doc.load(path) != QPdfDocument.Error.None_:
             return None
-        self._docs[path] = doc
+        self._docs[key] = doc
         while len(self._docs) > 4:
             _, old = self._docs.popitem(last=False)
             old.close()
@@ -80,8 +85,8 @@ class PdfViewer(QFrame):
         return True
 
     def forget(self, path: str) -> None:
-        doc = self._docs.pop(path, None)
-        if doc is not None:
+        for key in [k for k in self._docs if k[0] == path]:
+            doc = self._docs.pop(key)
             if self.view.document() is doc:
                 self.view.setDocument(None)
             doc.close()

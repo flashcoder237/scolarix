@@ -95,6 +95,27 @@ def pdf_pages_text(pdf_path: Path) -> list[PageText]:
         return _pages_pdfplumber(pdf_path)
 
 
+def page_count_and_text(pdf_path: Path, numbers: list[int]) -> tuple[int, dict[int, str]]:
+    """(nombre de pages, {numéro: texte}) pour quelques pages seulement (contrôle avant impression)."""
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(str(pdf_path))
+    out: dict[int, str] = {}
+    try:
+        n = len(doc)
+        for num in numbers:
+            if 1 <= num <= n:
+                page = doc[num - 1]
+                try:
+                    tp = page.get_textpage()
+                    out[num] = tp.get_text_bounded() or ""
+                    tp.close()
+                finally:
+                    page.close()
+    finally:
+        doc.close()
+    return n, out
+
+
 def _pages_pdfium(pdf_path: Path) -> list[PageText]:
     import pypdfium2 as pdfium
     try:
@@ -247,6 +268,119 @@ def ocr_pdf_pages(pdf_path: Path, page_numbers: list[int], settings: Settings) -
 
 
 # ------------------------------------------------------- conversion Word -> PDF
+class WordDied(Exception):
+    """Le processus WINWORD.EXE a planté ou ne répond plus (serveur RPC indisponible)."""
+
+
+# 0x800706BA (serveur RPC indisponible), 0x800706BE, RPC_E_DISCONNECTED, RPC_E_CALL_REJECTED
+_RPC_DEAD = {-2147023174, -2147023170, -2147417848, -2147417846}
+
+
+def _rpc_dead(exc: Exception) -> bool:
+    code = getattr(exc, "hresult", None)
+    if code is None and getattr(exc, "args", None):
+        code = exc.args[0] if isinstance(exc.args[0], int) else None
+    return code in _RPC_DEAD
+
+
+def _word_process_id(word) -> int | None:
+    """PID de l'instance Word créée (fenêtre cachée « OpusApp » retrouvée par un titre unique)."""
+    try:
+        import uuid
+
+        import win32gui  # type: ignore
+        import win32process  # type: ignore
+        caption = f"scolarix-{uuid.uuid4().hex}"
+        word.Caption = caption
+        hwnd = win32gui.FindWindow("OpusApp", caption)
+        if hwnd:
+            return win32process.GetWindowThreadProcessId(hwnd)[1]
+    except Exception:
+        pass
+    return None
+
+
+def _pid_file() -> Path:
+    from .config import data_dir
+    return data_dir() / "word_pids.txt"
+
+
+def register_word_pid(pid: int) -> None:
+    """Note « PID de Word  PID du processus propriétaire » (guichet, robot ou processus de lecture)."""
+    try:
+        with open(_pid_file(), "a", encoding="utf-8") as fh:
+            fh.write(f"{pid} {os.getpid()}\n")
+    except OSError:
+        pass
+
+
+def _read_pids() -> list[tuple[int, int]]:
+    try:
+        rows = []
+        for line in _pid_file().read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and all(x.isdigit() for x in parts):
+                rows.append((int(parts[0]), int(parts[1])))
+        return rows
+    except OSError:
+        return []
+
+
+def _write_pids(rows: list[tuple[int, int]]) -> None:
+    try:
+        _pid_file().write_text("".join(f"{a} {b}\n" for a, b in rows), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def unregister_word_pid(pid: int) -> None:
+    _write_pids([r for r in _read_pids() if r[0] != pid])
+
+
+def _process_name(pid: int) -> str | None:
+    """Nom de l'exécutable d'un processus vivant, None s'il n'existe plus."""
+    if platform.system() == "Windows":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True,
+                             text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        line = out.strip().splitlines()[0] if out.strip() else ""
+        return line.split('","')[0].strip('"') if line.startswith('"') else None
+    try:
+        os.kill(pid, 0)
+        return Path(f"/proc/{pid}/comm").read_text().strip() if Path(f"/proc/{pid}/comm").exists() else "?"
+    except OSError:
+        return None
+
+
+def kill_pid(pid: int) -> None:
+    if platform.system() != "Windows":
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+        return
+    subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def kill_orphan_words() -> int:
+    """Arrête les instances Word lancées par Scolarix dont le processus propriétaire a disparu (robot tué,
+    processus de lecture arrêté, plantage). Jamais un Word encore utilisé, ni un Word ouvert par l'utilisateur."""
+    rows = _read_pids()
+    keep, n = [], 0
+    for word_pid, owner in rows:
+        name = _process_name(word_pid)
+        if name is None:
+            continue                                   # déjà fermé
+        if _process_name(owner) is not None:
+            keep.append((word_pid, owner))             # propriétaire vivant : on n'y touche pas
+            continue
+        if "WINWORD" in name.upper():
+            kill_pid(word_pid)
+            n += 1
+    _write_pids(keep)
+    return n
+
+
 class WordConverter:
     """Convertit .doc/.docx en PDF. Réutilise une seule instance Word pendant toute l'indexation."""
 
@@ -278,22 +412,51 @@ class WordConverter:
     def __exit__(self, *exc):
         self.close()
 
+    word_pid: int | None = None
+
     def close(self) -> None:
+        """Fermeture normale (depuis le fil qui a créé Word) ; à défaut, arrêt du processus par son PID."""
         if self._word is not None:
             try:
                 self._word.Quit(SaveChanges=0)
             except Exception:
-                pass
+                self.kill()
             self._word = None
+        if self.word_pid:
+            unregister_word_pid(self.word_pid)
+            self.word_pid = None
+
+    def kill(self) -> None:
+        """Arrêt sans COM (utilisable depuis n'importe quel fil) : Word bloqué, processus parent disparu…"""
+        if self.word_pid:
+            kill_pid(self.word_pid)
+            unregister_word_pid(self.word_pid)
+            self.word_pid = None
+        self._word = None
 
     def _word_app(self):
         if self._word is None:
             import pythoncom  # type: ignore
             import win32com.client  # type: ignore
             pythoncom.CoInitialize()
-            self._word = win32com.client.DispatchEx("Word.Application")
-            self._word.Visible = False
-            self._word.DisplayAlerts = 0
+            word = win32com.client.DispatchEx("Word.Application")
+            try:
+                # Archives anciennes : macros (AutoOpen…) JAMAIS exécutées, pas de liens externes mis à jour
+                word.AutomationSecurity = 3          # msoAutomationSecurityForceDisable, avant tout Documents.Open
+            except Exception:
+                pass
+            word.Visible = False
+            word.DisplayAlerts = 0
+            try:
+                word.Options.UpdateLinksAtOpen = False
+                word.Options.CheckGrammarAsYouType = False
+                word.Options.CheckSpellingAsYouType = False
+            except Exception:
+                pass
+            self._word = word
+            self.word_pid = _word_process_id(word)
+            if self.word_pid:
+                register_word_pid(self.word_pid)
         return self._word
 
     def convert(self, src: Path, dest: Path, fmt: str = "pdf") -> None:
@@ -301,14 +464,20 @@ class WordConverter:
         dest.parent.mkdir(parents=True, exist_ok=True)
         errors = []
         if self._com_ok:
-            try:
-                self._convert_com(src, dest, fmt)
-                return
-            except ExtractionError:
-                raise
-            except Exception as exc:  # Word absent ou planté : on tente LibreOffice
-                errors.append(f"Word COM : {exc}")
-                self.close()
+            for attempt in (1, 2):
+                try:
+                    self._convert_com(src, dest, fmt)
+                    return
+                except WordDied as exc:      # Word a planté : on le relance une fois
+                    self.kill()
+                    if attempt == 2:
+                        errors.append(f"Word COM : {exc}")
+                except ExtractionError:
+                    raise
+                except Exception as exc:  # Word absent : on tente LibreOffice
+                    errors.append(f"Word COM : {exc}")
+                    self.kill()
+                    break
         if self._soffice:
             try:
                 self._convert_lo(src, dest, fmt)
@@ -326,17 +495,26 @@ class WordConverter:
                                       AddToRecentFiles=False, PasswordDocument="__fmsp__",
                                       Visible=False, NoEncodingDialog=True)
         except Exception as exc:
+            if _rpc_dead(exc):
+                raise WordDied(str(exc)) from exc
             text = str(exc).lower()
             if "password" in text or "mot de passe" in text:
                 raise ExtractionError("Fichier protégé par mot de passe : ignoré, indexation poursuivie.") from exc
             raise ExtractionError(f"Word ne peut pas ouvrir le fichier (endommagé ?) : {exc}") from exc
         try:
             if fmt == "docx":
-                doc.SaveAs2(str(dest.resolve()), FileFormat=16)   # 16 = wdFormatDocumentDefault (.docx)
+                doc.SaveAs2(str(dest.resolve()), FileFormat=16, AddToRecentFiles=False)  # 16 = .docx
             else:
                 doc.ExportAsFixedFormat(str(dest.resolve()), 17)  # 17 = wdExportFormatPDF
+        except Exception as exc:
+            if _rpc_dead(exc):
+                raise WordDied(str(exc)) from exc
+            raise
         finally:
-            doc.Close(SaveChanges=0)
+            try:
+                doc.Close(SaveChanges=0)
+            except Exception:
+                pass
 
     def _convert_lo(self, src: Path, dest: Path, fmt: str = "pdf") -> None:
         with tempfile.TemporaryDirectory(prefix="fmsp_conv_") as tmp:

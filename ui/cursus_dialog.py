@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton
 from core import pdf_tools
 from core.config import Settings
 from core.database import Database, Releve, missing_periods
+from core.guard import check_before_print
 from core.normalize import norm_text
 from core.printer_service import print_pdf
 
@@ -22,6 +23,7 @@ class CursusDialog(QDialog):
         super().__init__(parent)
         self.db, self.s = db, settings
         self.previews = previews
+        self._busy = False
         self.setWindowTitle("Cursus complet")
         self.resize(820, 760)
         self.rels = db.cursus(matricule)
@@ -178,44 +180,69 @@ class CursusDialog(QDialog):
         sel = self.selected()
         pages = sum(r.nb_pages for r in sel) + (1 if self.sw_cover.isChecked() and sel else 0)
         self.summary.setText(f"Fichier : {self._filename()}     ·     {len(sel)} relevé(s)     ·     {pages} pages")
-        self.btn_merge.setEnabled(bool(sel))
-        self.btn_print.setEnabled(bool(sel))
+        self.btn_merge.setEnabled(bool(sel) and not self._busy)
+        self.btn_print.setEnabled(bool(sel) and not self._busy)
+
+    def _prepare(self, rel: Releve) -> Releve:
+        """Pour chaque relevé fusionné : aperçu Word au besoin, puis contrôle de dernière ligne."""
+        if self.previews is not None:
+            rel = self.previews.ensure(rel)
+        check_before_print(rel)
+        return rel
 
     def _build(self, dest: Path) -> tuple[Path, int, list[str]]:
         stamp = pdf_tools.stamp_text() if self.sw_dup.isChecked() else None
-        prepare = self.previews.ensure if self.previews is not None else None
-        from PySide6.QtWidgets import QApplication
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            return pdf_tools.merge_releves(self.selected(), dest, cover=self.sw_cover.isChecked(), stamp=stamp,
-                                           prepare=prepare, absent=self._missing_levels())
-        finally:
-            QApplication.restoreOverrideCursor()
+        return pdf_tools.merge_releves(self.selected(), dest, cover=self.sw_cover.isChecked(), stamp=stamp,
+                                       prepare=self._prepare, absent=self._missing_levels())
+
+    def _run(self, dest: Path, on_done) -> None:
+        """Fusion en arrière-plan (conversions Word possibles) : la fenêtre ne gèle jamais."""
+        self.btn_merge.setEnabled(False)
+        self.btn_print.setEnabled(False)
+        self.toast.show_message("Préparation du dossier fusionné…", "blue", 60000)
+        self._busy = True
+        task = Task(self._build, dest)
+
+        def finish(*_):
+            self._busy = False
+            self._update_summary()
+
+        def failed(err):
+            finish()
+            self.toast.show_message(f"Échec de la fusion : {err}", "red")
+
+        task.signals.done.connect(lambda res: (finish(), on_done(*res)))
+        task.signals.failed.connect(failed)
+        QThreadPool.globalInstance().start(task)
 
     def _log(self, action: str, detail: str) -> None:
         mat = self.rels[0].matricule if self.rels else None
         self.db.log(action, self.s.operateur, self.s.poste, None, mat, detail)
 
     def export(self) -> None:
-        dest = self.s.export_dir() / self._filename()
-        try:
-            path, n, missing = self._build(dest)
-        except Exception as exc:
-            self.toast.show_message(f"Échec de la fusion : {exc}", "red")
-            return
-        self._log("CURSUS", f"{path.name} · {n} pages" + (" · DUPLICATA" if self.sw_dup.isChecked() else ""))
-        extra = f" — introuvables : {', '.join(missing)}" if missing else ""
-        self.toast.show_message(f"Exporté : {path} ({n} pages){extra}")
+        def done(path, n, missing):
+            self._log("CURSUS", f"{path.name} · {n} pages" + (" · DUPLICATA" if self.sw_dup.isChecked() else "")
+                      + (f" · écartés : {', '.join(missing)}" if missing else ""))
+            extra = f" — écartés : {', '.join(missing)}" if missing else ""
+            self.toast.show_message(f"Exporté : {path} ({n} pages){extra}", "amber" if missing else "green", 12000)
+        self._run(self.s.export_dir() / self._filename(), done)
 
     def print_(self) -> None:
-        tmp = pdf_tools.temp_pdf("cursus_")
-        try:
-            path, n, _ = self._build(tmp)
-        except Exception as exc:
-            self.toast.show_message(f"Échec de la fusion : {exc}", "red")
-            return
-        task = Task(print_pdf, path, self.s)
-        task.signals.done.connect(lambda how: (self._log("IMPRESSION", f"Cursus {n} pages ({how})"),
-                                               self.toast.show_message(f"Cursus envoyé à l'imprimante : {n} pages.")))
-        task.signals.failed.connect(lambda e: self.toast.show_message(f"Impression impossible : {e}", "red"))
-        QThreadPool.globalInstance().start(task)
+        def done(path, n, missing):
+            task = Task(print_pdf, path, self.s)
+            task.signals.done.connect(lambda how: (self._log("IMPRESSION", f"Cursus {n} pages ({how})"),
+                                                   self.toast.show_message(f"Cursus envoyé à l'imprimante : {n} pages."
+                                                                           + (f" Écartés : {', '.join(missing)}"
+                                                                              if missing else "")),
+                                                   _unlink(path)))
+            task.signals.failed.connect(lambda e: (self.toast.show_message(f"Impression impossible : {e}", "red"),
+                                                   _unlink(path)))
+            QThreadPool.globalInstance().start(task)
+        self._run(pdf_tools.temp_pdf("cursus_"), done)
+
+
+def _unlink(path) -> None:
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass

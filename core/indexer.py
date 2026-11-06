@@ -41,7 +41,7 @@ from typing import Callable, Iterable
 from .config import Settings, load_settings
 from .database import Database
 from .extractors import (MIN_TEXT_CHARS, ExtractionError, PageText, WordConverter, configure_tesseract,
-                         detect_type, docx_pages_text, ocr_pdf_pages, pdf_pages_text)
+                         detect_type, docx_pages_text, kill_orphan_words, ocr_pdf_pages, pdf_pages_text)
 from .parsing import parse_pages
 from .preview import cache_name_for, intermediate_docx, render_preview
 
@@ -59,6 +59,7 @@ class Counters:
     ignores: int = 0
     exclus: int = 0
     echecs: int = 0
+    illisibles: list = field(default_factory=list)
     formats: dict = field(default_factory=dict)
 
 
@@ -84,6 +85,12 @@ class Exclusions:
                 if not p.is_absolute():
                     p = root / p
                 self.folders.append(_fold_path(str(p)))
+                try:   # lecteur réseau mappé (Z:\) résolu en \\SRV\partage, comme la racine
+                    resolved = _fold_path(str(p.resolve()))
+                    if resolved not in self.folders:
+                        self.folders.append(resolved)
+                except OSError:
+                    pass
             else:
                 self.patterns.append(_fold(rule))
 
@@ -140,7 +147,9 @@ def scan_sources(root: Path, exclusions: Exclusions | None = None,
         current = stack.pop()
         try:
             it = os.scandir(current)
-        except OSError:
+        except OSError as exc:
+            if counters is not None:     # dossier illisible (réseau, droits, chemin trop long) : signalé
+                counters.illisibles.append(f"{current} ({exc.__class__.__name__})")
             continue
         with it:
             for entry in it:
@@ -272,6 +281,9 @@ class FileProcessor:
                                               f"(ex. {ex['matricule']} : pages {ex['numero_page']}–{ex['page_fin']}).", None))
             if not releves:
                 res.anomalies.append(("AVERTISSEMENT", "Aucun relevé détecté dans ce fichier.", "Revoir le fichier"))
+            if res.cache_pdf:   # pages lues sur le PDF rendu lui-même : exactes
+                for r in releves:
+                    r["page_verifiee"] = 1
             res.releves = releves
         except ExtractionError as exc:
             self._fail(res, str(exc))
@@ -307,7 +319,8 @@ def _worker_init(settings: Settings, parallel: bool) -> None:
     if parent is not None:
         def watchdog():
             parent.join()
-            _worker_close()
+            if _PROCESSOR is not None and _PROCESSOR._converter is not None:
+                _PROCESSOR._converter.kill()   # pas d'appel COM depuis ce fil : arrêt par PID
             os._exit(0)
         threading.Thread(target=watchdog, daemon=True).start()
 
@@ -320,6 +333,11 @@ def _worker_close() -> None:
 def _worker_process(src: SourceFile) -> FileResult:
     assert _PROCESSOR is not None
     return _PROCESSOR.process(src)
+
+
+def _path_key(path: str) -> str:
+    """Identité d'un chemin (insensible à la casse sous Windows)."""
+    return os.path.normcase(os.path.normpath(path))
 
 
 def default_workers() -> int:
@@ -356,8 +374,16 @@ class Indexer:
         return len(res.releves)
 
     def _store(self, res: FileResult) -> None:
-        self.db.store_result(res.chemin, res.type_fichier, res.taille, res.mtime, res.nb_pages, res.cache_pdf,
-                             res.statut, res.message, res.releves, res.anomalies)
+        import sqlite3
+        for attempt in range(5):     # base occupée par le guichet : on patiente plutôt que d'arrêter l'indexation
+            try:
+                self.db.store_result(res.chemin, res.type_fichier, res.taille, res.mtime, res.nb_pages,
+                                     res.cache_pdf, res.statut, res.message, res.releves, res.anomalies)
+                break
+            except sqlite3.OperationalError:
+                if attempt == 4:
+                    raise
+                time.sleep(1 + attempt)
         c = self.counters
         if res.statut == "OK":
             c.extraits += 1
@@ -380,10 +406,15 @@ class Indexer:
 
         purged = self._purge_excluded(root, exclusions)
         todo: list[SourceFile] = []
+        if self.counters.illisibles:
+            msg = (f"{len(self.counters.illisibles)} dossier(s) illisible(s), ignoré(s) cette fois : "
+                   + "; ".join(self.counters.illisibles[:5]))
+            self.emit({"type": "warning", "message": msg})
+            self.db.add_anomaly("AVERTISSEMENT", str(root), msg, "Vérifier l'accès réseau")
         if only_new:
-            known = self.db.file_signatures()
+            known = {_path_key(k): v for k, v in self.db.file_signatures().items()}
             for f in files:
-                state = known.get(f.path)
+                state = known.get(_path_key(f.path))
                 if state is not None and state[0] == f.taille and abs((state[1] or 0) - f.mtime) < 1:
                     self.counters.ignores += 1   # inchangé depuis la dernière passe (même en erreur)
                 else:
@@ -415,7 +446,8 @@ class Indexer:
 
         self.db.set_meta("derniere_indexation", time.strftime("%d/%m/%Y %H:%M"))
         self.db.set_meta("source_root", str(root))
-        summary = self.counters.__dict__ | {"duree_s": round(time.time() - started, 1), "stopped": self.stopped,
+        summary = {k: v for k, v in self.counters.__dict__.items() if k != "illisibles"} | {
+            "illisibles": len(self.counters.illisibles), "duree_s": round(time.time() - started, 1), "stopped": self.stopped,
                                             "workers": n_workers}
         self.emit({"type": "done", **summary})
         return self.counters
@@ -436,7 +468,14 @@ class Indexer:
                         # File d'attente courte : un arrêt demandé prend effet en quelques secondes.
                         while pending and len(in_flight) < n_workers * 2 and not self.stopped:
                             f = pending.popleft()
-                            in_flight[pool.submit(_worker_process, f)] = f
+                            try:
+                                in_flight[pool.submit(_worker_process, f)] = f
+                            except BrokenProcessPool:
+                                pending.appendleft(f)
+                                raise
+                        if self.stopped:   # arrêt : on abandonne ce qui n'a pas commencé
+                            for fut in [f for f in in_flight if f.cancel()]:
+                                in_flight.pop(fut)
                         if not in_flight:
                             break
                         finished, _ = wait(in_flight, timeout=0.5, return_when=FIRST_COMPLETED)
@@ -472,6 +511,10 @@ class Indexer:
                     self._progress(done, f.path, started)
             finally:
                 proc.close()
+        finally_kill = kill_orphan_words()
+        if finally_kill:
+            self.emit({"type": "warning", "message": f"{finally_kill} instance(s) de Word restée(s) ouverte(s) "
+                                                     "ont été fermées."})
         return done
 
     def _purge_excluded(self, root: Path, exclusions: Exclusions) -> int:
@@ -500,7 +543,7 @@ class Indexer:
         self.emit({"type": "progress", "done": done, "total": total, "file": path,
                    "elapsed_s": round(elapsed, 1), "eta_s": round(eta, 1) if eta is not None else None,
                    "rate": round(rate, 2) if rate else None,
-                   "counters": {k: v for k, v in self.counters.__dict__.items() if k != "formats"}})
+                   "counters": {k: v for k, v in self.counters.__dict__.items() if k not in ("formats", "illisibles")}})
 
 
 def check_integrity(db: Database) -> list[str]:
@@ -541,7 +584,8 @@ def _listen_for_stop(indexer: Indexer) -> None:
                 if line.strip().lower() == "stop":
                     indexer.stop()
                     return
-        except (OSError, ValueError, AttributeError):
+            indexer.stop()      # fin de l'entrée standard : l'interface a été fermée ou a planté
+        except (OSError, ValueError, AttributeError, TypeError):
             return
     threading.Thread(target=reader, daemon=True).start()
 

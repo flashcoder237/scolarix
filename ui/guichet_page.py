@@ -10,13 +10,14 @@ from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, QThreadPool, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
+from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
                                QLabel, QPushButton, QScrollArea, QSplitter, QStackedWidget, QTableView, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from core import pdf_tools
 from core.config import Settings
 from core.database import Database, Releve, missing_periods
+from core.guard import PrintBlocked, check_before_print
 from core.printer_service import print_pdf
 
 from .cursus_dialog import CursusDialog
@@ -275,7 +276,8 @@ class GuichetPage(QWidget):
         self.count.setText(f"{len(self.results)} relevé{'s' if len(self.results) > 1 else ''} · "
                            f"{n_st} étudiant{'s' if n_st > 1 else ''}" if self.omni.text().strip() else "Prêt")
         self.model.set_results(self.results, self.omni.text())
-        self._fill_tree()
+        if self.stack.currentIndex() == 1:   # vue groupée affichée seulement : pas de requêtes inutiles
+            self._fill_tree()
         if self.results:
             self.table.selectRow(0)
             self.table.setCurrentIndex(self.model.index(0, 0))
@@ -293,6 +295,8 @@ class GuichetPage(QWidget):
 
     def set_view(self, mode) -> None:
         self.stack.setCurrentIndex(0 if mode == "releve" else 1)
+        if mode != "releve":
+            self._fill_tree()
 
     def _fill_tree(self) -> None:
         self.tree.blockSignals(True)
@@ -300,11 +304,12 @@ class GuichetPage(QWidget):
         groups: dict[str, list[Releve]] = {}
         for r in self.results:
             groups.setdefault(r.matricule, []).append(r)
+        dossiers = self.db.dossiers(groups) if groups else {}
         bold = QFont()
         bold.setWeight(QFont.Weight.DemiBold)
         for mat, rels in groups.items():
             rels = sorted(rels, key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or ""))
-            dossier = self.db.cursus(mat)          # tout le dossier, pas seulement les relevés trouvés
+            dossier = dossiers.get(mat) or rels      # tout le dossier, pas seulement les relevés trouvés
             missing = missing_periods(dossier)
             n_ok = sum(1 for r in dossier if r.is_success)
             latest = max(dossier or rels, key=lambda r: (r.annee_academique or "", r.niveau_num, r.semestre or 0))
@@ -381,28 +386,29 @@ class GuichetPage(QWidget):
         return self.preview.rel
 
     def _ready(self, rel: Releve) -> Releve | None:
-        """Relevé prêt à imprimer : aperçu Word produit au besoin (normalement déjà fait à l'affichage)."""
+        """Relevé prêt à imprimer, après le contrôle de dernière ligne (core/guard.py). L'aperçu Word n'est
+        JAMAIS produit ici (fil de l'interface) : s'il manque, on lance sa préparation en arrière-plan."""
+        if self.preview.render_state == "en cours":
+            self.preview.toast.show_message("Aperçu Word en préparation : réessayez dès qu'il s'affiche.", "amber")
+            return None
         if self.previews is not None and self.previews.needs_render(rel):
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                rel = self.previews.ensure(rel)
-                self.preview.rel = rel
-            except Exception as exc:
-                self.preview.toast.show_message(f"Aperçu Word impossible : {exc}", "red")
-                return None
-            finally:
-                QApplication.restoreOverrideCursor()
-        return rel if self._source_ok(rel) else None
+            if self.preview.render_state == "échec":
+                self.preview.toast.show_message("Aperçu Word indisponible pour ce relevé : impression impossible.", "red")
+            else:
+                self.preview._render_async(rel)
+                self.preview.toast.show_message("Préparation de l'aperçu Word… relancez l'impression quand il "
+                                                "s'affiche.", "amber")
+            return None
+        try:
+            check_before_print(rel)
+        except PrintBlocked as exc:
+            self.preview.toast.show_message(str(exc), "red", 9000)
+            self.db.log("IMPRESSION BLOQUÉE", self.s.operateur, self.s.poste, rel.id, rel.matricule, str(exc)[:300])
+            return None
+        return rel
 
     def _trace(self, rel: Releve) -> str:
         return " · en-tête corrigé" if rel.is_word and self.preview.rules_active else ""
-
-    def _source_ok(self, rel: Releve) -> bool:
-        if not rel.preview_pdf or not Path(rel.preview_pdf).exists():
-            self.preview.toast.show_message("Aperçu PDF indisponible pour ce relevé : impression impossible "
-                                            "(fichier source introuvable ou Word non converti).", "red")
-            return False
-        return True
 
     def print_current(self) -> None:
         rel = self.current and self._ready(self.current)

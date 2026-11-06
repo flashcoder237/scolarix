@@ -10,6 +10,7 @@ Règle de non-destruction : ce module n'écrit JAMAIS dans le dossier des archiv
 """
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import threading
@@ -120,7 +121,8 @@ RELEVE_COLUMNS = (
     "r.date_naissance, r.filiere, r.filiere_code, r.niveau, r.niveau_num, r.annee_academique, r.session, "
     "r.statut, r.moyenne, r.numero_page, r.page_fin, r.ocr_confiance, r.extrait, "
     "r.semestre, r.decision, r.credits, r.grade, r.mgp, r.lieu_naissance, r.semestre_fin, r.cycle, r.option_filiere, "
-    "f.chemin, f.type_fichier, f.cache_pdf, f.statut AS fichier_statut"
+    "r.page_verifiee, f.chemin, f.type_fichier, f.cache_pdf, f.statut AS fichier_statut, "
+    "f.taille AS fichier_taille, f.mtime AS fichier_mtime"
 )
 
 
@@ -160,6 +162,9 @@ class Releve:
     type_fichier: str
     cache_pdf: str | None
     fichier_statut: str | None
+    page_verifiee: int = 0      # Word : page confirmée sur le PDF rendu (matricule retrouvé)
+    fichier_taille: int | None = None   # signature du fichier source au moment de l'indexation
+    fichier_mtime: float | None = None
     score: int = 100            # 100 = correspondance exacte ; < 100 = résultat approché
     flags: list[str] = field(default_factory=list)
 
@@ -269,6 +274,39 @@ def missing_periods(rels: list) -> list[str]:
     return [f"Niveau {n}" for n in range(1, max(nums) + 1) if n not in nums]
 
 
+CASE_INSENSITIVE_FS = os.name == "nt"
+
+
+class StaleIndexError(RuntimeError):
+    pass
+
+
+_DIR_CACHE: dict[str, tuple[float, set[str] | None]] = {}
+_DIR_TTL = 60.0
+
+
+def _exists_cached(path: str) -> bool:
+    """Existence d'un fichier, à partir d'UN listage par dossier gardé 60 s : au guichet, chaque frappe
+    ne déclenche plus des centaines d'accès au partage réseau."""
+    import time
+    folder, name = os.path.split(path)
+    now = time.monotonic()
+    hit = _DIR_CACHE.get(folder)
+    if hit is None or now - hit[0] > _DIR_TTL:
+        try:
+            names = {n.casefold() if CASE_INSENSITIVE_FS else n for n in os.listdir(folder)}
+        except OSError:
+            names = None
+        hit = (now, names)
+        _DIR_CACHE[folder] = hit
+        if len(_DIR_CACHE) > 2000:
+            _DIR_CACHE.clear()
+    names = hit[1]
+    if names is None:
+        return False
+    return (name.casefold() if CASE_INSENSITIVE_FS else name) in names
+
+
 def resolve_cache(value: str | None, cache_dir: Path | None) -> str | None:
     """Le cache d'aperçu est enregistré par son seul nom de fichier, résolu dans le dossier de cache
     du poste : la base peut ainsi être copiée sur un autre poste du guichet avec son dossier de données.
@@ -308,7 +346,8 @@ class Database:
             cols = {r[1] for r in self.conn.execute("PRAGMA table_info(etudiants_releves)")}
             for col, decl in (("semestre", "INTEGER"), ("decision", "VARCHAR(80)"), ("credits", "INTEGER"),
                               ("grade", "VARCHAR(4)"), ("mgp", "VARCHAR(6)"), ("lieu_naissance", "VARCHAR(80)"),
-                              ("semestre_fin", "INTEGER"), ("cycle", "VARCHAR(20)"), ("option_filiere", "VARCHAR(60)")):
+                              ("semestre_fin", "INTEGER"), ("cycle", "VARCHAR(20)"), ("option_filiere", "VARCHAR(60)"),
+                              ("page_verifiee", "INTEGER DEFAULT 0")):
                 if col not in cols:  # base créée par une version précédente
                     self.conn.execute(f"ALTER TABLE etudiants_releves ADD COLUMN {col} {decl}")
             row = self.conn.execute("SELECT valeur FROM meta WHERE cle='fts_mode'").fetchone()
@@ -339,9 +378,12 @@ class Database:
     def file_state(self, chemin: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
 
-    def file_signatures(self) -> dict[str, tuple[int, float]]:
-        """{chemin: (taille, mtime)} de tous les fichiers indexés (une seule requête pour le différentiel)."""
-        return {r[0]: (r[1], r[2]) for r in self.conn.execute("SELECT chemin, taille, mtime FROM fichiers")}
+    def file_signatures(self, with_status: bool = False) -> dict:
+        """{chemin: (taille, mtime[, statut])} de tous les fichiers indexés (une seule requête pour le différentiel)."""
+        rows = self.conn.execute("SELECT chemin, taille, mtime, statut FROM fichiers")
+        if with_status:
+            return {r[0]: (r[1], r[2], r[3]) for r in rows}
+        return {r[0]: (r[1], r[2]) for r in rows}
 
     def store_result(self, chemin: str, type_fichier: str, taille: int, mtime: float, nb_pages: int,
                      cache_pdf: str | None, statut: str, message: str | None, releves: Iterable[dict],
@@ -349,7 +391,8 @@ class Database:
         """Enregistre un fichier, ses relevés et (si fournies) ses anomalies dans une seule transaction."""
         with self._lock:
             cur = self.conn.cursor()
-            cur.execute("BEGIN")
+            # IMMEDIATE : le verrou d'écriture est pris d'emblée (busy_timeout respecté si le guichet écrit au même moment)
+            cur.execute("BEGIN IMMEDIATE")
             try:
                 fid = self._save_file_tx(cur, chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut,
                                          message, releves)
@@ -367,15 +410,23 @@ class Database:
     def releves_of_file(self, fichier_id: int) -> list[Releve]:
         return self._select("r.fichier_id = ?", [fichier_id], order="r.numero_page, r.id")
 
-    def attach_preview(self, fichier_id: int, cache_name: str, pages: dict[int, tuple[int, int]]) -> None:
-        """Enregistre le PDF d'aperçu produit à la demande et les numéros de page exacts qu'il donne."""
+    def attach_preview(self, fichier_id: int, cache_name: str, pages: dict[int, tuple[int, int]],
+                       signature: tuple[int, float] | None = None) -> None:
+        """Enregistre le PDF d'aperçu produit à la demande et les numéros de page exacts qu'il donne.
+        Seuls les relevés retrouvés sur le rendu sont marqués « page vérifiée » ; les autres restent bloqués."""
         with self._lock:
             cur = self.conn.cursor()
-            cur.execute("BEGIN")
+            cur.execute("BEGIN IMMEDIATE")
             try:
+                if signature is not None:
+                    row = cur.execute("SELECT taille, mtime FROM fichiers WHERE id=?", (fichier_id,)).fetchone()
+                    if row is None or row["taille"] != signature[0] or abs((row["mtime"] or 0) - signature[1]) >= 1:
+                        raise StaleIndexError("Fichier réindexé pendant la préparation de l'aperçu : réessayer.")
                 cur.execute("UPDATE fichiers SET cache_pdf=? WHERE id=?", (cache_name, fichier_id))
+                cur.execute("UPDATE etudiants_releves SET page_verifiee=0 WHERE fichier_id=?", (fichier_id,))
                 for rid, (debut, fin) in pages.items():
-                    cur.execute("UPDATE etudiants_releves SET numero_page=?, page_fin=? WHERE id=?", (debut, fin, rid))
+                    cur.execute("UPDATE etudiants_releves SET numero_page=?, page_fin=?, page_verifiee=1 "
+                                "WHERE id=? AND fichier_id=?", (debut, fin, rid, fichier_id))
                 cur.execute("COMMIT")
             except Exception:
                 cur.execute("ROLLBACK")
@@ -392,7 +443,19 @@ class Database:
 
     def _save_file_tx(self, cur, chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message,
               releves) -> int:
-        old = cur.execute("SELECT id FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
+        old = cur.execute("SELECT id, chemin FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
+        if old is None and CASE_INSENSITIVE_FS:
+            # Windows : même fichier saisi avec une autre casse (\\srv\archives vs \\SRV\Archives) -> même ligne
+            old = cur.execute("SELECT id, chemin FROM fichiers WHERE lower(chemin)=lower(?)", (chemin,)).fetchone()
+            if old:
+                cur.execute("UPDATE fichiers SET chemin=? WHERE id=?", (chemin, old["id"]))
+        if old and statut != "OK":
+            # Échec de lecture (réseau coupé, Word planté, fichier verrouillé…) : on GARDE les relevés déjà
+            # indexés et on efface la date pour que le prochain différentiel réessaie. Le contrôle avant
+            # impression bloque ces relevés si le fichier a réellement changé.
+            cur.execute("UPDATE fichiers SET statut=?, message=?, mtime=NULL, "
+                        "date_indexation=datetime('now','localtime') WHERE id=?", (statut, message, old["id"]))
+            return old["id"]
         if old:
             cur.execute("DELETE FROM etudiants_releves WHERE fichier_id=?", (old["id"],))
             cur.execute(
@@ -413,15 +476,16 @@ class Database:
                 "INSERT INTO etudiants_releves(fichier_id, matricule, matricule_brut, nom, prenom, nom_complet, "
                 "nom_norm, date_naissance, filiere, filiere_code, niveau, niveau_num, annee_academique, session, "
                 "statut, moyenne, numero_page, page_fin, ocr_confiance, extrait, semestre, decision, credits, grade, mgp, "
-                "lieu_naissance, semestre_fin, cycle, option_filiere) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "lieu_naissance, semestre_fin, cycle, option_filiere, page_verifiee) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (fid, r["matricule"], r.get("matricule_brut"), r.get("nom"), r.get("prenom"),
                  r["nom_complet"], norm_text(r["nom_complet"]), r.get("date_naissance"), r.get("filiere"),
                  r.get("filiere_code"), r.get("niveau"), r.get("niveau_num", 0), r.get("annee_academique"),
                  r.get("session"), r.get("statut"), r.get("moyenne"), r["numero_page"], r["page_fin"],
                  r.get("ocr_confiance"), r.get("extrait"), r.get("semestre"), r.get("decision"),
                  r.get("credits"), r.get("grade"), r.get("mgp"), r.get("lieu_naissance"),
-                 r.get("semestre_fin", r.get("semestre")), r.get("cycle"), r.get("option_filiere")),
+                 r.get("semestre_fin", r.get("semestre")), r.get("cycle"), r.get("option_filiere"),
+                 1 if r.get("page_verifiee") else 0),
             )
         return fid
 
@@ -506,7 +570,8 @@ class Database:
         return self.conn.execute("SELECT COUNT(*) FROM etudiants_releves").fetchone()[0]
 
     def _get_token_index(self) -> dict[str, set[str]]:
-        n = self.count_releves()
+        n = self.conn.execute("SELECT COUNT(*), IFNULL(MAX(id), 0) FROM etudiants_releves").fetchone()
+        n = (n[0], n[1])   # nombre ET dernier id : une réindexation à nombre constant invalide aussi l'index
         if self._token_index is None or n != self._token_index_count:
             index: dict[str, set[str]] = {}
             for (name,) in self.conn.execute("SELECT DISTINCT nom_norm FROM etudiants_releves"):
@@ -650,7 +715,7 @@ class Database:
                 r.flags.append(f"{n_same} RELEVÉS S{r.semestre}" if r.semestre else "DOUBLON NIVEAU")
             if r.type_fichier == "PDF_SCAN":
                 r.flags.append("SCAN OCR")
-            if r.fichier_statut == "ERREUR" or not Path(r.chemin).exists():
+            if r.fichier_statut == "ERREUR" or not _exists_cached(r.chemin):
                 r.flags.append("FICHIER INTROUVABLE")
 
     def level_siblings(self, rel: Releve) -> list[Releve]:
@@ -666,6 +731,16 @@ class Database:
                                  1 if (r.session or "").lower().startswith("rattrap") else 0))
         self._flag(rels)
         return rels
+
+    def dossiers(self, matricules: Iterable[str]) -> dict[str, list[Releve]]:
+        """Tous les relevés de plusieurs étudiants en une seule requête (vue groupée du guichet)."""
+        mats = sorted({norm_matricule(m) for m in matricules})
+        out: dict[str, list[Releve]] = {m: [] for m in mats}
+        for k in range(0, len(mats), 500):
+            chunk = mats[k:k + 500]
+            for r in self._select(f"r.matricule IN ({','.join('?' * len(chunk))})", chunk):
+                out.setdefault(r.matricule, []).append(r)
+        return out
 
     def correlated_matricules(self, matricule: str) -> list[dict]:
         """Autres matricules portés par la même personne (même nom complet, et même date de naissance si connue)."""

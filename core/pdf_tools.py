@@ -20,23 +20,46 @@ from .normalize import norm_text
 TEMP_DIR = Path(tempfile.gettempdir()) / "scolarix_tmp"
 
 
+_OWN_TEMP: set[Path] = set()
+
+
 def temp_pdf(prefix: str = "releve_") -> Path:
     """Fichier temporaire dans un dossier dédié, vidé au démarrage et à la fermeture (données personnelles)."""
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     fd = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".pdf", delete=False, dir=TEMP_DIR)
     fd.close()
+    _OWN_TEMP.add(Path(fd.name))
     return Path(fd.name)
 
 
-def purge_temp() -> int:
+def purge_temp(max_age: float | None = None) -> int:
+    """Supprime les PDF temporaires de CETTE session (max_age=None), ou ceux de plus de ``max_age`` secondes
+    laissés par une session précédente — jamais les fichiers en cours d'impression d'une autre instance.
+    Nettoie aussi les copies de travail des aperçus Word restées dans le dossier temporaire du système."""
+    import shutil
+    import time
     n = 0
-    if TEMP_DIR.exists():
-        for f in TEMP_DIR.glob("*.pdf"):
+    now = time.time()
+    if max_age is None:
+        targets = list(_OWN_TEMP)
+    else:
+        targets = list(TEMP_DIR.glob("*.pdf")) if TEMP_DIR.exists() else []
+        root = Path(tempfile.gettempdir())
+        for d in list(root.glob("scolarix_prev_*")) + list(root.glob("fmsp_conv_*")):
             try:
-                f.unlink()
-                n += 1
+                if now - d.stat().st_mtime > max_age:
+                    shutil.rmtree(d, ignore_errors=True)
             except OSError:
                 pass
+    for f in targets:
+        try:
+            if max_age is not None and now - f.stat().st_mtime < max_age:
+                continue
+            f.unlink()
+            n += 1
+        except OSError:
+            pass
+        _OWN_TEMP.discard(f)
     return n
 
 
@@ -157,8 +180,9 @@ def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
         if prepare is not None:
             try:
                 r = prepare(r)
-            except Exception:
-                missing.append(f"{r.periode} {r.annee_academique or ''}".strip())
+            except Exception as exc:   # aperçu impossible ou impression bloquée par le contrôle : écarté
+                reason = str(exc).split(":")[-1].strip()[:70] if str(exc) else exc.__class__.__name__
+                missing.append(f"{r.periode} {r.annee_academique or ''} ({reason})".strip())
                 continue
         src = r.preview_pdf
         if not src or not Path(src).exists():
