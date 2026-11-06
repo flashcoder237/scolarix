@@ -276,11 +276,10 @@ def resolve_cache(value: str | None, cache_dir: Path | None) -> str | None:
     if not value:
         return None
     p = Path(value)
-    if not p.is_absolute():
-        return str((cache_dir or Path(".")) / p)
-    if not p.exists() and cache_dir is not None and (cache_dir / p.name).exists():
-        return str(cache_dir / p.name)
-    return value
+    candidate = p if p.is_absolute() else (cache_dir or Path(".")) / p
+    if not candidate.exists() and cache_dir is not None and (cache_dir / p.name).exists():
+        return str(cache_dir / p.name)   # base copiée depuis un autre poste : même nom, dossier de cache local
+    return str(candidate)
 
 
 class Database:

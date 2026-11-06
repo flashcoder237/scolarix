@@ -114,6 +114,7 @@ class PreviewPanel(QWidget):
         self.previews = None          # core.preview.PreviewService (aperçu Word produit à la demande)
         self.rules_active = False     # corrections de texte des relevés Word
         self._rendering: int | None = None
+        self.render_state = ""        # "", "en cours", "prêt", "échec" (aperçu Word à la demande)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(14)
@@ -326,11 +327,13 @@ class PreviewPanel(QWidget):
         self.viewer.show_message("Préparation de l'aperçu Word… (première consultation de ce fichier, "
                                  "quelques secondes)")
         self._rendering = rel.id
+        self.render_state = "en cours"
         task = Task(self.previews.ensure, rel)
 
         def done(new_rel):
             if self.rel is None or self.rel.id != new_rel.id:
                 return   # l'agent est passé à un autre relevé entre-temps
+            self.render_state = "prêt"
             self.rel = new_rel
             self.tiles["pages"].setText(new_rel.pages_label + (" liées" if new_rel.nb_pages > 1 else ""))
             self._rebuild_pages(new_rel.nb_pages)
@@ -341,6 +344,7 @@ class PreviewPanel(QWidget):
         def failed(err):
             if self.rel is None or self.rel.id != rel.id:
                 return
+            self.render_state = "échec"
             self.viewer.show_message(f"Aperçu indisponible : {err}")
             self.alerts.addWidget(Alert(f"Aperçu Word impossible : {err}", "red"))
             self.btn_print.setEnabled(False)

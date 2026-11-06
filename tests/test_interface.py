@@ -10,6 +10,8 @@ from PySide6.QtCore import QModelIndex, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QImage, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication, QStyleOptionViewItem  # noqa: E402
 
+from conftest import HAS_CONVERTER  # noqa: E402
+
 from core.config import DEFAULT_TEXT_RULES  # noqa: E402
 
 
@@ -67,11 +69,15 @@ def test_guichet_releve_word_apercu_a_la_demande(app, window):
     word = [i for i, r in enumerate(g.model.rows) if r.is_word]
     if not word:
         pytest.skip("pas de relevé Word dans les résultats")
+    needs = window.previews.needs_render(g.model.rows[word[0]])
     g.on_row(word[0])
-    if not window.previews.needs_render(g.model.rows[word[0]]) or g.preview.rel.preview_pdf:
+    if not needs:
         return
-    ok = wait_for(app, lambda: g.preview.rel.preview_pdf is not None or g.preview.alerts.count() > 3, 60)
-    assert ok
+    assert wait_for(app, lambda: g.preview.render_state in ("prêt", "échec"), 90)
+    if HAS_CONVERTER:
+        assert g.preview.render_state == "prêt" and g.preview.rel.preview_pdf and g.preview.btn_print.isEnabled()
+    else:   # poste sans Word ni LibreOffice : message clair, impression bloquée
+        assert g.preview.render_state == "échec" and not g.preview.btn_print.isEnabled()
 
 
 def test_guichet_vue_groupee_et_zero_resultat(app, window):
