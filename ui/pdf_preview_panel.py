@@ -329,13 +329,16 @@ class PreviewPanel(QWidget):
         """Première consultation d'un relevé Word : le PDF d'aperçu est produit en arrière-plan."""
         self.btn_print.setEnabled(False)
         self.btn_export.setEnabled(False)
-        self.viewer.show_message("Préparation de l'aperçu Word… (première consultation de ce fichier, "
-                                 "quelques secondes)")
+        from . import effects
+        self._dots = effects.Dots(self.viewer.show_message, "Préparation de l'aperçu Word (première consultation "
+                                  "de ce fichier, quelques secondes)", self)
+        self._dots.start()
         self._rendering = rel.id
         self.render_state = "en cours"
         task = Task(self.previews.ensure, rel)
 
         def done(new_rel):
+            self._dots.stop()
             if self.rel is None or self.rel.id != new_rel.id:
                 return   # l'agent est passé à un autre relevé entre-temps
             self.render_state = "prêt"
@@ -347,6 +350,7 @@ class PreviewPanel(QWidget):
             self.releve_updated.emit(new_rel)
 
         def failed(err):
+            self._dots.stop()
             if self.rel is None or self.rel.id != rel.id:
                 return
             self.render_state = "échec"

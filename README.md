@@ -67,6 +67,17 @@ build_windows.bat
 
 Le script lance les tests, produit `dist\Scolarix\Scolarix.exe`, puis l'installateur `Output\Scolarix_Setup_x.y.z.exe` si [Inno Setup 6](https://jrsoftware.org/isinfo.php) est installé. Tesseract est nécessaire **uniquement sur le poste qui indexe** ; Word ou LibreOffice sur le poste qui indexe des `.doc` **et** sur les postes qui affichent ou impriment des relevés Word (l'aperçu PDF est produit à la première consultation, puis gardé en cache).
 
+## Finitions de l'interface
+
+- **Polices embarquées** (licence SIL OFL, dans `assets/fonts`) : Inter pour le texte, Inter Display pour les
+  titres, JetBrains Mono pour les matricules et les références — même rendu sur tous les postes.
+- **Curseurs** : main sur tout ce qui se clique (boutons, onglets, listes, lignes de résultats).
+- **Sons discrets** (`assets/sounds`, générés par `tools/make_sounds.py`) : succès, attention, erreur,
+  ajout à une demande, impression.
+- **Petites animations** : apparition des messages, fondu entre les écrans, compteurs qui défilent,
+  points animés pendant la préparation d'un aperçu Word.
+- Sons et animations se coupent dans Réglages › Poste (« Confort »).
+
 ## Demandes : plusieurs relevés pour une même personne
 
 Une personne qui se présente = une **demande** (écran *Demandes*, ou barre « Demande en cours » du guichet).

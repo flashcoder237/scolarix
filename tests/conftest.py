@@ -14,6 +14,7 @@ for p in (ROOT, ROOT / "tools", ROOT / "tests"):
         sys.path.insert(0, str(p))
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("SCOLARIX_SOUND", "0")
 
 HAS_TESSERACT = bool(shutil.which("tesseract")) or Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe").exists()
 HAS_CONVERTER = bool(shutil.which("soffice") or shutil.which("libreoffice")

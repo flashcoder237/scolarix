@@ -420,6 +420,12 @@ class SettingsDialog(QDialog):
         self.duplex = QCheckBox("Recto-verso automatique pour les relevés sur 2 pages")
         self.duplex.setChecked(settings.duplex)
         form.addRow("", self.duplex)
+        self.sounds = QCheckBox("Sons discrets (succès, attention, erreur, impression)")
+        self.sounds.setChecked(settings.ui_sounds)
+        self.anims = QCheckBox("Petites animations (messages, changement d'écran, compteurs)")
+        self.anims.setChecked(settings.ui_animations)
+        form.addRow("Confort", self.sounds)
+        form.addRow("", self.anims)
         form.addRow("Commande d'impression",
                     self._line("print_command", r'"C:\Outils\SumatraPDF.exe" -print-to-default -silent "{file}"'))
         form.addRow("Tesseract (OCR)", self._line("tesseract_cmd", r"C:\Program Files\Tesseract-OCR\tesseract.exe", "file"))
@@ -560,6 +566,8 @@ class SettingsDialog(QDialog):
             setattr(self.s, key, e.text().strip())
         self.s.printer_name = self.printer.currentData() or ""
         self.s.duplex = self.duplex.isChecked()
+        self.s.ui_sounds = self.sounds.isChecked()
+        self.s.ui_animations = self.anims.isChecked()
         self.s.index_workers = self.workers.value()
         self.s.exports_retention_days = self.retention.value()
         self.s.delivery_ref_stamp = self.ref_stamp.isChecked()

@@ -227,3 +227,31 @@ def test_demandes_au_guichet(app, window, tmp_path, monkeypatch):
     page.activate_selected()
     assert window.stack.currentIndex() == 0
     dlg.deleteLater()
+
+
+def test_finitions_polices_sons_animations(app, window):
+    from PySide6.QtWidgets import QLabel
+
+    from ui import effects
+    from ui.app import resource_path
+    fams = effects.load_fonts(resource_path("assets"))
+    assert {"Inter", "JetBrains Mono"} <= fams and effects.has_font("Inter Display")
+    from ui.widgets import mono_font, title
+    assert mono_font().families()[0] == "JetBrains Mono"
+    assert title("Grand titre", 22).font().family() == "Inter Display"
+    lab = QLabel("0")
+    effects.count_to(lab, 42)
+    assert wait_for(app, lambda: lab.text() == "42", 5)
+    window.s.ui_animations = False
+    effects.configure(window.s)
+    effects.count_to(lab, 7)
+    assert lab.text() == "7"                                   # sans animation : immédiat
+    window.s.ui_animations = True
+    effects.configure(window.s)
+    effects.play("green")                                      # sons coupés pendant les tests : sans effet
+    window.guichet.preview.toast.show_message("Essai", "green", sound="impression")
+    assert window.guichet.preview.toast.isVisible()
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QPushButton
+    btn = window.findChild(QPushButton)
+    assert btn.cursor().shape() == Qt.CursorShape.PointingHandCursor or not btn.isVisible()

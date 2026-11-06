@@ -10,8 +10,8 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[("ui/theme_fmsp.qss", "ui"), ("assets/scolarix.ico", "assets"), ("assets/scolarix_256.png", "assets"),
-           ("assets/scolarix.svg", "assets")],
-    hiddenimports=["pypdfium2", "olefile", "lxml", "lxml.etree", "win32com.client", "pythoncom", "pywintypes"],
+           ("assets/scolarix.svg", "assets"), ("assets/fonts", "assets/fonts"), ("assets/sounds", "assets/sounds")],
+    hiddenimports=["PySide6.QtMultimedia", "pypdfium2", "olefile", "lxml", "lxml.etree", "win32com.client", "pythoncom", "pywintypes"],
     excludes=["tkinter", "matplotlib", "IPython", "pytest"],
     noarchive=False,
 )

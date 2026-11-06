@@ -50,7 +50,7 @@ def flag_tone(flag: str) -> str:
 
 def mono_font(size: float = 10.5, bold: bool = True) -> QFont:
     f = QFont()
-    f.setFamilies(["Consolas", "Cascadia Mono", "JetBrains Mono", "DejaVu Sans Mono", "monospace"])
+    f.setFamilies(["JetBrains Mono", "Cascadia Mono", "Consolas", "DejaVu Sans Mono", "monospace"])
     f.setPointSizeF(size)
     f.setBold(bold)
     return f
@@ -90,6 +90,10 @@ def title(text: str, size: float = 13, obj: str = "h2") -> QLabel:
     lab = QLabel(text)
     lab.setObjectName(obj)
     f = lab.font()
+    if size >= 14:   # grands titres : Inter Display (dessin optimisé pour les grandes tailles)
+        from . import effects
+        if effects.has_font(effects.TITLE_FAMILY):
+            f.setFamily(effects.TITLE_FAMILY)
     f.setPointSizeF(size)
     f.setWeight(QFont.Weight.DemiBold)
     lab.setFont(f)
@@ -341,8 +345,12 @@ class Toast(QFrame):
         self._timer.timeout.connect(self.hide)
         self.hide()
 
-    def show_message(self, text: str, tone: str = "green", ms: int = 8000, action=None) -> None:
-        """``action`` = (libellé, fonction) : bouton dans le message (ex. « Ouvrir le dossier »)."""
+    def show_message(self, text: str, tone: str = "green", ms: int = 8000, action=None,
+                     sound: str | None = None) -> None:
+        """``action`` = (libellé, fonction) : bouton dans le message (ex. « Ouvrir le dossier »).
+        ``sound`` : son à jouer (par défaut celui du ton ; « blue » = information, silencieuse)."""
+        from . import effects
+        was_visible = self.isVisible()
         self._action = action[1] if action else None
         self.action_btn.setText(action[0] if action else "")
         self.action_btn.setVisible(bool(action))
@@ -353,6 +361,10 @@ class Toast(QFrame):
         self.ico.setStyleSheet("QLabel{background:#FFFFFF;border-radius:14px;}")
         self.lab.setText(text)
         self.show()
+        if not was_visible:
+            effects.slide_in(self)
+        if tone != "blue" or sound:
+            effects.play(sound or tone)
         self._timer.start(ms)
 
 
@@ -384,7 +396,11 @@ class StatCard(QFrame):
         lay.addLayout(col, 1)
 
     def set(self, value: str, ratio: float | None = None) -> None:
-        self.value.setText(value)
+        if value.isdigit():
+            from . import effects
+            effects.count_to(self.value, int(value))   # compteur qui défile
+        else:
+            self.value.setText(value)
         if self.bar is not None:
             self.bar.setVisible(ratio is not None)
             if ratio is not None:

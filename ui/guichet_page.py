@@ -155,6 +155,7 @@ class GuichetPage(QWidget):
 
         self.model = ResultsModel(self)
         self.table = QTableView()
+        self.table.setObjectName("results")
         self.table.setModel(self.model)
         self.table.setItemDelegate(RowDelegate(self.table))
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -384,8 +385,11 @@ class GuichetPage(QWidget):
     def add_to_demande(self) -> None:
         msg = self.demande_bar.add_current()
         if msg:
-            self.preview.toast.show_message(msg, "amber" if msg.startswith(("Attention", "Ce relevé est déjà",
-                                                                              "Sélectionnez")) else "green")
+            warn = msg.startswith(("Attention", "Ce relevé est déjà", "Sélectionnez"))
+            self.preview.toast.show_message(msg, "amber" if warn else "green", sound=None if warn else "ajout")
+            if not warn:
+                from . import effects
+                effects.pulse(self.demande_bar.label)
 
     def _mark_demande(self) -> None:
         """Les relevés déjà dans la demande en cours sont signalés dans la liste des résultats."""
@@ -460,7 +464,7 @@ class GuichetPage(QWidget):
                         + (" · recto-verso" if rel.nb_pages > 1 else "") + self._trace(rel))
             self.preview.toast.show_message(
                 f"Envoyé à l'imprimante — {rel.pages_label}" + (" · timbre Duplicata apposé" if dup else "")
-                + f" · réf. {ref}")
+                + f" · réf. {ref}", sound="impression")
             self.refresh_stats()
             _cleanup(tmp)
 

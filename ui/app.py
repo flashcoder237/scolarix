@@ -23,7 +23,7 @@ def resource_path(*parts: str) -> Path:
 
 def _font() -> QFont:
     families = set(QFontDatabase.families())
-    for fam in ("Segoe UI Variable Text", "Segoe UI", "Inter", "Noto Sans", "DejaVu Sans"):
+    for fam in ("Inter", "Segoe UI Variable Text", "Segoe UI", "Noto Sans", "DejaVu Sans"):
         if fam in families:
             f = QFont(fam)
             break
@@ -39,6 +39,8 @@ def run_gui(argv: list[str]) -> int:
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("FMSP - Université de Douala")
+    from . import effects
+    effects.load_fonts(resource_path("assets"))    # Inter, Inter Display, JetBrains Mono embarquées
     app.setFont(_font())
     ico = resource_path("assets", "scolarix.ico")
     if not ico.exists():
@@ -52,6 +54,9 @@ def run_gui(argv: list[str]) -> int:
     if qss.exists():
         app.setStyleSheet(qss.read_text(encoding="utf-8"))
     settings = load_settings()
+    effects.configure(settings)
+    effects.init_sounds(resource_path("assets"))
+    effects.install_cursors(app)
     db = Database(settings.resolved_db_path(), cache_dir=settings.resolved_cache_dir())
     previews = PreviewService(db, settings)
     app.aboutToQuit.connect(previews.close)

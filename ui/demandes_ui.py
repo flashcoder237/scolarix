@@ -458,7 +458,7 @@ class DemandeDialog(QDialog):
             self.refresh()
             self.toast.show_message(f"Envoyé à l'imprimante : {prep.pages} page(s)"
                                     + (" + bordereau" if self.with_bordereau.isChecked() else "")
-                                    + ". Remettez les documents puis « Marquer remise ».")
+                                    + ". Remettez les documents puis « Marquer remise ».", sound="impression")
         d = self.db.demande(self.did)
         folder = demandes.demande_folder(self.s, d) if d["dossier"] else None
         if d["statut"] in ("PRÊTE", "IMPRIMÉE") and folder and (folder / demandes.A_IMPRIMER).exists():

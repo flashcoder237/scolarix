@@ -126,6 +126,8 @@ class MainWindow(QMainWindow):
         self.focus_search()
 
     def _page_changed(self, idx: int) -> None:
+        from . import effects
+        effects.fade_in(self.stack.widget(idx), 160)
         if self.stack.widget(idx) is self.demandes:
             self.demandes.refresh()
         elif self.stack.widget(idx) is self.guichet:
@@ -155,6 +157,8 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> None:
         if SettingsDialog(self.s, self).exec():
+            from . import effects
+            effects.configure(self.s)
             self.guichet.refresh_header()
             self.guichet.preview.rules_active = self.s.text_rules_enabled and any(
                 r.get("actif", True) for r in self.s.text_rules)

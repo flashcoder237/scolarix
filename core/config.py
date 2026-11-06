@@ -70,6 +70,8 @@ class Settings:
     docx_convert_at_index: bool = False    # préconvertir les .docx pendant l'indexation (aperçu immédiat, très lent)
     differential: bool = True
     index_workers: int = 0
+    ui_sounds: bool = True                 # sons discrets (succès, attention, erreur, impression)
+    ui_animations: bool = True             # petites animations (messages, écrans, compteurs)
     exports_root: str = ""                 # vide = Documents\Exports Scolarix ; sinon dossier (partagé) du service
     exports_retention_days: int = 30       # relevés, cursus, vérifications : supprimés après N jours (0 = jamais)
     delivery_ref_stamp: bool = False       # imprimer le numéro de délivrance en bas de chaque page délivrée                 # processus parallèles ; 0 = automatique (cœurs - 1, au plus 4)
