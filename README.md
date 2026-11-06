@@ -43,6 +43,15 @@ Démarrer, bureau en option) et un désinstallateur (Paramètres › Application
 configuration) restent dans `%APPDATA%\FMSP_Archives` et ne sont pas effacées à la désinstallation.
 Une version portable (zip) est aussi produite.
 
+### Signature (certificat interne FMSP)
+
+`Scolarix.exe`, l'installateur et le désinstallateur sont signés par la compilation GitHub avec le certificat
+« FMSP - Cellule Informatique (Scolarix) », dont la clé privée est gardée dans les secrets du dépôt
+(`SIGN_PFX_BASE64`, `SIGN_PFX_PASSWORD`). Le certificat public est livré avec le logiciel
+(menu Démarrer › Scolarix › *Certificat de signature*) : l'installer une fois par poste
+(`installer_certificat.cmd`, en administrateur) ou pour tout le parc par stratégie de groupe
+(voir `installer/certificat/LISEZMOI_SIGNATURE.txt`) supprime l'avertissement SmartScreen.
+
 ### Poste de développement (Windows 10/11)
 
 1. **Python 3.11 ou plus récent** — https://www.python.org (cocher « Add to PATH »).

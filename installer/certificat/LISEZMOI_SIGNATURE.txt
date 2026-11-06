@@ -1,0 +1,28 @@
+SIGNATURE DE SCOLARIX — certificat interne de la Cellule Informatique FMSP
+==========================================================================
+
+Scolarix.exe et l'installateur sont signés avec le certificat « FMSP - Cellule Informatique (Scolarix) »
+(empreinte SHA-1 : A6:76:B6:8E:AC:A3:EC:91:B1:E2:8D:8E:E8:78:58:06:25:A7:B7:5A, valable jusqu'au 06/11/2031).
+Ce certificat est interne à la faculté : Windows ne le connaît pas tant qu'il n'est pas installé sur le poste.
+Une fois installé, plus aucun avertissement « Windows a protégé votre ordinateur ».
+Le certificat ne sert QU'À signer du code (pas de sites web, pas de messagerie).
+
+1) UN POSTE
+   Clic droit sur installer_certificat.cmd > Exécuter en tant qu'administrateur.
+   (équivalent : certutil -addstore -f Root FMSP_Cellule_Informatique.cer
+                 certutil -addstore -f TrustedPublisher FMSP_Cellule_Informatique.cer)
+
+2) TOUT LE PARC (domaine Active Directory, stratégie de groupe)
+   Console « Gestion des stratégies de groupe » > créer ou modifier une GPO liée aux postes du guichet :
+   Configuration ordinateur > Stratégies > Paramètres Windows > Paramètres de sécurité >
+   Stratégies de clé publique >
+     a) « Autorités de certification racines de confiance » > Importer > FMSP_Cellule_Informatique.cer
+     b) « Éditeurs approuvés » > Importer > FMSP_Cellule_Informatique.cer
+   Les postes appliquent la stratégie au prochain redémarrage (ou : gpupdate /force).
+
+3) VÉRIFIER
+   Clic droit sur Scolarix_Setup_x.y.z.exe > Propriétés > Signatures numériques :
+   « FMSP - Cellule Informatique (Scolarix) » doit apparaître, et « Cette signature numérique est valide ».
+
+En dehors de la faculté (poste sans le certificat), Windows affichera toujours un avertissement :
+pour une diffusion publique, il faudrait un certificat acheté auprès d'une autorité reconnue.

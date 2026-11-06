@@ -12,6 +12,11 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Certificat interne de la Cellule Informatique (Settings > Secrets and variables > Actions).
+      # Absents : la compilation continue, sans signature.
+      SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+      SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +35,23 @@ jobs:
 
       - name: Exécutable (PyInstaller)
         run: pyinstaller --noconfirm fmsp_archives.spec
+
+      - name: Signature de l'exécutable (certificat interne FMSP)
+        if: env.SIGN_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+                       Where-Object FullName -match "x64" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          "SIGNTOOL=$signtool" | Out-File -Append $env:GITHUB_ENV
+          "SIGN_PFX=$pfx" | Out-File -Append $env:GITHUB_ENV
+          & $signtool sign /f $pfx /p $env:SIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+              /d "Scolarix" dist\Scolarix\Scolarix.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $sig = Get-AuthenticodeSignature dist\Scolarix\Scolarix.exe
+          Write-Host "Signataire : $($sig.SignerCertificate.Subject)"
+          if ($sig.SignerCertificate.Subject -notmatch "FMSP") { exit 1 }
 
       - name: Vérification rapide de l'exécutable (robot parallèle + exclusions)
         shell: pwsh
@@ -55,8 +77,15 @@ jobs:
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
-          & $iscc /DAppVersion=1.2.0 installer\scolarix.iss
+          if ($env:SIGN_PFX) {
+            $cmd = "`"$env:SIGNTOOL`" sign /f `"$env:SIGN_PFX`" /p $env:SIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d `$qScolarix`$q `$f"
+            & $iscc /DAppVersion=1.2.0 /DSIGN "/Ssigntool=$cmd" installer\scolarix.iss
+          } else {
+            Write-Host "Secrets de signature absents : installateur NON signé."
+            & $iscc /DAppVersion=1.2.0 installer\scolarix.iss
+          }
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem Output\*.exe | ForEach-Object { $s = Get-AuthenticodeSignature $_; Write-Host "$($_.Name) : $($s.Status) $($s.SignerCertificate.Subject)" }
           Get-ChildItem Output
 
       - name: Archive zip (version portable)

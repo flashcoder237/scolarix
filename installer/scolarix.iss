@@ -12,6 +12,11 @@
 #define AppExe "Scolarix.exe"
 
 [Setup]
+#ifdef SIGN
+; Signature de l'installateur ET du désinstallateur (outil « signtool » défini sur la ligne de commande /S)
+SignTool=signtool
+SignedUninstaller=yes
+#endif
 AppId={{6F1C2B7E-5A2D-4E8B-9C41-3B7D8E2F9A10}
 AppName={#AppName}
 AppVersion={#AppVersion}
@@ -47,10 +52,12 @@ Name: "desktopicon"; Description: "Créer un raccourci sur le bureau"; GroupDesc
 [Files]
 Source: "..\dist\Scolarix\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; DestName: "LISEZMOI.md"; Flags: ignoreversion
+Source: "certificat\*"; DestDir: "{app}\certificat"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Archives des relevés de notes"
 Name: "{group}\Lisez-moi"; Filename: "{app}\LISEZMOI.md"
+Name: "{group}\Certificat de signature (administrateurs)"; Filename: "{app}\certificat"
 Name: "{group}\Désinstaller {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
