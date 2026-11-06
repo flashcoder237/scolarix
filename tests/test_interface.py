@@ -210,7 +210,7 @@ def test_demandes_au_guichet(app, window, tmp_path, monkeypatch):
     g.on_row(0)
     g.add_to_demande()
     assert window.db.demande(did)["n"] == 3                  # pas de doublon
-    assert sum("DANS LA DEMANDE" in r.flags for r in g.model.rows) == 3
+    assert sum("✓ DEMANDE" in r.flags for r in g.model.rows) == 3
     dlg = dui.DemandeDialog(window.db, window.s, did, window, previews=window.previews)
     dlg.print_all()                                          # prépare d'abord, puis imprime
     assert wait_for(app, lambda: window.db.demande(did)["statut"] == "IMPRIMÉE", 120)

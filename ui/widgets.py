@@ -43,7 +43,7 @@ def flag_tone(flag: str) -> str:
         return "gray"
     if flag in ("FICHIER INTROUVABLE", "MATRICULE ILLISIBLE"):
         return "red"
-    if flag == "DANS LA DEMANDE":
+    if flag == "✓ DEMANDE":
         return "green"
     return "amber"
 

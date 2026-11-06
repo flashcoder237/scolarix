@@ -284,8 +284,8 @@ class GuichetPage(QWidget):
                            f"{n_st} étudiant{'s' if n_st > 1 else ''}" if self.omni.text().strip() else "Prêt")
         ids = self.demande_bar.releve_ids()
         for r in self.results:
-            if r.id in ids and "DANS LA DEMANDE" not in r.flags:
-                r.flags.append("DANS LA DEMANDE")
+            if r.id in ids and "✓ DEMANDE" not in r.flags:
+                r.flags.insert(0, "✓ DEMANDE")
         self.model.set_results(self.results, self.omni.text())
         if self.stack.currentIndex() == 1:   # vue groupée affichée seulement : pas de requêtes inutiles
             self._fill_tree()
@@ -391,12 +391,12 @@ class GuichetPage(QWidget):
         """Les relevés déjà dans la demande en cours sont signalés dans la liste des résultats."""
         ids = self.demande_bar.releve_ids()
         for r in getattr(self.model, "rows", []):
-            had = "DANS LA DEMANDE" in r.flags
+            had = "✓ DEMANDE" in r.flags
             if (r.id in ids) != had:
                 if had:
-                    r.flags.remove("DANS LA DEMANDE")
+                    r.flags.remove("✓ DEMANDE")
                 else:
-                    r.flags.append("DANS LA DEMANDE")
+                    r.flags.insert(0, "✓ DEMANDE")   # court et en premier : visible à côté des alertes
         if hasattr(self.model, "layoutChanged"):
             self.model.layoutChanged.emit()
 
