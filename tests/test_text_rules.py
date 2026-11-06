@@ -137,3 +137,57 @@ def test_regles_par_defaut_dans_la_configuration():
     assert s.text_rules_enabled and len(s.text_rules) == 3
     s.text_rules[0]["actif"] = False                     # copie : ne modifie pas les valeurs par défaut
     assert DEFAULT_TEXT_RULES[0]["actif"] is True
+
+
+def _rpr_order_ok(path) -> bool:
+    """Les propriétés de chaque run respectent l'ordre du schéma OOXML (sinon Word refuse le fichier)."""
+    from lxml import etree
+
+    from core.text_rules import _RPR_ORDER, W
+    with zipfile.ZipFile(path) as z:
+        for name in z.namelist():
+            if not name.startswith("word/") or not name.endswith(".xml"):
+                continue
+            root = etree.fromstring(z.read(name))
+            for rpr in root.iter(W + "rPr"):
+                ranks = [_RPR_ORDER.index(c.tag.replace(W, "")) for c in rpr if c.tag.replace(W, "") in _RPR_ORDER]
+                if ranks != sorted(ranks):
+                    return False
+    return True
+
+
+def test_police_taille_gras_italique_du_texte_ajoute(tmp_path):
+    src = make_releve_docx(tmp_path / "r.docx")
+    rules = compile_rules([{"actif": True, "regex": False, "chercher": "RELEVE DE NOTES",
+                            "remplacer": "Ref N° RELEVE DE NOTES", "police": "Times New Roman", "taille": 10,
+                            "gras": True, "italique": True}])
+    out = tmp_path / "o.docx"
+    assert rewrite_docx(src, out, rules) == 1
+    runs = Document(str(out)).sections[0].header.paragraphs[2].runs
+    ref = next(r for r in runs if r.text.startswith("Ref N°"))
+    assert (ref.font.name, ref.font.size, ref.font.bold, ref.font.italic) == ("Times New Roman", Pt(10), True, True)
+    titre = next(r for r in runs if r.text == "RELEVE DE NOTES")
+    assert titre.font.size == Pt(16) and titre.font.name != "Times New Roman"   # texte conservé intact
+    assert _rpr_order_ok(out)
+
+
+def test_style_sur_tout_le_resultat_meme_texte(tmp_path):
+    """Changer seulement la police / la taille d'un texte existant (remplacement identique)."""
+    src = make_releve_docx(tmp_path / "r.docx")
+    rules = compile_rules([{"actif": True, "regex": False, "chercher": "RELEVE DE NOTES /TRANSCRIPT",
+                            "remplacer": "RELEVE DE NOTES /TRANSCRIPT", "police": "Arial", "taille": 14,
+                            "gras": False, "style_sur": "tout"}])
+    out = tmp_path / "o.docx"
+    assert rewrite_docx(src, out, rules) == 1
+    runs = Document(str(out)).sections[0].header.paragraphs[2].runs
+    titre = next(r for r in runs if "TRANSCRIPT" in r.text)
+    assert titre.text.strip() == "RELEVE DE NOTES /TRANSCRIPT"
+    assert (titre.font.name, titre.font.size, titre.font.bold) == ("Arial", Pt(14), False)
+    assert _rpr_order_ok(out)
+
+
+def test_regles_par_defaut_respectent_le_schema(tmp_path):
+    src = make_releve_docx(tmp_path / "r.docx")
+    out = tmp_path / "o.docx"
+    rewrite_docx(src, out, DEFAULTS)
+    assert _rpr_order_ok(out)

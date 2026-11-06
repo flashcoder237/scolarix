@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+                               QFormLayout,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QPushButton,
                                QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
@@ -107,7 +108,13 @@ class ExclusionsDialog(QDialog):
 
 
 # ------------------------------------------------------------ corrections Word
-RULE_COLS = ("Actif", "Description", "Chercher", "Remplacer par", "Expr. régulière", "Taille (pt)")
+RULE_COLS = ("Actif", "Description", "Chercher", "Remplacer par", "Regex", "Police", "Taille (pt)", "Gras",
+             "Italique", "Style appliqué à")
+C_ACT, C_DESC, C_FIND, C_REPL, C_RX, C_FONT, C_SIZE, C_BOLD, C_ITAL, C_SCOPE = range(len(RULE_COLS))
+ORIGINE = "(police d'origine)"
+COMMON_FONTS = ["Arial", "Times New Roman", "Calibri", "Cambria", "Book Antiqua", "Century Gothic", "Garamond",
+                "Georgia", "Tahoma", "Verdana", "Segoe UI", "Arial Narrow", "Bookman Old Style"]
+TRI = {None: Qt.CheckState.PartiallyChecked, True: Qt.CheckState.Checked, False: Qt.CheckState.Unchecked}
 
 
 class RulesEditor(QWidget):
@@ -124,11 +131,16 @@ class RulesEditor(QWidget):
         self.table.setHorizontalHeaderLabels(RULE_COLS)
         self.table.verticalHeader().setVisible(False)
         hh = self.table.horizontalHeader()
-        for i, mode in enumerate((QHeaderView.ResizeMode.ResizeToContents, QHeaderView.ResizeMode.Interactive,
-                                  QHeaderView.ResizeMode.Stretch, QHeaderView.ResizeMode.Stretch,
-                                  QHeaderView.ResizeMode.ResizeToContents, QHeaderView.ResizeMode.ResizeToContents)):
-            hh.setSectionResizeMode(i, mode)
-        self.table.setColumnWidth(1, 170)
+        for i in range(len(RULE_COLS)):
+            hh.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(C_FIND, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(C_REPL, QHeaderView.ResizeMode.Stretch)
+        for col, w in ((C_ACT, 46), (C_DESC, 150), (C_RX, 52), (C_FONT, 150), (C_SIZE, 76), (C_BOLD, 52),
+                       (C_ITAL, 60), (C_SCOPE, 130)):
+            self.table.setColumnWidth(col, w)
+        self.table.setToolTip("Gras / Italique : case grisée = comme le texte d'origine, cochée = oui, vide = non.\n"
+                              "Style appliqué à : « Texte ajouté » ne met en forme que ce qui change (ex. « Ref N° » "
+                              "ajouté devant le titre) ; « Tout le résultat » met en forme tout le texte de remplacement.")
         for r in settings.text_rules:
             self._append(r)
         lay.addWidget(self.table, 1)
@@ -158,39 +170,81 @@ class RulesEditor(QWidget):
                             "l'aperçu, l'original n'est jamais modifié et les PDF/scans ne sont pas concernés. En texte "
                             "simple, les espaces acceptent n'importe quel nombre d'espaces. « Taille » met le texte ajouté "
                             "dans cette taille (utile pour ne pas allonger l'en-tête). Toute modification d'une règle "
-                            "refait les aperçus à la consultation suivante.", 8.5))
+                            "refait les aperçus à la consultation suivante. Police, taille, gras et italique mettent en forme le texte "
+                            "de remplacement ; la police doit être installée sur le poste qui produit l'aperçu.", 8.5))
         self.preview()
 
     def _append(self, r: dict) -> None:
         i = self.table.rowCount()
         self.table.insertRow(i)
-        act = QTableWidgetItem()
-        act.setFlags(act.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        act.setCheckState(Qt.CheckState.Checked if r.get("actif", True) else Qt.CheckState.Unchecked)
-        self.table.setItem(i, 0, act)
-        for col, key in ((1, "description"), (2, "chercher"), (3, "remplacer")):
+
+        def check(col, state, tristate=False):
+            it = QTableWidgetItem()
+            flags = it.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            if tristate:
+                flags |= Qt.ItemFlag.ItemIsUserTristate
+            it.setFlags(flags & ~Qt.ItemFlag.ItemIsEditable)
+            it.setCheckState(state)
+            self.table.setItem(i, col, it)
+
+        check(C_ACT, TRI[bool(r.get("actif", True))])
+        for col, key in ((C_DESC, "description"), (C_FIND, "chercher"), (C_REPL, "remplacer")):
             self.table.setItem(i, col, QTableWidgetItem(str(r.get(key) or "")))
-        rx = QTableWidgetItem()
-        rx.setFlags(rx.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        rx.setCheckState(Qt.CheckState.Checked if r.get("regex") else Qt.CheckState.Unchecked)
-        self.table.setItem(i, 4, rx)
-        self.table.setItem(i, 5, QTableWidgetItem(str(r.get("taille") or "")))
+        check(C_RX, TRI[bool(r.get("regex"))])
+        font = QComboBox()
+        font.setEditable(True)
+        font.addItem(ORIGINE)
+        try:
+            from PySide6.QtGui import QFontDatabase
+            installed = set(QFontDatabase.families())
+        except Exception:
+            installed = set()
+        font.addItems(sorted(set(COMMON_FONTS) | installed))
+        font.setCurrentText(r.get("police") or ORIGINE)
+        font.setToolTip("Police du texte de remplacement (doit être installée sur le poste qui produit l'aperçu)")
+        font.currentTextChanged.connect(lambda *_: self.preview())
+        self.table.setCellWidget(i, C_FONT, font)
+        size = QDoubleSpinBox()
+        size.setRange(0, 72)
+        size.setDecimals(1)
+        size.setSingleStep(0.5)
+        size.setSpecialValueText("origine")
+        size.setValue(float(r.get("taille") or 0))
+        size.setToolTip("Taille en points du texte de remplacement (« origine » = taille du texte remplacé)")
+        self.table.setCellWidget(i, C_SIZE, size)
+        check(C_BOLD, TRI[r.get("gras") if r.get("gras") in (True, False) else None], tristate=True)
+        check(C_ITAL, TRI[r.get("italique") if r.get("italique") in (True, False) else None], tristate=True)
+        scope = QComboBox()
+        scope.addItem("Texte ajouté", "ajout")
+        scope.addItem("Tout le résultat", "tout")
+        scope.setCurrentIndex(1 if r.get("style_sur") == "tout" else 0)
+        self.table.setCellWidget(i, C_SCOPE, scope)
 
     def rules(self) -> list[dict]:
+        def tri(it):
+            st = it.checkState() if it else Qt.CheckState.PartiallyChecked
+            return None if st == Qt.CheckState.PartiallyChecked else st == Qt.CheckState.Checked
+
         out = []
         for i in range(self.table.rowCount()):
             def txt(c):
                 it = self.table.item(i, c)
                 return it.text() if it else ""
-            size = txt(5).replace(",", ".").strip()
-            rule = {"actif": self.table.item(i, 0).checkState() == Qt.CheckState.Checked,
-                    "description": txt(1), "chercher": txt(2), "remplacer": txt(3),
-                    "regex": self.table.item(i, 4).checkState() == Qt.CheckState.Checked}
-            try:
-                if size:
-                    rule["taille"] = float(size)
-            except ValueError:
-                pass
+            rule = {"actif": self.table.item(i, C_ACT).checkState() == Qt.CheckState.Checked,
+                    "description": txt(C_DESC), "chercher": txt(C_FIND), "remplacer": txt(C_REPL),
+                    "regex": self.table.item(i, C_RX).checkState() == Qt.CheckState.Checked}
+            font = self.table.cellWidget(i, C_FONT).currentText().strip()
+            if font and font != ORIGINE:
+                rule["police"] = font
+            size = self.table.cellWidget(i, C_SIZE).value()
+            if size > 0:
+                rule["taille"] = size
+            for key, col in (("gras", C_BOLD), ("italique", C_ITAL)):
+                v = tri(self.table.item(i, col))
+                if v is not None:
+                    rule[key] = v
+            if self.table.cellWidget(i, C_SCOPE).currentData() == "tout":
+                rule["style_sur"] = "tout"
             out.append(rule)
         return out
 
@@ -230,7 +284,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.s = settings
         self.setWindowTitle("Réglages du poste")
-        self.resize(860, 680)
+        self.resize(1120, 700)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 20)
         card = Card(padding=20, spacing=14, soft_shadow=False)

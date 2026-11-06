@@ -39,7 +39,14 @@ class CompiledRule:
     replacement: str
     description: str
     size: float | None = None      # taille (pt) du texte ajouté ; None = celle du texte d'origine
-    bold: bool | None = None
+    bold: bool | None = None       # None = comme le texte d'origine
+    font: str | None = None        # police (« Arial », « Times New Roman »…) ; None = celle d'origine
+    italic: bool | None = None
+    whole: bool = False            # True : le style s'applique à tout le résultat, pas seulement au texte ajouté
+
+    @property
+    def styled(self) -> bool:
+        return bool(self.size or self.font) or self.bold is not None or self.italic is not None
 
 
 class RuleError(ValueError):
@@ -70,8 +77,12 @@ def compile_rules(rules: Iterable[dict]) -> list[CompiledRule]:
             size = float(size) if size not in (None, "", 0) else None
         except (TypeError, ValueError):
             size = None
-        bold = r.get("gras")
-        out.append(CompiledRule(pat, repl, r.get("description") or search, size, bold if bold in (True, False) else None))
+        bold, italic = r.get("gras"), r.get("italique")
+        font = (r.get("police") or "").strip() or None
+        out.append(CompiledRule(pat, repl, r.get("description") or search, size,
+                                bold if bold in (True, False) else None, font,
+                                italic if italic in (True, False) else None,
+                                (r.get("style_sur") or "ajout") == "tout"))
     return out
 
 
@@ -79,7 +90,8 @@ def rules_digest(rules: Iterable[dict], enabled: bool = True) -> str:
     """Empreinte courte des règles actives : change => les aperçus déjà produits sont refaits."""
     if not enabled:
         return "brut"
-    active = [{k: r.get(k) for k in ("regex", "chercher", "remplacer", "taille", "gras")} for r in rules or [] if r.get("actif", True)
+    active = [{k: r.get(k) for k in ("regex", "chercher", "remplacer", "taille", "gras", "police", "italique",
+                                     "style_sur")} for r in rules or [] if r.get("actif", True)
               and (r.get("chercher") or "").strip()]
     if not active:
         return "brut"
@@ -118,9 +130,60 @@ def _common_affixes(a: str, b: str) -> tuple[int, int]:
     return p, q
 
 
-def _styled_insert(t_node, offset: int, text: str, size: float | None, bold: bool | None) -> bool:
-    """Insère ``text`` dans un run séparé (taille/gras imposés) au milieu du run de ``t_node``.
-    Renvoie False si le run est trop complexe pour être découpé sans risque."""
+# Ordre imposé par le schéma OOXML pour les enfants de <w:rPr> : Word refuse (« contenu illisible »)
+# un fichier dont les propriétés ne sont pas dans cet ordre.
+_RPR_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline",
+              "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w",
+              "kern", "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign",
+              "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath"]
+
+
+def _rpr_child(rpr, tag: str, create: bool = True):
+    from lxml import etree
+    el = rpr.find(W + tag)
+    if el is not None or not create:
+        return el
+    el = etree.Element(W + tag)
+    rank = _RPR_ORDER.index(tag)
+    for k, child in enumerate(rpr):
+        name = child.tag.replace(W, "")
+        if name in _RPR_ORDER and _RPR_ORDER.index(name) > rank:
+            rpr.insert(k, el)
+            return el
+    rpr.append(el)
+    return el
+
+
+def _apply_style(run, size: float | None, bold: bool | None, font: str | None = None,
+                 italic: bool | None = None) -> None:
+    from lxml import etree
+    rpr = run.find(W + "rPr")
+    if rpr is None:
+        rpr = etree.Element(W + "rPr")
+        run.insert(0, rpr)
+    if font:
+        rf = _rpr_child(rpr, "rFonts")
+        for att in ("asciiTheme", "hAnsiTheme", "cstheme", "eastAsiaTheme"):   # une police de thème l'emporterait
+            rf.attrib.pop(W + att, None)
+        for att in ("ascii", "hAnsi", "cs", "eastAsia"):
+            rf.set(W + att, font)
+    for flag, tags in ((bold, ("b", "bCs")), (italic, ("i", "iCs"))):
+        if flag is None:
+            continue
+        for tag in tags:
+            el = _rpr_child(rpr, tag)
+            if flag:
+                el.attrib.pop(W + "val", None)
+            else:
+                el.set(W + "val", "0")   # explicite : sinon le style du paragraphe (souvent gras) reprendrait le dessus
+    if size:
+        for tag in ("sz", "szCs"):
+            _rpr_child(rpr, tag).set(W + "val", str(int(round(size * 2))))
+
+
+def _styled_insert(t_node, offset: int, text: str, rule: "CompiledRule") -> bool:
+    """Insère ``text`` dans un run séparé (taille, police, gras, italique imposés) au milieu du run de
+    ``t_node``. Renvoie False si le run est trop complexe pour être découpé sans risque."""
     import copy
 
     run = t_node.getparent()
@@ -131,26 +194,7 @@ def _styled_insert(t_node, offset: int, text: str, size: float | None, bold: boo
         return False
     before, after = (t_node.text or "")[:offset], (t_node.text or "")[offset:]
     new_run = copy.deepcopy(run)
-    rpr = new_run.find(W + "rPr")
-    if rpr is None:
-        from lxml import etree
-        rpr = etree.SubElement(new_run, W + "rPr")
-        new_run.remove(rpr)
-        new_run.insert(0, rpr)
-    from lxml import etree
-    if size:
-        for tag in ("sz", "szCs"):
-            el = rpr.find(W + tag)
-            if el is None:
-                el = etree.SubElement(rpr, W + tag)
-            el.set(W + "val", str(int(round(size * 2))))
-    if bold is not None:
-        for tag in ("b", "bCs"):
-            el = rpr.find(W + tag)
-            if bold and el is None:
-                etree.SubElement(rpr, W + tag)
-            elif not bold and el is not None:
-                rpr.remove(el)
+    _apply_style(new_run, rule.size, rule.bold, rule.font, rule.italic)
     nt = new_run.find(W + "t")
     nt.text = text
     nt.set(XML_SPACE, "preserve")
@@ -229,7 +273,7 @@ def _replace_in_paragraph(paragraph, rules: list[CompiledRule]) -> int:
             repl = m.expand(rule.replacement)
             # On ne touche que la partie qui change : le texte conservé garde sa mise en forme d'origine
             # (« Ref N° » ajouté devant le titre ne transforme pas « /TRANSCRIPT » en gros caractères).
-            p, q = _common_affixes(m.group(0), repl)
+            p, q = (0, 0) if rule.whole else _common_affixes(m.group(0), repl)
             start, end = m.start() + p, m.end() - q
             middle = repl[p:len(repl) - q]
             count += 1
@@ -252,8 +296,7 @@ def _replace_in_paragraph(paragraph, rules: list[CompiledRule]) -> int:
                 for k in range(i, j + 1):
                     nodes[k].set(XML_SPACE, "preserve")
             if middle:        # 2) insérer le nouveau (dans un run à part si une taille / un gras est imposé)
-                styled = (rule.size or rule.bold is not None) and _styled_insert(nodes[i], a, middle, rule.size,
-                                                                                   rule.bold)
+                styled = rule.styled and _styled_insert(nodes[i], a, middle, rule)
                 if not styled:
                     t = nodes[i].text or ""
                     nodes[i].text = t[:a] + middle + t[a:]

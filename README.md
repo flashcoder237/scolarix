@@ -1,6 +1,6 @@
 # Scolarix — Archives des relevés de notes (FMSP)
 
-<img src="assets/scolarix.svg" width="96" align="right" alt="Logo Scolarix">
+<img src="assets/scolarix_signature.svg" width="360" alt="Scolarix — Archives des relevés de notes">
 
 Application de bureau Windows pour la Cellule Informatique de la FMSP (Université de Douala).
 Elle **indexe les relevés de notes** accumulés au fil des années (Word .doc/.docx, PDF texte, PDF scannés),
