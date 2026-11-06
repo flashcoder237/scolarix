@@ -10,7 +10,9 @@ from core.preview import PreviewService
 def test_demande_complete(indexed, tmp_path):
     db, settings = indexed[0], indexed[1]
     settings.exports_root = str(tmp_path / "Exports")
-    rels = pdf_tools.select_for_cursus(db.cursus("18M042"))[:3]
+    # relevés PDF : rendus sans Word/LibreOffice (le poste de compilation Windows n'en a pas)
+    rels = [r for r in pdf_tools.select_for_cursus(db.cursus("18M042")) if r.type_fichier.startswith("PDF")][:3]
+    assert len(rels) == 3
     did = db.create_demande(settings.poste, settings.operateur, rels[0].matricule, rels[0].nom_complet,
                             "L'étudiant lui-même", "Inscription en master")
     d = db.demande(did)

@@ -15,7 +15,7 @@ from core.config import DEFAULT_TEXT_RULES, Settings, config_path, save_settings
 from core.indexer import default_workers
 from core.text_rules import RuleError, apply_text, compile_rules
 
-from .widgets import Card, card_header, muted
+from .widgets import Card, card_header, eyebrow, muted
 
 
 # ------------------------------------------------------------------ exclusions
@@ -216,7 +216,7 @@ class RulesEditor(QWidget):
                          ("Appliquer", self.scope)):
             col = QVBoxLayout()
             col.setSpacing(2)
-            col.addWidget(muted(label, 8.5))
+            col.addWidget(eyebrow(label))
             col.addWidget(w)
             controls.addLayout(col)
         controls.addStretch(1)

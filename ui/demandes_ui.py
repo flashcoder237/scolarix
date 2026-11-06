@@ -9,8 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QThreadPool, Qt, Signal
-from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout,
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QHBoxLayout,
                                QHeaderView, QInputDialog, QLabel, QLineEdit, QPushButton, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -19,13 +19,66 @@ from core.config import Settings
 from core.database import Database
 from core.printer_service import print_pdf
 
-from .widgets import TONES, Badge, Card, IconChip, Segmented, Switch, Task, Toast, eyebrow, muted, statut_tone, title
+from .widgets import (Badge, Card, IconChip, Segmented, StatCard, Switch, Task, Toast, card_header, eyebrow,
+                      mono_font, muted, statut_tone, title)
 
 STATUT_TONE = {"EN COURS": "blue", "PRÊTE": "violet", "IMPRIMÉE": "amber", "REMISE": "green", "ANNULÉE": "gray"}
 STATUT_AIDE = {"EN COURS": "à préparer", "PRÊTE": "dossier prêt, à imprimer", "IMPRIMÉE": "à remettre",
                "REMISE": "remise au demandeur", "ANNULÉE": "annulée"}
 MOTIFS = ["Inscription / poursuite d'études", "Concours", "Emploi / stage", "Équivalence / études à l'étranger",
           "Bourse", "Dossier personnel", "Autre"]
+
+
+def style_table(table: QTableWidget, headers: tuple[str, ...]) -> None:
+    """Même apparence que les autres tableaux de l'application (en-têtes en capitales, lignes alternées)."""
+    table.setColumnCount(len(headers))
+    table.setHorizontalHeaderLabels([h.upper() for h in headers])
+    table.verticalHeader().hide()
+    table.verticalHeader().setDefaultSectionSize(44)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    table.setShowGrid(False)
+    table.setAlternatingRowColors(True)
+    table.setStyleSheet("QTableWidget{alternate-background-color:#F8FAFC;}")
+    table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+
+def badge_cell(table: QTableWidget, row: int, col: int, text: str, tone: str) -> None:
+    holder = QWidget()
+    hl = QHBoxLayout(holder)
+    hl.setContentsMargins(4, 4, 4, 4)
+    hl.addWidget(Badge(text, tone))
+    hl.addStretch(1)
+    table.setCellWidget(row, col, holder)
+
+
+class StepTracker(QWidget):
+    """Les étapes d'une demande, l'étape courante en couleur : Préparer → Imprimer → Remettre."""
+    STEPS = (("EN COURS", "1 · Préparer"), ("PRÊTE", "2 · Imprimer"), ("IMPRIMÉE", "3 · Remettre"), ("REMISE", "Terminée"))
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        self.badges = []
+        for k, (_, label) in enumerate(self.STEPS):
+            if k:
+                arrow = QLabel("→")
+                arrow.setStyleSheet("color:#94A3B8;")
+                lay.addWidget(arrow)
+            b = Badge(label, "gray")
+            self.badges.append(b)
+            lay.addWidget(b)
+        lay.addStretch(1)
+
+    def set(self, statut: str) -> None:
+        order = [st for st, _ in self.STEPS]
+        cur = order.index(statut) if statut in order else -1
+        for k, (b, (st, label)) in enumerate(zip(self.badges, self.STEPS)):
+            tone = "green" if k < cur or statut == "REMISE" else (STATUT_TONE[st] if k == cur else "gray")
+            b.set(("✓ " if (k < cur or statut == "REMISE") and k < 3 else "") + label, tone)
 
 
 def new_demande(db: Database, s: Settings, parent, rel=None) -> int | None:
@@ -40,30 +93,30 @@ def new_demande(db: Database, s: Settings, parent, rel=None) -> int | None:
 
 
 # --------------------------------------------------------------- barre du guichet
-class DemandeBar(QFrame):
+class DemandeBar(Card):
     """« Demande en cours » au-dessus des résultats : on sait toujours pour qui on travaille."""
     changed = Signal()
 
     def __init__(self, db: Database, settings: Settings, current_releve, parent=None):
-        super().__init__(parent)
+        super().__init__(padding=14, spacing=0, parent=parent)
         self.db, self.s = db, settings
         self.current_releve = current_releve          # fonction -> relevé affiché (ou None)
         self.active: int | None = None
-        self.setObjectName("demandebar")
-        self.setStyleSheet("QFrame#demandebar{background:#FFFFFF;border:1px solid #E3E7EF;border-radius:18px;}")
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(14, 10, 14, 10)
-        lay.setSpacing(10)
+        lay = QHBoxLayout()
+        lay.setSpacing(12)
+        self.lay.addLayout(lay)
         lay.addWidget(IconChip("folder", "violet", 36))
         col = QVBoxLayout()
         col.setSpacing(1)
         col.addWidget(eyebrow("Demande en cours"))
-        self.label = QLabel()
-        f = self.label.font()
-        f.setWeight(QFont.Weight.DemiBold)
-        self.label.setFont(f)
+        self.label = title("", 11)
+        self.label.setMinimumWidth(120)
+        from PySide6.QtWidgets import QSizePolicy
+        self.label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         col.addWidget(self.label)
         lay.addLayout(col, 1)
+        self.status = Badge("", "gray")
+        lay.addWidget(self.status)
         self.picker = QComboBox()
         self.picker.setMinimumWidth(220)
         self.picker.setToolTip("Changer de demande (plusieurs personnes au guichet)")
@@ -95,10 +148,14 @@ class DemandeBar(QFrame):
         self.picker.blockSignals(False)
         d = self.db.demande(self.active) if self.active else None
         if d:
-            self.label.setText(f"{d['numero']} · {d['nom'] or '—'} ({d['matricule'] or '—'}) · {d['n']} relevé(s) · "
-                               f"{STATUT_AIDE.get(d['statut'], d['statut'])}")
+            self.label.setText(f"{d['numero']} · {d['nom'] or '—'} · {d['n']} relevé(s)")
+            self.label.setToolTip(f"{d['nom'] or '—'} — matricule {d['matricule'] or '—'} — demandeur : "
+                                  f"{d['demandeur'] or '—'}")
+            self.status.set(STATUT_AIDE.get(d["statut"], d["statut"]), STATUT_TONE.get(d["statut"], "gray"))
+            self.status.show()
         else:
-            self.label.setText("Aucune — créez une demande pour réunir les relevés d'une même personne")
+            self.label.setText("Aucune — une demande réunit les relevés demandés par une même personne")
+            self.status.hide()
         self.btn_add.setEnabled(True)
         self.btn_open.setEnabled(d is not None)
         self.changed.emit()
@@ -177,9 +234,9 @@ class DemandeDialog(QDialog):
         self.badge = Badge("", "gray", big=True)
         head.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
         card.lay.addLayout(head)
+        self.steps = StepTracker()
+        card.lay.addWidget(self.steps)
 
-        form = QFormLayout()
-        form.setSpacing(8)
         self.demandeur = QLineEdit()
         self.demandeur.setObjectName("field")
         self.motif = QComboBox()
@@ -187,23 +244,30 @@ class DemandeDialog(QDialog):
         self.motif.addItems(MOTIFS)
         self.duplicata = Switch(False)
         self.duplicata.setAccessibleName("Timbre « Duplicata conforme »")
+        grid = QHBoxLayout()
+        grid.setSpacing(12)
+        for label, w, stretch in (("Demandeur", self.demandeur, 1), ("Motif", self.motif, 1)):
+            box = QVBoxLayout()
+            box.setSpacing(4)
+            box.addWidget(eyebrow(label))
+            box.addWidget(w)
+            grid.addLayout(box, stretch)
+        box = QVBoxLayout()
+        box.setSpacing(4)
+        box.addWidget(eyebrow("Duplicata conforme"))
         dup = QHBoxLayout()
         dup.addWidget(self.duplicata)
-        dup.addWidget(QLabel("Timbre « Duplicata conforme » sur tous les relevés"))
-        dup.addStretch(1)
-        form.addRow("Demandeur", self.demandeur)
-        form.addRow("Motif", self.motif)
-        form.addRow("", dup)
-        card.lay.addLayout(form)
+        dup.addWidget(muted("timbre sur tous les relevés", 9))
+        box.addLayout(dup)
+        grid.addLayout(box)
+        card.lay.addLayout(grid)
 
+        card.lay.addWidget(eyebrow("Relevés de la demande · dans l'ordre d'impression"))
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setObjectName("demande")
-        self.table.setHorizontalHeaderLabels(self.COLS)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        style_table(self.table, self.COLS)
         hh = self.table.horizontalHeader()
-        for c, w in ((0, 40), (1, 170), (2, 96), (3, 160), (4, 54), (5, 200)):
+        for c, w in ((0, 44), (1, 200), (2, 96), (3, 150), (4, 64), (5, 190)):
             hh.resizeSection(c, w)
         hh.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.table.setMinimumHeight(220)
@@ -281,6 +345,8 @@ class DemandeDialog(QDialog):
                          + (f" · dossier : {exports.short_location(self.s, Path(d['dossier']) / 'x')}"
                             if d["dossier"] else ""))
         self.badge.set(f"{d['statut']} — {STATUT_AIDE.get(d['statut'], '')}", STATUT_TONE.get(d["statut"], "gray"))
+        self.steps.set(d["statut"])
+        self.table.setRowCount(0)              # supprime aussi les pastilles de l'affichage précédent
         self.table.setRowCount(len(self.items))
         pages = 0
         for i, (item, rel) in enumerate(self.items):
@@ -289,12 +355,20 @@ class DemandeDialog(QDialog):
                     str(rel.nb_pages) if rel else "", item["etat"] or ("à préparer" if d["statut"] == "EN COURS" else ""),
                     item["reference"] or ""]
             for j, v in enumerate(vals):
-                it = QTableWidgetItem(v)
                 if j == 3 and rel:
-                    it.setForeground(QColor(TONES[statut_tone(rel.statut)][0]))
-                if j == 5 and (item["etat"] or "").startswith("BLOQUÉ"):
-                    it.setForeground(QColor(TONES["red"][0]))
-                    it.setToolTip(item["etat"])
+                    badge_cell(self.table, i, j, v, statut_tone(rel.statut))
+                    continue
+                if j == 5:
+                    etat = item["etat"] or ""
+                    self.table.setItem(i, j, QTableWidgetItem(""))
+                    badge_cell(self.table, i, j, "Bloqué" if etat.startswith("BLOQUÉ") else (v or "—"),
+                               "red" if etat.startswith("BLOQUÉ") else ("green" if etat == "PRÊT" else "gray"))
+                    if etat.startswith("BLOQUÉ"):
+                        self.table.cellWidget(i, j).setToolTip(etat)
+                    continue
+                it = QTableWidgetItem(v)
+                if j in (0, 6):
+                    it.setFont(mono_font(9.5 if j == 6 else 10.5))
                 self.table.setItem(i, j, it)
             if rel and not (item["etat"] or "").startswith("BLOQUÉ"):
                 pages += rel.nb_pages
@@ -417,6 +491,7 @@ class DemandesPage(QWidget):
 
     FILTRES = (("a_traiter", "À traiter"), ("a_remettre", "À remettre"), ("remises", "Remises"), ("toutes", "Toutes"))
     STATUTS = {"a_traiter": ("EN COURS", "PRÊTE"), "a_remettre": ("IMPRIMÉE",), "remises": ("REMISE",), "toutes": None}
+    COLS = ("N° de demande", "Reçue le", "Étudiant", "Demandeur · motif", "Relevés", "Statut", "Prochaine étape")
 
     def __init__(self, db: Database, settings: Settings, parent=None):
         super().__init__(parent)
@@ -425,18 +500,36 @@ class DemandesPage(QWidget):
         self.setObjectName("page")
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(14)
-        head = QHBoxLayout()
-        col = QVBoxLayout()
-        col.addWidget(eyebrow("Suivi des demandes"))
-        col.addWidget(title("Demandes de relevés", 22, "h1"))
-        head.addLayout(col, 1)
-        self.counts = Badge("", "violet", big=True)
-        head.addWidget(self.counts, 0, Qt.AlignmentFlag.AlignBottom)
+        root.setSpacing(16)
+        head = QVBoxLayout()
+        head.setSpacing(4)
+        head.addWidget(eyebrow("Guichet · une personne = une demande"))
+        head.addWidget(title("Demandes de relevés", 22, "h1"))
         root.addLayout(head)
-        card = Card(padding=16, spacing=12)
+
+        stats = QHBoxLayout()
+        stats.setSpacing(12)
+        self.card_prep = StatCard("folder", "blue", "À préparer", "—")
+        self.card_print = StatCard("printer", "violet", "Prêtes à imprimer", "—")
+        self.card_give = StatCard("alert", "amber", "Imprimées, à remettre", "—")
+        self.card_done = StatCard("check", "green", "Remises aujourd'hui", "—")
+        for c in (self.card_prep, self.card_print, self.card_give, self.card_done):
+            stats.addWidget(c)
+        root.addLayout(stats)
+
+        card = Card(padding=18, spacing=12)
         root.addWidget(card, 1)
+        h = QHBoxLayout()
+        h.addWidget(IconChip("folder", "violet", 42))
+        h.addWidget(card_header("File d'attente", "Suivi des demandes"), 1)
+        new_btn = QPushButton("Nouvelle demande   Ctrl+N")
+        new_btn.setObjectName("primary")
+        new_btn.clicked.connect(self.create)
+        h.addWidget(new_btn, 0, Qt.AlignmentFlag.AlignTop)
+        card.lay.addLayout(h)
         bar = QHBoxLayout()
+        bar.setSpacing(12)
+        bar.addWidget(eyebrow("Afficher"))
         self.seg = Segmented(list(self.FILTRES), "a_traiter")
         self.seg.changed.connect(lambda *_: self.refresh())
         bar.addWidget(self.seg)
@@ -446,34 +539,31 @@ class DemandesPage(QWidget):
         self.q.textChanged.connect(lambda *_: self.refresh())
         bar.addWidget(self.q, 1)
         card.lay.addLayout(bar)
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, len(self.COLS))
         self.table.setObjectName("demandes")
-        self.table.setHorizontalHeaderLabels(("N° de demande", "Reçue le", "Étudiant", "Demandeur · motif",
-                                              "Relevés", "Statut", "Prochaine étape"))
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        style_table(self.table, self.COLS)
         hh = self.table.horizontalHeader()
-        for c, w in ((0, 130), (1, 110), (2, 230), (3, 230), (4, 64), (5, 110)):
+        for c, w in ((0, 140), (1, 120), (2, 250), (3, 250), (4, 80), (5, 130)):
             hh.resizeSection(c, w)
         hh.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.table.doubleClicked.connect(lambda *_: self.open_selected())
         card.lay.addWidget(self.table, 1)
+        self.empty = muted("Aucune demande dans cette liste. Au guichet, « Ajouter ce relevé » (Ctrl+D) ouvre une "
+                           "demande pour l'étudiant affiché.", 9.5)
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card.lay.addWidget(self.empty)
         btns = QHBoxLayout()
-        for label, slot, name in (("Ouvrir", self.open_selected, "primary"),
+        for label, slot, name in (("Ouvrir la demande", self.open_selected, "primary"),
                                   ("Reprendre au guichet", self.activate_selected, "secondary"),
-                                  ("Ouvrir le dossier", self.folder_selected, "ghost"),
-                                  ("Nouvelle demande", self.create, "ghost")):
+                                  ("Ouvrir le dossier", self.folder_selected, "ghost")):
             b = QPushButton(label)
             b.setObjectName(name)
             b.clicked.connect(slot)
             btns.addWidget(b)
         btns.addStretch(1)
+        btns.addWidget(muted("Double-clic : ouvrir · le dossier préparé contient le bordereau, les relevés "
+                             "numérotés et « A_IMPRIMER_TOUT »", 8.5))
         card.lay.addLayout(btns)
-        card.lay.addWidget(muted("Une demande par personne : on y réunit tous les relevés demandés (plusieurs années, "
-                                 "plusieurs semestres). « Préparer » crée un dossier Demandes\\AAAA\\MM\\<n°>_<matricule>_<NOM> "
-                                 "avec un bordereau, les relevés numérotés et un fichier unique « A_IMPRIMER_TOUT ».", 8.5))
         self.refresh()
 
     def refresh(self) -> None:
@@ -483,19 +573,34 @@ class DemandesPage(QWidget):
             rows = [r for r in rows if q in " ".join(str(r[k] or "") for k in
                                                      ("numero", "matricule", "nom", "demandeur", "motif")).lower()]
         self._rows = rows
+        self.table.setRowCount(0)
         self.table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            vals = (r["numero"], (r["creee_le"] or "")[:16].replace("-", "/"), f"{r['nom'] or '—'} ({r['matricule'] or '—'})",
+            vals = (r["numero"], (r["creee_le"] or "")[:16].replace("-", "/"),
+                    f"{r['nom'] or '—'} ({r['matricule'] or '—'})",
                     " · ".join(x for x in (r["demandeur"], r["motif"]) if x) or "—", str(r["n"]), r["statut"],
                     STATUT_AIDE.get(r["statut"], ""))
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(v)
+                if j == 0:
+                    it.setFont(mono_font(10.5))
+                if j == 6:
+                    it.setForeground(QColor("#64748B"))
                 if j == 5:
-                    it.setForeground(QColor(TONES[STATUT_TONE.get(v, "gray")][0]))
+                    it.setForeground(QColor(0, 0, 0, 0))     # texte gardé pour le tri/les tests, la pastille l'affiche
                 self.table.setItem(i, j, it)
+                if j == 5:
+                    badge_cell(self.table, i, j, v, STATUT_TONE.get(v, "gray"))
+        self.table.setVisible(bool(rows))
+        self.empty.setVisible(not rows)
         allr = self.db.demandes(demandes.OUVERTES)
         n = {st: sum(1 for r in allr if r["statut"] == st) for st in demandes.OUVERTES}
-        self.counts.set(f"{n['EN COURS']} à préparer · {n['PRÊTE']} à imprimer · {n['IMPRIMÉE']} à remettre", "violet")
+        today = __import__("datetime").date.today().isoformat()
+        done = sum(1 for r in self.db.demandes(("REMISE",), limit=200) if (r["maj_le"] or "").startswith(today))
+        self.card_prep.set(str(n["EN COURS"]))
+        self.card_print.set(str(n["PRÊTE"]))
+        self.card_give.set(str(n["IMPRIMÉE"]))
+        self.card_done.set(str(done))
 
     def _selected(self):
         rows = {i.row() for i in self.table.selectedIndexes()}
