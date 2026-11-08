@@ -255,7 +255,7 @@ class IndexingPage(QWidget):
         conf.lay.addLayout(perf)
         self._update_excl_btn()
         self.toast = Toast()
-        conf.lay.addWidget(self.toast)
+        self.toast.float_over(self)        # toujours visible, même en bas d'une page qui défile
         row.addWidget(conf, 5)
         root.addLayout(row)
 

@@ -255,3 +255,197 @@ def test_finitions_polices_sons_animations(app, window):
     from PySide6.QtWidgets import QPushButton
     btn = window.findChild(QPushButton)
     assert btn.cursor().shape() == Qt.CursorShape.PointingHandCursor or not btn.isVisible()
+
+
+# ------------------------------------------------------------------------------------------------
+# Constats de la simulation d'usage au guichet (1366×768) — chacun verrouillé par un test.
+
+def _inside(window, w) -> bool:
+    """Le widget est entièrement visible dans la fenêtre (pas sous la ligne de flottaison)."""
+    from PySide6.QtCore import QPoint
+    top = w.mapTo(window, QPoint(0, 0))
+    return w.isVisible() and top.y() >= 0 and top.y() + w.height() <= window.height() and top.x() + w.width() <= window.width()
+
+
+def test_ecran_bas_document_et_imprimer_visibles(app, window):
+    g = window.guichet
+    app.processEvents()
+    assert g.compact and not g.stats_box.isVisible() and g.mini.isVisible()
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    app.processEvents()
+    assert _inside(window, g.preview.btn_print)               # bouton Imprimer sans défiler
+    assert _inside(window, g.preview.viewer) or g.preview.viewer.height() >= 140
+    assert g.preview.line.isVisible() and "18M042" in g.preview.line.text()
+    window.resize(1920, 1080)                                # en-tête complet, aperçu resserré
+    assert wait_for(app, lambda: not g.compact, 5)
+    app.processEvents()
+    assert g.stats_box.isVisible() and g.preview.compact and _inside(window, g.preview.btn_print)
+    assert g.preview.viewer.height() >= 250                  # le document reste lisible en 1080p
+    window.resize(2560, 1440)                                # grand écran : tuiles et grandes actions
+    assert wait_for(app, lambda: not g.preview.compact, 5)
+    assert all(t.isVisible() for t in g.preview._tile_frames)
+    window.resize(1366, 768)
+    assert wait_for(app, lambda: g.compact, 5)
+
+
+def test_message_flottant_toujours_visible(app, window):
+    g = window.guichet
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    g.export_current()
+    app.processEvents()
+    assert g.preview.toast.isVisible() and _inside(window, g.preview.toast)
+    assert "Exporté" in g.preview.toast.lab.text()
+
+
+def test_etat_apercu_word_ne_colle_pas_au_releve_suivant(app, window):
+    """↓ sur un relevé Word (aperçu en préparation) puis sur un PDF : Ctrl+P ne doit pas être refusé."""
+    g = window.guichet
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    pdf = next(i for i, r in enumerate(g.model.rows) if not r.is_word)
+    g.preview.render_state = "en cours"                      # comme si un aperçu Word tournait encore
+    g.on_row(pdf)
+    assert g.preview.render_state == ""
+    assert g._ready(g.current) is not None
+
+
+def test_impression_programmee_pendant_apercu_word(app, window, monkeypatch):
+    g = window.guichet
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    g.on_row(0)
+    rel = g.current
+    state = {"needs": True}
+    monkeypatch.setattr(window.previews, "needs_render", lambda r: state["needs"])
+    monkeypatch.setattr(g.preview, "_render_async", lambda r: setattr(g.preview, "render_state", "en cours"))
+    calls = []
+    monkeypatch.setattr(g, "print_current", lambda: calls.append("print"))
+    GuichetPage = type(g)
+    GuichetPage.print_current(g)                             # Ctrl+P trop tôt
+    assert g._pending == ("print", rel.id) and "automatiquement" in g.preview.toast.lab.text()
+    state["needs"] = False
+    g._on_releve_updated(rel)                                # l'aperçu est prêt
+    assert wait_for(app, lambda: calls == ["print"], 5) and g._pending is None
+    # changer de relevé annule l'impression programmée
+    g._pending = ("print", rel.id)
+    other = next(i for i, r in enumerate(g.model.rows) if r.id != rel.id)
+    g.on_row(other)
+    assert g._pending is None and "annulée" in g.preview.toast.lab.text()
+
+
+def test_ctrl_d_sur_un_autre_etudiant_propose_une_nouvelle_demande(app, window, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+
+    import ui.widgets as W
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("Lui-même", True)))
+    g = window.guichet
+    g.run_search("18P203")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    g.on_row(0)
+    g.add_to_demande()
+    first = g.demande_bar.active
+    assert window.db.demande(first)["matricule"] == "18P203"
+    g.run_search("19P017")                                   # une autre personne
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    g.on_row(0)
+    asked = []
+    monkeypatch.setattr(W, "ask_choice", lambda *a, **k: asked.append(a[2]) or -1)
+    g.add_to_demande()                                       # Annuler : rien n'est ajouté nulle part
+    assert asked and window.db.demande(first)["n"] == 1 and g.demande_bar.active == first
+    monkeypatch.setattr(W, "ask_choice", lambda *a, **k: 0)  # « Nouvelle demande pour … »
+    g.add_to_demande()
+    second = g.demande_bar.active
+    assert second != first and window.db.demande(second)["matricule"] == "19P017"
+    assert window.db.demande(first)["n"] == 1                # la demande de la 1re personne est intacte
+    g.demande_bar.set_active(first)
+    monkeypatch.setattr(W, "ask_choice", lambda *a, **k: 1)  # « Ajouter quand même » : choix explicite
+    g.add_to_demande()
+    assert window.db.demande(first)["n"] == 2 and "Attention" in g.preview.toast.lab.text()
+
+
+def test_meme_personne_autre_filiere():
+    from ui.demandes_ui import same_person
+    assert same_person("TCHOUA Alain", "Alain TCHOUA") and same_person("TCHOUA Alain", "TCHOUA ALAIN Junior")
+    assert not same_person("KOUAME Estelle", "TCHOUA Marie-Claire") and not same_person(None, "X")
+
+
+def test_etats_vides_guident_l_agent(app, window):
+    g = window.guichet
+    g.run_search("zzqxw")
+    assert wait_for(app, lambda: g.stack.currentWidget() is g.empty)
+    assert "zzqxw" in g.empty_title.text() and "Pistes" in g.empty_text.text()
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0) and g.stack.currentWidget() is g.table
+    g.set_filiere("P")                                       # rien en Pharmacie pour ce matricule
+    assert g.stack.currentWidget() is g.empty and g.empty_btn.isVisible() and "toutes les filières" in g.empty_btn.text()
+    g.empty_btn.click()
+    assert g.filiere is None and g.model.rowCount() > 0 and g.stack.currentWidget() is g.table
+
+
+def test_navigation_rafraichit_la_bonne_page(app, window, monkeypatch):
+    calls = []
+    monkeypatch.setattr(window.extraction, "reload_years", lambda: calls.append("extraction"))
+    monkeypatch.setattr(window.indexing, "refresh", lambda: calls.append("indexation"))
+    window.go(window.stack.indexOf(window.extraction))
+    window.go(window.stack.indexOf(window.indexing))
+    window.go(window.stack.indexOf(window.demandes))
+    assert calls == ["extraction", "indexation"]
+    created = []
+    monkeypatch.setattr(window.demandes, "create", lambda: created.append(1))
+    window._new_demande()                                    # Ctrl+N sur l'écran Demandes
+    assert created == [1]
+    window.go(0)
+
+
+def test_dialogue_demande_bouton_principal_et_annulation(app, window, monkeypatch):
+    import ui.demandes_ui as dui
+    import ui.widgets as W
+    did = window.db.create_demande("T", "test", "18M042", "TCHOUA Alain", "Lui-même")
+    rel = window.db.cursus("18M042")[0]
+    window.db.add_demande_item(did, rel.id)
+    dlg = dui.DemandeDialog(window.db, window.s, did, window)
+    assert dlg.btn_print.objectName() == "primary" and dlg.btn_prepare.objectName() == "ghost"
+    monkeypatch.setattr(W, "ask_choice", lambda *a, **k: -1)
+    dlg.cancel()                                             # un clic malheureux ne suffit plus
+    assert window.db.demande(did)["statut"] == "EN COURS"
+    monkeypatch.setattr(W, "ask_choice", lambda *a, **k: 0)
+    dlg.cancel()
+    assert window.db.demande(did)["statut"] == "ANNULÉE"
+    dlg.deleteLater()
+
+
+def test_impression_d_une_demande_journalisee_par_releve(app, window, tmp_path, monkeypatch):
+    import ui.demandes_ui as dui
+    window.s.exports_root = str(tmp_path / "Exports")
+    monkeypatch.setattr(dui, "print_pdf", lambda path, s: "test")
+    did = window.db.create_demande("T", "test", "18M042", "TCHOUA Alain", "Lui-même")
+    rels = [r for r in window.db.cursus("18M042") if not r.is_word][:2]
+    for r in rels:
+        window.db.add_demande_item(did, r.id)
+    numero = window.db.demande(did)["numero"]
+    dlg = dui.DemandeDialog(window.db, window.s, did, window, previews=window.previews)
+    dlg.print_all()
+    assert wait_for(app, lambda: window.db.demande(did)["statut"] == "IMPRIMÉE", 120)
+    lines = [j for j in window.db.journal("18M042") if j["action"] == "IMPRESSION" and numero in (j["detail"] or "")]
+    assert len(lines) == len(rels)                            # compte dans « Imprimés aujourd'hui »
+    dlg.deleteLater()
+
+
+def test_verification_retrouve_l_original_toute_seule(app, window, tmp_path, monkeypatch):
+    g = window.guichet
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    g.on_row(next(i for i, r in enumerate(g.model.rows) if not r.is_word))
+    g.export_current()
+    exported = g.last_export
+    ver = window.verification
+    import ui.verification_page as vp
+    monkeypatch.setattr(vp.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(exported), "")))
+    ver.matricule.clear()
+    ver.original = None
+    ver.load_submitted()                                     # aucun matricule saisi
+    assert wait_for(app, lambda: bool(ver.rows), 60)
+    assert ver.matricule.text() == "18M042" and ver.original.id == g.current.id
+    assert "conforme" in ver.v_title.text().lower()

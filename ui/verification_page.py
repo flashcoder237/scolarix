@@ -61,7 +61,7 @@ class VerificationPage(QWidget):
                       (self.matricule, "Matricule déclaré, ex. 18M042")):
             w.setObjectName("field")
             w.setPlaceholderText(ph)
-        self.matricule.returnPressed.connect(self.find_original)
+        self.matricule.returnPressed.connect(lambda: self.find_original())
         self.choice = QComboBox()
         self.choice.currentIndexChanged.connect(self._choose)
         for i, (lab, w) in enumerate((("Organisme demandeur", self.demandeur), ("Référence", self.reference),
@@ -75,7 +75,7 @@ class VerificationPage(QWidget):
         brow = QHBoxLayout()
         find = QPushButton(icon("search", "#1D4ED8", 16), "  Rechercher l'original")
         find.setObjectName("secondary")
-        find.clicked.connect(self.find_original)
+        find.clicked.connect(lambda: self.find_original())
         load = QPushButton(icon("upload", "#FFFFFF", 16), "  Charger le document soumis (PDF, JPG, PNG)")
         load.setObjectName("ink")
         load.clicked.connect(self.load_submitted)
@@ -162,11 +162,11 @@ class VerificationPage(QWidget):
         arow.addStretch(1)
         cmp_card.lay.addLayout(arow)
         self.toast = Toast()
-        cmp_card.lay.addWidget(self.toast)
+        self.toast.float_over(self)        # toujours visible, même en bas d'une page qui défile
         root.addWidget(cmp_card)
 
     # ----------------------------------------------------------------
-    def find_original(self) -> None:
+    def find_original(self, select: int | None = None) -> None:
         rels = self.db.cursus(self.matricule.text())
         self.choice.blockSignals(True)
         self.choice.clear()
@@ -178,7 +178,8 @@ class VerificationPage(QWidget):
                                     "ou matricule erroné.", "red")
             self.original = None
             return
-        self.choice.setCurrentIndex(len(rels) - 1)
+        idx = self.choice.findData(select) if select is not None else -1
+        self.choice.setCurrentIndex(idx if idx >= 0 else len(rels) - 1)
         self._choose()
 
     def _choose(self) -> None:
@@ -220,8 +221,38 @@ class VerificationPage(QWidget):
                                                Qt.TransformationMode.SmoothTransformation))
             self.sub_image.show()
         self.sub_badge.set("LECTURE…", "blue")
-        self._check_registry(path)
-        self.compare()
+        delivered = self._check_registry(path)
+        if self.original is None or delivered:
+            self._identify(path, delivered)     # retrouve l'original tout seul (matricule lu sur le document)
+        else:
+            self.compare()
+
+    def _identify(self, path: str, delivered=None) -> None:
+        def work():
+            return verification.identify(verification.read_submitted(path, self.s))
+
+        def found(ident):
+            rels = []
+            mat = (delivered["matricule"] if delivered else None) or ident.get("matricule")
+            if mat and not self.matricule.text().strip():
+                self.matricule.setText(mat)
+            if self.matricule.text().strip():
+                rels = self.db.cursus(self.matricule.text())
+            if not rels:
+                self.sub_badge.set("LU", "green")
+                self.toast.show_message("Matricule non reconnu sur le document soumis : saisissez le matricule "
+                                        "déclaré puis « Rechercher l'original ».", "amber", 12000)
+                return
+            target = None
+            if delivered and delivered["releve_id"]:
+                target = next((r for r in rels if r.id == delivered["releve_id"]), None)
+            target = target or verification.best_match(rels, ident)
+            self.find_original(select=target.id if target else None)
+
+        task = Task(work)
+        task.signals.done.connect(found)
+        task.signals.failed.connect(lambda e: self.toast.show_message(f"Lecture impossible : {e}", "red"))
+        QThreadPool.globalInstance().start(task)
 
     def _check_registry(self, path: str) -> None:
         """Le fichier soumis est-il, à l'octet près, un document délivré par le guichet ?"""
@@ -230,6 +261,7 @@ class VerificationPage(QWidget):
         except OSError:
             row = None
         if row:
+            self.registry_row = row
             self.toast.show_message(
                 f"Fichier identique au document délivré le {row['horodatage'][:16].replace('-', '/')} sous la "
                 f"référence {row['reference']} ({row['nature'].lower()}, matricule {row['matricule'] or '?'}, "
@@ -238,6 +270,7 @@ class VerificationPage(QWidget):
             self.toast.show_message("Ce fichier ne correspond à aucun document délivré par le guichet (il a pu être "
                                     "modifié, réimprimé puis scanné, ou délivré avant Scolarix) : comparaison du "
                                     "contenu ci-dessous.", "amber", 12000)
+        return row
 
     def compare(self) -> None:
         if not (self.original and self.submitted_path):

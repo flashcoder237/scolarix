@@ -252,6 +252,15 @@ class Releve:
         return f"{base} · S{self.semestre}" if self.semestre else base
 
     @property
+    def sem_label(self) -> str:
+        """« S7 », « S7-S8 » pour un relevé annuel, « » si le semestre est inconnu."""
+        if not self.semestre:
+            return ""
+        if self.semestre_fin and self.semestre_fin != self.semestre:
+            return f"S{self.semestre}-S{self.semestre_fin}"
+        return f"S{self.semestre}"
+
+    @property
     def decision_deduite(self) -> bool:
         """Ancien format (2012-2014) : pas de décision semestrielle imprimée, elle est déduite de la colonne JURY."""
         return bool(self.decision and re.match(r"^\d+ UE ", self.decision))

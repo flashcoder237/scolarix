@@ -114,7 +114,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+E"), self, activated=lambda: self._on_guichet(self.guichet.export_current))
         QShortcut(QKeySequence("Ctrl+Shift+E"), self, activated=lambda: self._on_guichet(self.guichet.open_cursus))
         QShortcut(QKeySequence("Ctrl+D"), self, activated=lambda: self._on_guichet(self.guichet.add_to_demande))
-        QShortcut(QKeySequence("Ctrl+N"), self, activated=lambda: self._on_guichet(self.guichet.demande_bar.create))
+        QShortcut(QKeySequence("Ctrl+N"), self, activated=self._new_demande)
         for i in range(5):
             QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self, activated=lambda idx=i: self.go(idx))
 
@@ -136,16 +136,25 @@ class MainWindow(QMainWindow):
     def go(self, idx: int) -> None:
         self.stack.setCurrentIndex(idx)
         self.nav.button(idx).setChecked(True)
-        if idx == 1:
+        page = self.stack.widget(idx)          # par la page, pas par son rang : l'ordre du menu peut changer
+        if page is self.indexing:
             self.indexing.refresh()
-        elif idx == 2:
-            self.extraction.reload_years()
-        elif idx == 0:
+        elif page is self.extraction:
+            self.extraction.reload_years()     # années, chiffres et journal du jour à jour
+        elif page is self.guichet:
             self.guichet.refresh_stats()
 
     def focus_search(self) -> None:
         self.go(0)
         self.guichet.focus_search()
+
+    def _new_demande(self) -> None:
+        """Ctrl+N : au guichet (pré-remplie avec le relevé affiché) comme sur l'écran Demandes."""
+        page = self.stack.currentWidget()
+        if page is self.guichet:
+            self.guichet.demande_bar.create()
+        elif page is self.demandes:
+            self.demandes.create()
 
     def _on_guichet(self, fn) -> None:
         if self.stack.currentIndex() == 0:

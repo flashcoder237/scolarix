@@ -51,6 +51,35 @@ def read_submitted(path: str | Path, settings: Settings) -> str:
     return pytesseract.image_to_string(img, lang=settings.ocr_lang or "fra", config="--psm 6")
 
 
+def identify(text: str) -> dict:
+    """Ce que dit le document soumis de lui-même : matricule, année académique, niveau et semestre.
+    Sert à retrouver l'original sans faire retaper le matricule à l'agent."""
+    from .normalize import find_matricules
+    from .parsing import PathHints, _header_matricule, _labeled_matricules, detect_niveau, extract_recap
+    labeled = _labeled_matricules(text)
+    mat = labeled[0][0] if labeled else ((_header_matricule(text) or (None,))[0] or
+                                         next(iter(find_matricules(text)), None))
+    years = re.search(r"\b((?:19|20)\d\d)\s*[-/]\s*((?:19|20)\d\d)\b", text)
+    annee = f"{years.group(1)}-{years.group(2)}" if years else None
+    try:
+        niveau, semestre = detect_niveau(text, PathHints(), extract_recap(text))
+    except Exception:
+        niveau, semestre = None, None
+    return {"matricule": mat, "annee": annee, "niveau": niveau, "semestre": semestre}
+
+
+def best_match(rels: list, ident: dict):
+    """L'original le plus probable parmi les relevés d'un matricule (même année, même niveau…)."""
+    if not rels:
+        return None
+
+    def score(r):
+        return ((ident.get("annee") is not None and r.annee_academique == ident["annee"]) * 4
+                + (ident.get("niveau") is not None and (r.niveau or "") == ident["niveau"]) * 2
+                + (ident.get("semestre") is not None and r.semestre == ident["semestre"]) * 1)
+    return max(rels, key=lambda r: (score(r), r.annee_academique or ""))
+
+
 def _grades(text: str) -> dict[str, tuple[str, str]]:
     """{clé normalisée: (libellé, note)} pour chaque ligne de note."""
     out: dict[str, tuple[str, str]] = {}

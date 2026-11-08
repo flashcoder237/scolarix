@@ -1,7 +1,7 @@
 """Composants réutilisables du Design System FMSP (cartes, pastilles, interrupteurs, graphiques...)."""
 from __future__ import annotations
 
-from PySide6.QtCore import (QEasingCurve, QObject, QPointF, QPropertyAnimation, QRectF, QRunnable, QSize, Qt,
+from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QPropertyAnimation, QRectF, QRunnable, QSize, Qt,
                             QTimer, Signal, Property)
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QAbstractButton, QButtonGroup, QFrame, QGraphicsDropShadowEffect, QHBoxLayout,
@@ -340,10 +340,40 @@ class Toast(QFrame):
         self.action_btn.clicked.connect(lambda: self._action and self._action())
         self.lay.addWidget(self.action_btn)
         self._action = None
+        self._host = None
+        self._anchor = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.hide)
         self.hide()
+
+    def float_over(self, host: QWidget, anchor: QWidget | None = None, margin: int = 18, max_width: int = 620) -> None:
+        """Message flottant en bas de ``host`` (aligné sur ``anchor`` s'il est donné) : toujours visible,
+        même à 1366×768 où le bas d'un panneau est hors de l'écran."""
+        self._host, self._anchor, self._margin, self._max_w = host, anchor, margin, max_width
+        self.setParent(host)
+        host.installEventFilter(self)
+        self.hide()
+
+    def _place(self) -> None:
+        host = self._host
+        if self._anchor is not None and self._anchor.isVisible():
+            top_left = self._anchor.mapTo(host, self._anchor.rect().topLeft())
+            area = (top_left.x(), self._anchor.width(), top_left.y() + self._anchor.height())
+        else:
+            area = (0, host.width(), host.height())
+        x0, width, bottom = area
+        w = min(self._max_w, max(240, width - 2 * self._margin))
+        lay = self.layout()
+        h = lay.totalHeightForWidth(w) if lay.hasHeightForWidth() else self.sizeHint().height()
+        h = max(h, 44)
+        self.setGeometry(x0 + (width - w) // 2, bottom - h - self._margin, w, h)
+        self.raise_()
+
+    def eventFilter(self, obj, event):
+        if obj is self._host and event.type() == QEvent.Type.Resize and self.isVisible():
+            self._place()
+        return False
 
     def show_message(self, text: str, tone: str = "green", ms: int = 8000, action=None,
                      sound: str | None = None) -> None:
@@ -360,9 +390,19 @@ class Toast(QFrame):
         self.ico.setPixmap(pixmap("check" if tone == "green" else "alert", fg, 15))
         self.ico.setStyleSheet("QLabel{background:#FFFFFF;border-radius:14px;}")
         self.lab.setText(text)
-        self.show()
-        if not was_visible:
-            effects.slide_in(self)
+        if self._host is not None:
+            # flottant : bordure à la place de l'ombre (un seul effet graphique possible, réservé au fondu)
+            self.setStyleSheet(f"QFrame#toast{{background:{bg};border:1px solid {fg}55;border-radius:14px;}} "
+                               f"QLabel{{color:{fg};font-weight:600;background:transparent;}}")
+            self._place()
+            self.show()
+            self._place()
+            if not was_visible:
+                effects.fade_in(self, 180)
+        else:
+            self.show()
+            if not was_visible:
+                effects.slide_in(self)
         if tone != "blue" or sound:
             effects.play(sound or tone)
         self._timer.start(ms)
@@ -639,3 +679,22 @@ def hline() -> QFrame:
 
 def brush(color: str) -> QBrush:
     return QBrush(QColor(color))
+
+
+def ask_choice(parent, title_text: str, text: str, choices: list[str], default: int = 0, details: str = "") -> int:
+    """Question à choix (boutons explicites, « Annuler » avec Échap). Renvoie l'indice choisi, -1 si annulé."""
+    from PySide6.QtWidgets import QMessageBox
+    box = QMessageBox(parent)
+    box.setWindowTitle(title_text)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText(text)
+    if details:
+        box.setInformativeText(details)
+    buttons = [box.addButton(c, QMessageBox.ButtonRole.AcceptRole if i == default else QMessageBox.ButtonRole.ActionRole)
+               for i, c in enumerate(choices)]
+    cancel = box.addButton("Annuler", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(buttons[default])
+    box.setEscapeButton(cancel)
+    box.exec()
+    clicked = box.clickedButton()
+    return buttons.index(clicked) if clicked in buttons else -1

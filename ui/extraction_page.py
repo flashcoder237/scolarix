@@ -176,7 +176,7 @@ class ExtractionPage(QWidget):
         brow.addStretch(1)
         prev.lay.addLayout(brow)
         self.toast = Toast()
-        prev.lay.addWidget(self.toast)
+        self.toast.float_over(self)        # toujours visible, même en bas d'une page qui défile
         left.addWidget(prev)
         main.addLayout(left, 58)
 

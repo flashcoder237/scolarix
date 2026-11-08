@@ -19,6 +19,7 @@ from core.config import Settings
 from core.database import Database
 from core.printer_service import print_pdf
 
+from . import widgets
 from .widgets import (Badge, Card, IconChip, Segmented, StatCard, Switch, Task, Toast, card_header, eyebrow,
                       mono_font, muted, statut_tone, title)
 
@@ -81,6 +82,13 @@ class StepTracker(QWidget):
             b.set(("✓ " if (k < cur or statut == "REMISE") and k < 3 else "") + label, tone)
 
 
+def same_person(a: str | None, b: str | None) -> bool:
+    """Même nom, à l'ordre des mots, aux accents et à la casse près (changement de filière, nom réécrit)."""
+    from core.normalize import norm_text
+    ta, tb = set(norm_text(a or "").split()), set(norm_text(b or "").split())
+    return bool(ta) and bool(tb) and (ta <= tb or tb <= ta)
+
+
 def new_demande(db: Database, s: Settings, parent, rel=None) -> int | None:
     """Ouvre une demande, pré-remplie avec l'étudiant du relevé affiché."""
     demandeur, ok = QInputDialog.getText(parent, "Nouvelle demande",
@@ -105,10 +113,12 @@ class DemandeBar(Card):
         lay = QHBoxLayout()
         lay.setSpacing(12)
         self.lay.addLayout(lay)
-        lay.addWidget(IconChip("folder", "violet", 36))
+        self.chip = IconChip("folder", "violet", 36)
+        lay.addWidget(self.chip)
         col = QVBoxLayout()
         col.setSpacing(1)
-        col.addWidget(eyebrow("Demande en cours"))
+        self.eyebrow = eyebrow("Demande en cours")
+        col.addWidget(self.eyebrow)
         self.label = title("", 11)
         self.label.setMinimumWidth(120)
         from PySide6.QtWidgets import QSizePolicy
@@ -133,6 +143,15 @@ class DemandeBar(Card):
         self.btn_new.clicked.connect(self.create)
         for b in (self.btn_add, self.btn_open, self.btn_new):
             lay.addWidget(b)
+        self.compact = False
+        self.refresh()
+
+    def set_compact(self, on: bool) -> None:
+        self.compact = on
+        self.chip.setVisible(not on)
+        self.eyebrow.setVisible(not on)
+        self.lay.setContentsMargins(*((12, 8, 12, 8) if on else (14, 14, 14, 14)))
+        self.picker.setMinimumWidth(180 if on else 220)
         self.refresh()
 
     def refresh(self) -> None:
@@ -147,14 +166,20 @@ class DemandeBar(Card):
         self.picker.setCurrentIndex(max(0, self.picker.findData(self.active)))
         self.picker.blockSignals(False)
         d = self.db.demande(self.active) if self.active else None
+        prefix = "Demande en cours : " if self.compact else ""
         if d:
-            self.label.setText(f"{d['numero']} · {d['nom'] or '—'} · {d['n']} relevé(s)")
+            # écran bas : le numéro est déjà dans la liste déroulante, la ligne dit pour qui l'on travaille
+            self.label.setText(f"Pour : {d['nom'] or d['matricule'] or '—'} · {d['n']} relevé(s)" if self.compact
+                               else f"{d['numero']} · {d['nom'] or '—'} · {d['n']} relevé(s)")
             self.label.setToolTip(f"{d['nom'] or '—'} — matricule {d['matricule'] or '—'} — demandeur : "
                                   f"{d['demandeur'] or '—'}")
             self.status.set(STATUT_AIDE.get(d["statut"], d["statut"]), STATUT_TONE.get(d["statut"], "gray"))
             self.status.show()
         else:
-            self.label.setText("Aucune — une demande réunit les relevés demandés par une même personne")
+            self.label.setText(f"{prefix}aucune" if self.compact else "Aucune — une demande réunit les relevés "
+                               "demandés par une même personne")
+            self.label.setToolTip("Une demande réunit les relevés demandés par une même personne : Ctrl+D ajoute le "
+                                  "relevé affiché (la demande est créée au premier ajout).")
             self.status.hide()
         self.btn_add.setEnabled(True)
         self.btn_open.setEnabled(d is not None)
@@ -188,11 +213,30 @@ class DemandeBar(Card):
                 return ""
             self.active = did
         d = self.db.demande(self.active)
+        msg = ""
         if d["matricule"] and d["matricule"] != rel.matricule:
-            msg = (f"Attention : ce relevé ({rel.matricule}) n'est pas celui de l'étudiant de la demande "
-                   f"({d['matricule']}). Ajouté quand même (changement de filière ?) : vérifiez.")
-        else:
-            msg = ""
+            if same_person(d["nom"], rel.nom_complet):
+                msg = (f"Attention : ce relevé ({rel.matricule}) n'a pas le matricule de la demande ({d['matricule']}), "
+                       "mais le même nom (changement de filière ?). Ajouté : vérifiez la date de naissance.")
+            else:
+                # Autre personne : le relevé n'entre PAS dans la demande d'un autre sans décision explicite
+                choice = widgets.ask_choice(
+                    self, "Autre étudiant",
+                    f"La demande en cours ({d['numero']}) est celle de {d['nom'] or d['matricule']}.\n"
+                    f"Ce relevé est celui de {rel.nom_complet} ({rel.matricule}).",
+                    [f"Nouvelle demande pour {rel.nom_complet}", f"Ajouter à la demande de {d['nom'] or d['matricule']}"],
+                    default=0, details="Une demande = une personne : ses documents lui sont remis ensemble.")
+                if choice < 0:
+                    return ""
+                if choice == 0:
+                    did = new_demande(self.db, self.s, self, rel)
+                    if not did:
+                        return ""
+                    self.active = did
+                    d = self.db.demande(did)
+                else:
+                    msg = (f"Attention : relevé de {rel.nom_complet} ajouté à la demande de "
+                           f"{d['nom'] or d['matricule']}, comme vous l'avez choisi.")
         if not d["matricule"]:
             self.db.update_demande(self.active, matricule=rel.matricule, nom=rel.nom_complet)
         added = self.db.add_demande_item(self.active, rel.id)
@@ -293,11 +337,12 @@ class DemandeDialog(QDialog):
         card.lay.addWidget(self.summary)
 
         btns = QHBoxLayout()
-        self.btn_prepare = QPushButton("Préparer le dossier")
-        self.btn_prepare.setObjectName("primary")
+        self.btn_prepare = QPushButton("Préparer sans imprimer")
+        self.btn_prepare.setObjectName("ghost")
+        self.btn_prepare.setToolTip("Préparer le dossier (bordereau + relevés numérotés) sans l'envoyer à l'imprimante")
         self.btn_prepare.clicked.connect(lambda: self.prepare())
         self.btn_print = QPushButton("Imprimer tout")
-        self.btn_print.setObjectName("secondary")
+        self.btn_print.setObjectName("primary")
         self.btn_print.clicked.connect(self.print_all)
         self.btn_done = QPushButton("Marquer remise")
         self.btn_done.setObjectName("secondary")
@@ -311,7 +356,7 @@ class DemandeDialog(QDialog):
         close = QPushButton("Fermer")
         close.setObjectName("ghost")
         close.clicked.connect(self.accept)
-        for b in (self.btn_prepare, self.btn_print, self.btn_done, self.btn_folder, self.btn_cancel):
+        for b in (self.btn_print, self.btn_done, self.btn_prepare, self.btn_folder, self.btn_cancel):
             btns.addWidget(b)
         btns.addStretch(1)
         btns.addWidget(close)
@@ -373,7 +418,7 @@ class DemandeDialog(QDialog):
             if rel and not (item["etat"] or "").startswith("BLOQUÉ"):
                 pages += rel.nb_pages
         status = d["statut"]
-        nxt = {"EN COURS": "Étape suivante : « Préparer le dossier ».",
+        nxt = {"EN COURS": "Étape suivante : « Imprimer tout » (le dossier est préparé et contrôlé au passage).",
                "PRÊTE": "Étape suivante : « Imprimer tout », puis remettre les documents.",
                "IMPRIMÉE": "Étape suivante : remettre les documents et « Marquer remise ».",
                "REMISE": "Demande terminée.", "ANNULÉE": "Demande annulée."}[status]
@@ -382,6 +427,16 @@ class DemandeDialog(QDialog):
         self.btn_prepare.setEnabled(editable and bool(self.items))
         self.btn_print.setEnabled(editable and bool(self.items))
         self.btn_done.setEnabled(status in ("PRÊTE", "IMPRIMÉE") and not self._busy)
+        # Un seul bouton bleu : celui de l'étape suivante. « Imprimer tout » prépare d'abord le dossier
+        # si besoin : l'agent n'a pas à passer par « Préparer » (gardé pour préparer sans imprimer).
+        primary = {"EN COURS": self.btn_print, "PRÊTE": self.btn_print, "IMPRIMÉE": self.btn_done}.get(status)
+        for b in (self.btn_prepare, self.btn_print, self.btn_done):
+            name = "primary" if b is primary else ("ghost" if b is self.btn_prepare else "secondary")
+            if b.objectName() != name:
+                b.setObjectName(name)
+                b.style().unpolish(b)
+                b.style().polish(b)
+        self.btn_prepare.setText("Préparer sans imprimer" if status == "EN COURS" else "Refaire le dossier")
         self.btn_folder.setEnabled(bool(d["dossier"]))
         self.btn_cancel.setEnabled(status not in ("REMISE", "ANNULÉE"))
 
@@ -453,6 +508,11 @@ class DemandeDialog(QDialog):
                 task = Task(print_pdf, f, self.s)
                 task.signals.failed.connect(lambda e: self.toast.show_message(f"Impression impossible : {e}", "red"))
                 QThreadPool.globalInstance().start(task)
+            d = self.db.demande(self.did)
+            for rel, ref, _n in prep.prets:      # chaque relevé au journal, comme une impression au guichet
+                self.db.log("DUPLICATA" if d["duplicata"] else "IMPRESSION", self.s.operateur, self.s.poste, rel.id,
+                            rel.matricule, f"Réf. {ref} · {rel.periode} · {rel.annee_academique} · {rel.pages_label}"
+                            f" · demande {d['numero']}")
             demandes.mark(self.db, self.s, self.did, "IMPRIMÉE",
                           f"{len(prep.prets)} relevé(s), {prep.pages} page(s) envoyés à l'imprimante")
             self.refresh()
@@ -476,6 +536,11 @@ class DemandeDialog(QDialog):
             self.refresh()
 
     def cancel(self) -> None:
+        d = self.db.demande(self.did)
+        if widgets.ask_choice(self, "Annuler la demande",
+                              f"Annuler la demande {d['numero']} ({d['nom'] or '—'}, {len(self.items)} relevé(s)) ?",
+                              ["Annuler la demande"], details="Elle restera visible dans « Toutes », marquée annulée.") != 0:
+            return
         demandes.mark(self.db, self.s, self.did, "ANNULÉE")
         self.refresh()
 

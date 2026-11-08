@@ -108,6 +108,7 @@ class PreviewPanel(QWidget):
     print_requested = Signal()
     export_requested = Signal()
     releve_updated = Signal(object)
+    render_failed = Signal(object)
     cursus_requested = Signal()
     open_location_requested = Signal()
 
@@ -129,14 +130,19 @@ class PreviewPanel(QWidget):
         head = QHBoxLayout()
         col = QVBoxLayout()
         col.setSpacing(2)
-        col.addWidget(eyebrow("Contrôle avant impression"))
+        self.recap_eyebrow = eyebrow("Contrôle avant impression")
+        col.addWidget(self.recap_eyebrow)
         self.name = title("Aucun relevé sélectionné", 16, "h1")
         col.addWidget(self.name)
         self.details = muted("", 9)
         col.addWidget(self.details)
         head.addLayout(col, 1)
         self.statut = Badge("", "gray", big=True)
-        head.addWidget(self.statut, 0, Qt.AlignmentFlag.AlignTop)
+        self.head_right = QVBoxLayout()
+        self.head_right.setSpacing(4)
+        self.head_right.addWidget(self.statut, 0, Qt.AlignmentFlag.AlignRight)
+        self.head_right.addStretch(1)
+        head.addLayout(self.head_right)
         self.recap.lay.addLayout(head)
         grid = QGridLayout()
         grid.setSpacing(8)
@@ -165,6 +171,14 @@ class PreviewPanel(QWidget):
             self._tile_frames.append(tile)
             grid.addWidget(tile, 0, i)
         self.recap.lay.addLayout(grid)
+        # Écran bas (1366×768) : une seule ligne remplace les 4 tuiles, pour laisser la place au document
+        self.line = QLabel()
+        self.line.setObjectName("recapLine")
+        self.line.setWordWrap(True)
+        self.line.setStyleSheet("QLabel#recapLine{background:#F6F8FB;border-radius:12px;padding:8px 12px;"
+                                "font-weight:600;color:#0F172A;}")
+        self.line.hide()
+        self.recap.lay.addWidget(self.line)
         self.alerts = QVBoxLayout()
         self.alerts.setSpacing(6)
         self.recap.lay.addLayout(self.alerts)
@@ -176,8 +190,11 @@ class PreviewPanel(QWidget):
         self.page_seg_holder = QHBoxLayout()
         bar.addLayout(self.page_seg_holder)
         bar.addStretch(1)
+        self.viewer_bar = bar
         fit = QPushButton(icon("fit", "#334155", 16), " Ajuster à la largeur")
         fit.setObjectName("ghost")
+        fit.setToolTip("Ajuster à la largeur")
+        self.fit_btn = fit
         fit.clicked.connect(lambda: self.viewer.zoom(None))
         bar.addWidget(fit)
         for name, factor, tip in (("zoom_out", 1 / 1.2, "Zoom arrière"), ("zoom_in", 1.2, "Zoom avant")):
@@ -195,12 +212,16 @@ class PreviewPanel(QWidget):
 
         # --- actions (hiérarchie : 1 primaire, 2 secondaires, 1 tertiaire)
         actions = Card(padding=14, spacing=10)
+        self.actions = actions
         self.btn_print = QPushButton(icon("printer", "#FFFFFF", 19), "  Imprimer ce relevé   Ctrl+P")
         self.btn_print.setObjectName("primary")
         self.btn_print.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_print.clicked.connect(self.print_requested)
-        actions.lay.addWidget(self.btn_print)
+        self.act_row1 = QHBoxLayout()
+        self.act_row1.addWidget(self.btn_print, 1)
+        actions.lay.addLayout(self.act_row1)
         row = QHBoxLayout()
+        self.act_row2 = row
         self.btn_export = QPushButton(icon("download", "#1D4ED8", 16), "  Exporter PDF   Ctrl+E")
         self.btn_export.setObjectName("secondary")
         self.btn_export.clicked.connect(self.export_requested)
@@ -214,22 +235,28 @@ class PreviewPanel(QWidget):
         dup.setObjectName("soft")
         dl = QHBoxLayout(dup)
         dl.setContentsMargins(10, 8, 12, 8)
-        dl.addWidget(IconChip("stamp", "amber", 36))
+        self.dup_chip = IconChip("stamp", "amber", 36)
+        dl.addWidget(self.dup_chip)
         dcol = QVBoxLayout()
         dcol.setSpacing(1)
         t = QLabel("Timbre « Duplicata conforme »")
         f = t.font()
         f.setWeight(QFont.Weight.DemiBold)
         t.setFont(f)
+        self.dup_title = t
         dcol.addWidget(t)
-        dcol.addWidget(muted("Horodaté et journalisé · l'original reste intact", 8.5))
+        self.dup_sub = muted("Horodaté et journalisé · l'original reste intact", 8.5)
+        dcol.addWidget(self.dup_sub)
         dl.addLayout(dcol, 1)
+        self.dup_layout = dl
+        self.dup_frame = dup
         self.dup_switch = Switch(False)
         self.dup_switch.setAccessibleName("Apposer le timbre Duplicata conforme")
         self.dup_switch.toggled.connect(lambda _: self._refresh_view())
         dl.addWidget(self.dup_switch)
         actions.lay.addWidget(dup)
         src = QHBoxLayout()
+        self.src_row = src
         self.source = muted("", 8.5)
         self.source.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         src.addWidget(self.source, 1)
@@ -241,7 +268,64 @@ class PreviewPanel(QWidget):
         self.toast = Toast()
         actions.lay.addWidget(self.toast)
         lay.addWidget(actions)
+        self.compact = False
         self.set_enabled(False)
+
+    # ---------------------------------------------------------------- écran bas
+    LABELS = {"print": ("  Imprimer ce relevé   Ctrl+P", "  Imprimer   Ctrl+P"),
+              "export": ("  Exporter PDF   Ctrl+E", "  Exporter"), "cursus": ("  Cursus complet   Ctrl+Maj+E", "  Cursus")}
+
+    def set_compact(self, on: bool) -> None:
+        """Écran de 768 px de haut : récapitulatif sur une ligne, actions sur une ligne, le document visible."""
+        if on == self.compact:
+            return
+        self.compact = on
+        for tile in self._tile_frames:
+            tile.setVisible(not on)
+        self.line.setVisible(on and self.rel is not None)
+        k = 1 if on else 0
+        self.btn_print.setText(self.LABELS["print"][k])
+        self.btn_export.setText(self.LABELS["export"][k])
+        self.btn_cursus.setText(self.LABELS["cursus"][k])
+        self.btn_export.setToolTip("Exporter en PDF (Ctrl+E)")
+        self.btn_cursus.setToolTip("Cursus complet (Ctrl+Maj+E)")
+        if on:   # actions sur une ligne ; le timbre (visible sur l'aperçu) passe dans la barre de l'aperçu
+            self.act_row1.addWidget(self.btn_export)
+            self.act_row1.addWidget(self.btn_cursus)
+            self.viewer_bar.insertWidget(self.viewer_bar.indexOf(self.fit_btn), self.dup_frame)
+            self.head_right.insertWidget(1, self.btn_open, 0, Qt.AlignmentFlag.AlignRight)
+        else:
+            self.act_row2.addWidget(self.btn_export)
+            self.act_row2.addWidget(self.btn_cursus)
+            self.actions.lay.insertWidget(2, self.dup_frame)
+            self.src_row.addWidget(self.btn_open)
+        self.viewer.setMinimumHeight(140 if on else 420)
+        self.layout().setSpacing(10 if on else 14)
+        self.dup_chip.setVisible(not on)
+        self.dup_sub.setVisible(not on)
+        self.dup_title.setText("Duplicata" if on else "Timbre « Duplicata conforme »")
+        self.dup_frame.setToolTip("Timbre « Duplicata conforme » horodaté et journalisé · l'original reste intact")
+        self.dup_layout.setContentsMargins(*((8, 4, 8, 4) if on else (10, 8, 12, 8)))
+        self.source.setVisible(not on)
+        self.btn_open.setText("Fichier original" if on else "Ouvrir l'emplacement du fichier original")
+        self.fit_btn.setText("" if on else " Ajuster à la largeur")
+        self.btn_open.setToolTip("Ouvrir l'emplacement du fichier original (lecture seule)")
+        self.recap_eyebrow.setVisible(not on)
+        self.btn_open.setVisible(self.rel is not None or not on)
+        self.recap.lay.setContentsMargins(*((14, 12, 14, 12) if on else (16, 16, 16, 16)))
+        self.actions.lay.setContentsMargins(*((12, 10, 12, 10) if on else (14, 14, 14, 14)))
+        self.name.setStyleSheet("font-size:13pt;" if on else "")
+
+    def _update_line(self) -> None:
+        rel = self.rel
+        if rel is None:
+            self.line.setText("")
+            self.line.hide()
+            return
+        sem = self.tiles["ses"].text()
+        self.line.setText(f"{rel.matricule}   ·   {rel.annee_academique or '?'} · {rel.niveau or '?'}"
+                          + (f" · {sem}" if sem and sem != "?" else "") + f"   ·   {self.tiles['pages'].text()}")
+        self.line.setVisible(self.compact)
 
     def resizeEvent(self, event):
         # Écran étroit (1366×768) : les 4 tuiles passent sur 2 lignes au lieu d'être coupées.
@@ -262,8 +346,9 @@ class PreviewPanel(QWidget):
     def set_enabled(self, on: bool) -> None:
         for b in (self.btn_print, self.btn_export, self.btn_cursus, self.btn_open):
             b.setEnabled(on)
+        self.btn_open.setVisible(on or not self.compact)
 
-    def clear(self) -> None:
+    def clear(self, message: str = "L'aperçu du relevé sélectionné s'affiche ici.") -> None:
         self.rel = None
         self._drop_stamped()
         self.name.setText("Aucun relevé sélectionné")
@@ -272,8 +357,9 @@ class PreviewPanel(QWidget):
         for v in self.tiles.values():
             v.setText("—")
         self._clear_alerts()
+        self._update_line()
         self.source.setText("")
-        self.viewer.show_message("Aucun résultat. Vérifiez la saisie ou activez la tolérance aux fautes.")
+        self.viewer.show_message(message)
         self._rebuild_pages(0)
         self.set_enabled(False)
 
@@ -285,6 +371,13 @@ class PreviewPanel(QWidget):
                 w.deleteLater()
 
     def set_releve(self, rel: Releve, siblings: list[Releve]) -> None:
+        # L'aperçu Word d'un relevé survolé (↓) peut encore être en préparation : son état et son message
+        # d'attente ne doivent pas rester collés au relevé affiché maintenant.
+        if getattr(self, "_dots", None) is not None:
+            self._dots.stop()
+            self._dots = None
+        self._rendering = None
+        self.render_state = ""
         self.rel = rel
         self._page = 0
         self.name.setText(f"{(rel.nom or rel.nom_complet).upper()} {rel.prenom or ''}".strip())
@@ -292,7 +385,7 @@ class PreviewPanel(QWidget):
         self.statut.show()
         self.tiles["mat"].setText(rel.matricule)
         self.tiles["niv"].setText(f"{rel.annee_academique or '?'} · {rel.niveau or '?'}")
-        sem = f"S{rel.semestre}" if rel.semestre else "?"
+        sem = (rel.sem_label + (" (annuel)" if rel.annuel else "")) if rel.semestre else "?"
         if rel.credits is not None:
             sem += f" · {rel.credits}/30 crédits"
         if (rel.session or "").lower().startswith("rattrap"):
@@ -313,6 +406,7 @@ class PreviewPanel(QWidget):
             bits.append("date de naissance non renseignée sur le relevé")
         self.details.setText(" · ".join(bits))
         self.tiles["pages"].setText(rel.pages_label + (" liées" if rel.nb_pages > 1 else ""))
+        self._update_line()
         self._clear_alerts()
         for text, tone in self._alerts(rel, siblings):
             self.alerts.addWidget(Alert(text, tone))
@@ -337,20 +431,23 @@ class PreviewPanel(QWidget):
         self.render_state = "en cours"
         task = Task(self.previews.ensure, rel)
 
+        dots = self._dots
+
         def done(new_rel):
-            self._dots.stop()
+            dots.stop()
             if self.rel is None or self.rel.id != new_rel.id:
                 return   # l'agent est passé à un autre relevé entre-temps
             self.render_state = "prêt"
             self.rel = new_rel
             self.tiles["pages"].setText(new_rel.pages_label + (" liées" if new_rel.nb_pages > 1 else ""))
+            self._update_line()
             self._rebuild_pages(new_rel.nb_pages)
             self.set_enabled(True)
             self._refresh_view()
             self.releve_updated.emit(new_rel)
 
         def failed(err):
-            self._dots.stop()
+            dots.stop()
             if self.rel is None or self.rel.id != rel.id:
                 return
             self.render_state = "échec"
@@ -358,6 +455,7 @@ class PreviewPanel(QWidget):
             self.alerts.addWidget(Alert(f"Aperçu Word impossible : {err}", "red"))
             self.btn_print.setEnabled(False)
             self.btn_export.setEnabled(False)
+            self.render_failed.emit(rel)
 
         task.signals.done.connect(done)
         task.signals.failed.connect(failed)
@@ -404,12 +502,6 @@ class PreviewPanel(QWidget):
             conf = f" (confiance {rel.ocr_confiance:.0f} %)" if rel.ocr_confiance is not None else ""
             tone = "amber" if (rel.ocr_confiance or 100) < 70 else "blue"
             out.append((f"Texte issu de l'OCR{conf} : contrôlez le matricule sur l'image avant impression.", tone))
-        if rel.matricule.startswith("ILLISIBLE"):
-            out.append(("Matricule illisible sur ce relevé : identifiez l'étudiant sur l'aperçu. L'impression est "
-                        "bloquée tant que le fichier n'est pas corrigé ou réindexé.", "red"))
-        if (rel.statut or "") == "À VÉRIFIER":
-            out.append(("Décision et crédits incohérents (ou décision ambiguë) : vérifiez la décision du jury sur "
-                        "l'aperçu avant de délivrer.", "amber"))
         if rel.matricule.startswith("ILLISIBLE"):
             out.append(("Matricule illisible sur ce relevé : identifiez l'étudiant sur l'aperçu. L'impression est "
                         "bloquée tant que le fichier n'est pas corrigé ou réindexé.", "red"))

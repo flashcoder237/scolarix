@@ -226,3 +226,27 @@ def test_roman_et_matricules_longs():
     assert [roman_or_int(x) for x in ("I", "IV", "VI", "XII", "3")] == [1, 4, 6, 12, 3]
     assert find_matricules("MATRICULE :98MP110 et 98LSB111") == ["98MP110", "98LSB111"]
     assert [filiere_code_from_matricule(m) for m in ("98MM109", "98MP110", "98EM101", "98LSB111")] == ["M", "P", "M", "B"]
+
+
+def test_verification_identifie_le_document_soumis():
+    from types import SimpleNamespace
+
+    from core import verification
+    text = ("UNIVERSITÉ DE DOUALA\nRELEVÉ DE NOTES\nAnnée académique : 2020-2021   Session : Normale\n"
+            "Noms et Prénoms : TCHOUA Alain\nMatricule : 18-M-042   Né(e) le : 12/03/1999\nNiveau : 3\n")
+    ident = verification.identify(text)
+    assert ident["matricule"] == "18M042" and ident["annee"] == "2020-2021"
+    rels = [SimpleNamespace(annee_academique=a, niveau=n, semestre=None, id=i)
+            for i, (a, n) in enumerate([("2018-2019", "Niveau 1"), ("2020-2021", "Niveau 3"), ("2022-2023", "Niveau 5")])]
+    assert verification.best_match(rels, ident).id == 1
+    assert verification.best_match([], ident) is None
+
+
+def test_libelle_semestre_annuel():
+    from core.database import Releve
+    import dataclasses
+    base = {f.name: None for f in dataclasses.fields(Releve)}
+    r = Releve(**{**base, "semestre": 7, "semestre_fin": 8})
+    assert r.sem_label == "S7-S8" and r.annuel
+    assert Releve(**{**base, "semestre": 3, "semestre_fin": 3}).sem_label == "S3"
+    assert Releve(**{**base}).sem_label == ""

@@ -69,6 +69,10 @@ class GuichetPage(QWidget):
         self.hello = title("", 22, "h1")
         col.addWidget(self.hello)
         header.addLayout(col, 1)
+        self.mini = muted("", 9)          # écran bas : les cartes d'état tiennent sur cette ligne
+        self.mini.hide()
+        header.addWidget(self.mini, 0, Qt.AlignmentFlag.AlignBottom)
+        header.addSpacing(8)
         ro = Badge("Sources en lecture seule", "green", big=True)
         header.addWidget(ro, 0, Qt.AlignmentFlag.AlignBottom)
         self.poste_btn = QPushButton()
@@ -79,7 +83,9 @@ class GuichetPage(QWidget):
         root.addLayout(header)
 
         # --------------------------------------------------- cartes d'état
-        stats = QGridLayout()
+        self.stats_box = QWidget()
+        stats = QGridLayout(self.stats_box)
+        stats.setContentsMargins(0, 0, 0, 0)
         stats.setSpacing(12)
         self.card_index = StatCard("shield", "green", "Base d'index", "—")
         self.card_indexing = StatCard("database", "blue", "Indexation", "—", progress=True)
@@ -87,7 +93,7 @@ class GuichetPage(QWidget):
         self.card_anom = StatCard("alert", "amber", "Anomalies à revoir", "—")
         for i, c in enumerate((self.card_index, self.card_indexing, self.card_prints, self.card_anom)):
             stats.addWidget(c, 0, i)
-        root.addLayout(stats)
+        root.addWidget(self.stats_box)
 
         # --------------------------------------------------- demande en cours (une personne = une demande)
         self.demande_bar = DemandeBar(db, settings, lambda: self.current)
@@ -97,6 +103,7 @@ class GuichetPage(QWidget):
 
         # --------------------------------------------------- Zone A : Omnibox + filtres
         search = Card(padding=16, spacing=12)
+        self.search_card = search
         row = QHBoxLayout()
         row.setSpacing(16)
         self.omni = Omnibox()
@@ -169,7 +176,7 @@ class GuichetPage(QWidget):
         hh = self.table.horizontalHeader()
         hh.setHighlightSections(False)
         hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        for i, w in enumerate((92, 0, 138, 108, 112, 56)):
+        for i, w in enumerate((86, 0, 104, 98, 100, 58)):
             if w:
                 hh.resizeSection(i, w)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -189,6 +196,9 @@ class GuichetPage(QWidget):
         self.stack = QStackedWidget()
         self.stack.addWidget(self.table)
         self.stack.addWidget(self.tree)
+        self.empty = self._build_empty()
+        self.stack.addWidget(self.empty)
+        self.view_mode = "releve"
         results.lay.addWidget(self.stack, 1)
         keys = QLabel("Échap nouvel étudiant   ·   ↑ ↓ parcourir + aperçu   ·   Ctrl+P imprimer   ·   "
                       "Ctrl+E exporter   ·   Ctrl+Maj+E cursus")
@@ -206,6 +216,8 @@ class GuichetPage(QWidget):
         self.preview.cursus_requested.connect(self.open_cursus)
         self.preview.open_location_requested.connect(self.open_location)
         self.preview.releve_updated.connect(self._on_releve_updated)
+        self.preview.render_failed.connect(self._on_render_failed)
+        self._pending: tuple[str, int] | None = None     # impression / export programmé (aperçu Word en cours)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -217,11 +229,25 @@ class GuichetPage(QWidget):
         hl.addWidget(self.preview)
         self.preview.setMinimumWidth(420)
         scroll.setWidget(holder)
-        split.addWidget(scroll)
-        split.setStretchFactor(0, 55)
-        split.setStretchFactor(1, 45)
-        split.setSizes([580, 420])
+        # Les boutons Imprimer / Exporter restent épinglés sous l'aperçu : jamais hors de l'écran
+        self.preview.layout().removeWidget(self.preview.actions)
+        right = QWidget()
+        right.setObjectName("page")
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 6, 0)
+        rl.setSpacing(10)
+        rl.addWidget(scroll, 1)
+        rl.addWidget(self.preview.actions)
+        split.addWidget(right)
+        split.setStretchFactor(0, 57)
+        split.setStretchFactor(1, 43)
+        split.setSizes([570, 430])
         root.addWidget(split, 1)
+        self.root_lay = root
+        self.preview_scroll = scroll
+        # Messages (impression, alertes) flottants au-dessus de l'aperçu : toujours visibles, même à 768 px
+        self.preview.toast.float_over(self, anchor=scroll)
+        self.compact = False
 
         self.refresh_header()
         self._stats_timer = QTimer(self)
@@ -254,9 +280,98 @@ class GuichetPage(QWidget):
         self.card_prints.set(f"{counts.get('IMPRESSION', 0) + counts.get('DUPLICATA', 0)} relevés · "
                              f"{counts.get('DUPLICATA', 0)} duplicata(s)")
         self.card_anom.set(f"{anomalies} fichier(s)")
+        n_print = counts.get('IMPRESSION', 0) + counts.get('DUPLICATA', 0)
+        self.mini.setText(f"{st['releves']:,} relevés".replace(",", " ") + f"  ·  {n_print} imprimé(s) aujourd'hui"
+                          + (f"  ·  {anomalies} anomalie(s)" if anomalies else ""))
+        self.mini.setWordWrap(False)
+        self.mini.setToolTip(f"{self.card_index.value.text()}\nIndexation : {self.card_indexing.value.text()}\n"
+                             f"Imprimés aujourd'hui : {self.card_prints.value.text()}\n"
+                             f"Anomalies à revoir : {self.card_anom.value.text()}")
+
+    # ------------------------------------------------------------ écran bas (1366×768, 1440×900…)
+    COMPACT_BELOW = 880          # hauteur de page sous laquelle l'en-tête se resserre (1366×768, 1440×900)
+    PREVIEW_FULL_FROM = 1150     # aperçu « confort » (4 tuiles, grandes actions) seulement sur grand écran
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.set_compact(self.height() < self.COMPACT_BELOW)
+        self.preview.set_compact(self.height() < self.PREVIEW_FULL_FROM)
+
+    def set_compact(self, on: bool) -> None:
+        """Le document à contrôler et le bouton Imprimer doivent tenir dans l'écran sans défiler :
+        cartes d'état réduites à une ligne d'en-tête, barres resserrées, récapitulatif sur une ligne."""
+        if on == self.compact:
+            return
+        self.compact = on
+        self.stats_box.setVisible(not on)
+        self.mini.setVisible(on and not getattr(self, "_indexing_live", False))
+        self.date_label.setVisible(not on)
+        self.hello.setStyleSheet("font-size:17pt;" if on else "")
+        self.root_lay.setSpacing(10 if on else 16)
+        pad = 10 if on else 16
+        self.search_card.lay.setContentsMargins(pad + 2, pad, pad + 2, pad)
+        self.search_card.lay.setSpacing(8 if on else 12)
+        self.omni.setMinimumHeight(48 if on else 60)
+        self.timing.setVisible(not on)
+        self.demande_bar.set_compact(on)
+        if on and getattr(self, "_indexing_live", False):
+            self.stats_box.setVisible(True)      # indexation en cours : la progression reste visible
+
+    # ------------------------------------------------------------ état vide
+    def _build_empty(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(10)
+        lay.addStretch(1)
+        self.empty_title = title("", 13)
+        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_title.setWordWrap(True)
+        lay.addWidget(self.empty_title)
+        self.empty_text = muted("", 9.5)
+        self.empty_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_text.setWordWrap(True)
+        lay.addWidget(self.empty_text)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.empty_btn = QPushButton()
+        self.empty_btn.setObjectName("secondary")
+        self.empty_btn.clicked.connect(lambda: self._empty_action and self._empty_action())
+        row.addWidget(self.empty_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        lay.addStretch(2)
+        self._empty_action = None
+        return w
+
+    def _show_empty(self, q: str) -> None:
+        self._empty_action = None
+        if not q:
+            self.empty_title.setText("Qui se présente au guichet ?")
+            self.empty_text.setText("Tapez le matricule (18M042, 18-M-042, 18 m 042…), le nom ou le prénom, ou une "
+                                    "année. Les résultats s'affichent pendant la frappe ; ↑ ↓ pour parcourir.")
+        elif self._all:      # des résultats existent, mais pas dans la filière choisie
+            self.empty_title.setText(f"Aucun relevé de cette filière pour « {q} »")
+            self.empty_text.setText(f"{len(self._all)} relevé(s) trouvé(s) dans d'autres filières.")
+            self._empty_action = lambda: (self.pills[None][0].setChecked(True), self.set_filiere(None))
+            self.empty_btn.setText(f"Afficher toutes les filières ({len(self._all)})")
+        else:
+            self.empty_title.setText(f"Aucun relevé pour « {q} »")
+            tips = ["vérifiez l'orthographe ou tapez seulement le nom de famille",
+                    "pour un matricule, essayez sans la lettre de filière (ex. 18 042)",
+                    "un relevé récent n'est peut-être pas encore indexé (écran Indexation, Ctrl+3)"]
+            self.empty_text.setText("Pistes : " + " ; ".join(tips) + ".")
+            if not self.tolerant:
+                self._empty_action = lambda: (self.mode.set_value(True), self.set_mode(True))
+                self.empty_btn.setText("Essayer avec la tolérance aux fautes")
+        self.empty_btn.setVisible(self._empty_action is not None)
+        self.stack.setCurrentWidget(self.empty)
 
     def on_indexing_progress(self, done: int, total: int, running: bool) -> None:
         self._indexing_live = running
+        if self.compact:      # écran bas : la carte de progression ne s'affiche que pendant l'indexation
+            self.stats_box.setVisible(running)
+            self.mini.setVisible(not running)
         if running and total:
             self.card_indexing.set(f"{done * 100 // total} % · {done} / {total} fichiers", done / total)
         else:
@@ -266,6 +381,7 @@ class GuichetPage(QWidget):
     def run_search(self, text: str) -> None:
         t0 = time.perf_counter()
         q = text.strip()
+        self._query = q
         self._all = self.db.search(q, None, self.tolerant, self.s.fuzzy_threshold, self.s.max_results) if q else []
         ms = (time.perf_counter() - t0) * 1000
         self.apply_filter()
@@ -288,6 +404,10 @@ class GuichetPage(QWidget):
             if r.id in ids and "✓ DEMANDE" not in r.flags:
                 r.flags.insert(0, "✓ DEMANDE")
         self.model.set_results(self.results, self.omni.text())
+        if not self.results:
+            self._show_empty(getattr(self, "_query", self.omni.text().strip()))
+        else:
+            self.stack.setCurrentIndex(0 if self.view_mode == "releve" else 1)
         if self.stack.currentIndex() == 1:   # vue groupée affichée seulement : pas de requêtes inutiles
             self._fill_tree()
         if self.results:
@@ -295,7 +415,8 @@ class GuichetPage(QWidget):
             self.table.setCurrentIndex(self.model.index(0, 0))
             self.on_row(0)
         else:
-            self.preview.clear()
+            self.preview.clear("Aucun résultat : voir les pistes à gauche." if getattr(self, "_query", "")
+                               else "L'aperçu du relevé sélectionné s'affiche ici.")
 
     def set_filiere(self, code) -> None:
         self.filiere = code
@@ -306,6 +427,9 @@ class GuichetPage(QWidget):
         self.run_search(self.omni.text())
 
     def set_view(self, mode) -> None:
+        self.view_mode = mode
+        if not self.results:
+            return
         self.stack.setCurrentIndex(0 if mode == "releve" else 1)
         if mode != "releve":
             self._fill_tree()
@@ -376,6 +500,9 @@ class GuichetPage(QWidget):
             self._show(rel)
 
     def _show(self, rel: Releve) -> None:
+        if self._pending and self._pending[1] != rel.id:
+            self._pending = None
+            self.preview.toast.show_message("Impression programmée annulée : un autre relevé est sélectionné.", "amber")
         self.preview.set_releve(rel, self.db.level_siblings(rel))
         if rel.id not in self._consulted:
             self._consulted.add(rel.id)
@@ -404,8 +531,17 @@ class GuichetPage(QWidget):
         if hasattr(self.model, "layoutChanged"):
             self.model.layoutChanged.emit()
 
+    def _on_render_failed(self, rel: Releve) -> None:
+        if self._pending and self._pending[1] == rel.id:
+            self._pending = None
+            self.preview.toast.show_message("Aperçu Word impossible : l'impression programmée est annulée.", "red")
+
     def _on_releve_updated(self, rel: Releve) -> None:
-        """Aperçu Word produit : les numéros de page exacts remplacent l'estimation dans la liste."""
+        """Aperçu Word produit : les numéros de page exacts remplacent l'estimation dans la liste.
+        Une impression (ou un export) demandée pendant la préparation part maintenant."""
+        pending, self._pending = self._pending, None
+        if pending and pending[1] == rel.id:
+            QTimer.singleShot(0, self.print_current if pending[0] == "print" else self.export_current)
         for i, r in enumerate(self.model.rows):
             if r.id == rel.id:
                 rel.flags, rel.score = r.flags, r.score
@@ -419,19 +555,20 @@ class GuichetPage(QWidget):
     def current(self) -> Releve | None:
         return self.preview.rel
 
-    def _ready(self, rel: Releve) -> Releve | None:
+    def _ready(self, rel: Releve, kind: str = "print") -> Releve | None:
         """Relevé prêt à imprimer, après le contrôle de dernière ligne (core/guard.py). L'aperçu Word n'est
-        JAMAIS produit ici (fil de l'interface) : s'il manque, on lance sa préparation en arrière-plan."""
-        if self.preview.render_state == "en cours":
-            self.preview.toast.show_message("Aperçu Word en préparation : réessayez dès qu'il s'affiche.", "amber")
-            return None
+        JAMAIS produit ici (fil de l'interface) : s'il manque, l'action est programmée et part toute seule
+        dès que l'aperçu est prêt (et contrôlé)."""
         if self.previews is not None and self.previews.needs_render(rel):
             if self.preview.render_state == "échec":
                 self.preview.toast.show_message("Aperçu Word indisponible pour ce relevé : impression impossible.", "red")
-            else:
+                return None
+            if self.preview.render_state != "en cours":
                 self.preview._render_async(rel)
-                self.preview.toast.show_message("Préparation de l'aperçu Word… relancez l'impression quand il "
-                                                "s'affiche.", "amber")
+            self._pending = (kind, rel.id)
+            what = "L'impression partira" if kind == "print" else "L'export se fera"
+            self.preview.toast.show_message(f"Aperçu Word en préparation. {what} automatiquement dès qu'il sera prêt "
+                                            "et contrôlé.", "blue", 30000)
             return None
         try:
             check_before_print(rel)
@@ -477,7 +614,7 @@ class GuichetPage(QWidget):
         QThreadPool.globalInstance().start(task)
 
     def export_current(self) -> None:
-        rel = self.current and self._ready(self.current)
+        rel = self.current and self._ready(self.current, "export")
         if not rel:
             return
         dup = self.preview.duplicata

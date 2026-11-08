@@ -10,7 +10,7 @@ from core.normalize import norm_matricule, norm_text
 
 from .widgets import BLUE, INK, MUTED, TONES, flag_tone, mono_font, statut_tone
 
-COLUMNS = ["Matricule", "Nom & prénom", "Filière · niveau", "Année · moyenne", "Statut", "Pages"]
+COLUMNS = ["Matricule", "Nom & prénom", "Période", "Année", "Statut", "Pages"]
 FIL_SHORT = {"M": "Médecine", "P": "Pharmacie", "B": "Biomédical", "MS": "Master", "D": "Doctorat"}
 ReleveRole = Qt.ItemDataRole.UserRole + 1
 
@@ -66,7 +66,7 @@ def _periode_court(r: Releve) -> str:
         base = f"N{r.niveau_num}"
     else:
         base = r.niveau or "?"
-    return f"{base} · S{r.semestre}" if r.semestre else base
+    return f"{base} · {r.sem_label}" if r.semestre else base
 
 
 def _ligne2(r: Releve) -> str:
@@ -157,11 +157,18 @@ class RowDelegate(QStyledItemDelegate):
                     if w <= 0:
                         break
                     fx += w + 5
-        elif col == 2:
+        elif col == 2:     # deux lignes : la période (« N4 · S7-S8 ») d'abord, la filière dessous
             p.setPen(QColor("#334155"))
             p.setFont(base)
-            p.drawText(inner, Qt.AlignmentFlag.AlignVCenter,
-                       QFontMetricsF(base).elidedText(index.data(), Qt.TextElideMode.ElideRight, inner.width()))
+            p.drawText(QRectF(inner.left(), inner.top() + 7, inner.width(), inner.height() / 2 - 4),
+                       Qt.AlignmentFlag.AlignBottom,
+                       QFontMetricsF(base).elidedText(_periode_court(r), Qt.TextElideMode.ElideRight, inner.width()))
+            f = QFont(base)
+            f.setPointSizeF(base.pointSizeF() * 0.88)
+            p.setFont(f)
+            p.setPen(QColor(MUTED))
+            p.drawText(QRectF(inner.left(), inner.center().y() + 1, inner.width(), inner.height() / 2),
+                       Qt.AlignmentFlag.AlignTop, FIL_SHORT.get(r.filiere_code or "", r.filiere or "?"))
         elif col == 3:
             p.setFont(base)
             p.setPen(QColor("#334155"))

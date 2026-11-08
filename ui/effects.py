@@ -10,7 +10,10 @@
 from __future__ import annotations
 
 import os
+import weakref
 from pathlib import Path
+
+import shiboken6
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, Qt, QTimer, QUrl, QVariantAnimation
 from PySide6.QtGui import QFontDatabase
@@ -35,6 +38,10 @@ def animations_on() -> bool:
 
 # ------------------------------------------------------------------ polices
 def load_fonts(assets_dir: Path) -> set[str]:
+    """Charge les polices embarquées UNE fois : les recharger pendant que des fenêtres existent invalide
+    les caches de polices de Qt (plantage à la fenêtre suivante)."""
+    if _state.get("fonts"):
+        return _state["fonts"]
     families: set[str] = set()
     for f in sorted((assets_dir / "fonts").glob("*.[ot]tf")):
         fid = QFontDatabase.addApplicationFont(str(f))
@@ -100,6 +107,19 @@ def play(kind: str) -> None:
 
 
 # ------------------------------------------------------------------ animations
+# Les fonctions de fin d'animation ne tiennent le widget que par une référence FAIBLE : l'animation est
+# enfant du widget ; si elle en gardait une référence forte, sa destruction pourrait détruire son propre
+# parent (widget sans parent Qt) et provoquer une double destruction.
+def _weak_call(widget, fn):
+    ref = weakref.ref(widget)
+
+    def call(*args):
+        w = ref()
+        if w is not None and shiboken6.isValid(w):
+            fn(w, *args)
+    return call
+
+
 def fade_in(widget: QWidget, ms: int = 180) -> None:
     if not animations_on() or widget is None:
         return
@@ -111,7 +131,7 @@ def fade_in(widget: QWidget, ms: int = 180) -> None:
     anim.setEndValue(1.0)
     anim.setEasingCurve(QEasingCurve.Type.OutCubic)
     # l'effet est retiré à la fin : pas de coût de rendu permanent (ni de conflit avec les ombres)
-    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
+    anim.finished.connect(_weak_call(widget, lambda w: w.setGraphicsEffect(None)))
     anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
 
@@ -125,7 +145,7 @@ def slide_in(widget: QWidget, ms: int = 220) -> None:
     anim.setStartValue(0)
     anim.setEndValue(max(target, 1))
     anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-    anim.finished.connect(lambda: widget.setMaximumHeight(16777215))
+    anim.finished.connect(_weak_call(widget, lambda w: w.setMaximumHeight(16777215)))
     anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
     fade_in(widget, ms)
 
@@ -144,7 +164,7 @@ def count_to(label, value: int, fmt=str, ms: int = 450) -> None:
     anim.setStartValue(start)
     anim.setEndValue(value)
     anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-    anim.valueChanged.connect(lambda v: label.setText(fmt(int(v))))
+    anim.valueChanged.connect(_weak_call(label, lambda w, v: w.setText(fmt(int(v)))))
     anim.start(QVariantAnimation.DeletionPolicy.DeleteWhenStopped)
 
 
@@ -160,7 +180,7 @@ def pulse(widget: QWidget, times: int = 2) -> None:
     for k in range(times):
         anim.setKeyValueAt((2 * k + 1) / (2 * times), 0.55)
         anim.setKeyValueAt((2 * k + 2) / (2 * times), 1.0)
-    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
+    anim.finished.connect(_weak_call(widget, lambda w: w.setGraphicsEffect(None)))
     anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
 
