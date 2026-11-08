@@ -5,7 +5,7 @@ import os
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QMargins, QPointF, QThreadPool, Qt, Signal
+from PySide6.QtCore import QEvent, QMargins, QPointF, QThreadPool, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -50,6 +50,17 @@ class PdfViewer(QFrame):
         lay.addWidget(self.stack)
         self._docs: OrderedDict[str, QPdfDocument] = OrderedDict()
         self.setMinimumHeight(420)
+        self.view.viewport().installEventFilter(self)     # Ctrl + molette : zoom du document
+        self.setToolTip("Ctrl + molette : zoomer le document")
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Type.Wheel and obj is self.view.viewport()
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            dy = event.angleDelta().y()
+            if dy:
+                self.zoom(1.15 if dy > 0 else 1 / 1.15)
+            return True
+        return super().eventFilter(obj, event)
 
     def _doc(self, path: str) -> QPdfDocument | None:
         try:

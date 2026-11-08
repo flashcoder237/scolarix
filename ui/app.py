@@ -34,7 +34,17 @@ def _font() -> QFont:
     return f
 
 
+def apply_ui_scale(settings) -> None:
+    """Taille de l'interface choisie par l'agent, en plus de la mise à l'échelle de Windows.
+    Qt ne la lit qu'au démarrage : un changement s'applique en relançant Scolarix."""
+    import os
+    scale = getattr(settings, "ui_scale", 100) or 100
+    if scale != 100 and "QT_SCALE_FACTOR" not in os.environ:
+        os.environ["QT_SCALE_FACTOR"] = f"{max(50, min(200, scale)) / 100:.2f}"
+
+
 def run_gui(argv: list[str]) -> int:
+    apply_ui_scale(load_settings())
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)

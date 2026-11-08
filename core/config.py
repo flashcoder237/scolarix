@@ -18,6 +18,7 @@ from pathlib import Path
 APP_NAME = "Scolarix"
 APP_SUBTITLE = "Archives des relevés de notes · FMSP"
 APP_VERSION = "1.3.0"
+UI_SCALES = (80, 90, 100, 110, 125, 150)    # tailles d'interface proposées (en %)
 
 # Corrections d'en-tête par défaut des relevés Word (modifiables dans Réglages).
 DEFAULT_TEXT_RULES = (
@@ -72,6 +73,7 @@ class Settings:
     index_workers: int = 0
     ui_sounds: bool = True                 # sons discrets (succès, attention, erreur, impression)
     ui_animations: bool = True             # petites animations (messages, écrans, compteurs)
+    ui_scale: int = 100                    # taille de l'interface en % (Ctrl+Plus / Ctrl+Moins / Ctrl+0)
     exports_root: str = ""                 # vide = Documents\Exports Scolarix ; sinon dossier (partagé) du service
     exports_retention_days: int = 30       # relevés, cursus, vérifications : supprimés après N jours (0 = jamais)
     delivery_ref_stamp: bool = False       # imprimer le numéro de délivrance en bas de chaque page délivrée                 # processus parallèles ; 0 = automatique (cœurs - 1, au plus 4)

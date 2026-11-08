@@ -449,3 +449,49 @@ def test_verification_retrouve_l_original_toute_seule(app, window, tmp_path, mon
     assert wait_for(app, lambda: bool(ver.rows), 60)
     assert ver.matricule.text() == "18M042" and ver.original.id == g.current.id
     assert "conforme" in ver.v_title.text().lower()
+
+
+def test_taille_de_l_interface(app, window, monkeypatch):
+    import os
+
+    import ui.main_window as mw
+    saved = []
+    monkeypatch.setattr(mw, "save_settings", lambda s: saved.append(s.ui_scale))
+    monkeypatch.delenv("QT_SCALE_FACTOR", raising=False)
+    window.s.ui_scale = 100
+    assert window.change_scale(+1) == 110 and saved == [110]
+    assert "redémarrage" in window.toast.lab.text() and window.toast.action_btn.isVisible()
+    assert window.change_scale(+1) == 125
+    assert window.change_scale(0) == 100                     # Ctrl+0 : taille normale
+    window.s.ui_scale = 150
+    assert window.change_scale(+1) == 150 and "maximale" in window.toast.lab.text()
+    window.s.ui_scale = 100
+    from ui.app import apply_ui_scale
+    from types import SimpleNamespace
+    apply_ui_scale(SimpleNamespace(ui_scale=125))
+    assert os.environ.pop("QT_SCALE_FACTOR") == "1.25"
+    apply_ui_scale(SimpleNamespace(ui_scale=100))
+    assert "QT_SCALE_FACTOR" not in os.environ
+
+
+def test_ctrl_molette_zoome_le_document(app, window):
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+    g = window.guichet
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    v = g.preview.viewer
+    before = v.view.zoomFactor()
+    ev = QWheelEvent(QPointF(50, 50), QPointF(50, 50), QPoint(), QPoint(0, 120), Qt.MouseButton.NoButton,
+                     Qt.KeyboardModifier.ControlModifier, Qt.ScrollPhase.NoScrollPhase, False)
+    app.sendEvent(v.view.viewport(), ev)
+    assert v.view.zoomMode() == v.view.ZoomMode.Custom and v.view.zoomFactor() > before * 1.1
+
+
+def test_raccourcis_sans_ambiguite(app, window):
+    from collections import Counter
+
+    from PySide6.QtGui import QShortcut
+    keys = Counter(sc.key().toString() for sc in window.findChildren(QShortcut))
+    assert not [k for k, n in keys.items() if n > 1]          # une touche = un seul raccourci
+    assert {"Ctrl++", "Ctrl+-", "Ctrl+0", "Ctrl+="} <= set(keys)

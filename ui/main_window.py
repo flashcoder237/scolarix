@@ -1,12 +1,15 @@
 """Fenêtre principale : rail de navigation + écrans, raccourcis clavier globaux."""
 from __future__ import annotations
 
+import os
+import sys
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QStackedWidget,
                                QVBoxLayout, QWidget)
 
-from core.config import APP_NAME, APP_VERSION, Settings
+from core.config import APP_NAME, APP_VERSION, UI_SCALES, Settings, save_settings
 from core.database import Database
 
 from .extraction_page import ExtractionPage
@@ -16,7 +19,7 @@ from .icons import pixmap
 from .indexing_page import IndexingPage
 from .settings_dialog import SettingsDialog
 from .verification_page import VerificationPage
-from .widgets import NavButton, shadow
+from .widgets import NavButton, Toast, shadow
 
 
 class MainWindow(QMainWindow):
@@ -117,6 +120,18 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+N"), self, activated=self._new_demande)
         for i in range(5):
             QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self, activated=lambda idx=i: self.go(idx))
+        # Taille de toute l'interface, comme dans un navigateur (Ctrl + molette zoome le document seul)
+        # (une même touche déclarée deux fois rendrait le raccourci ambigu : aucun ne marcherait)
+        zoom_keys: dict[str, int] = {}
+        for seqs, step in (((QKeySequence.StandardKey.ZoomIn, "Ctrl++", "Ctrl+="), +1),
+                           ((QKeySequence.StandardKey.ZoomOut, "Ctrl+-"), -1), (("Ctrl+0",), 0)):
+            for seq in seqs:
+                for ks in QKeySequence.keyBindings(seq) if not isinstance(seq, str) else [QKeySequence(seq)]:
+                    zoom_keys.setdefault(ks.toString(), step)
+        for key, step in zoom_keys.items():
+            QShortcut(QKeySequence(key), self, activated=lambda st=step: self.change_scale(st))
+        self.toast = Toast()
+        self.toast.float_over(self.stack)
 
         self.focus_search()
 
@@ -148,6 +163,38 @@ class MainWindow(QMainWindow):
         self.go(0)
         self.guichet.focus_search()
 
+    # ------------------------------------------------------------ taille de l'interface
+    def change_scale(self, step: int) -> int:
+        """+1 / -1 : taille suivante / précédente ; 0 : taille normale (100 %). Appliquée au redémarrage."""
+        cur = self.s.ui_scale if self.s.ui_scale in UI_SCALES else 100
+        k = UI_SCALES.index(cur)
+        new = 100 if step == 0 else UI_SCALES[max(0, min(len(UI_SCALES) - 1, k + step))]
+        if new == cur:
+            limit = "maximale" if step > 0 else ("minimale" if step < 0 else "normale")
+            self.toast.show_message(f"Taille de l'interface déjà {limit} ({cur} %).", "blue", 4000)
+            return cur
+        self.s.ui_scale = new
+        save_settings(self.s)
+        self._scale_notice()
+        return new
+
+    def _scale_notice(self) -> None:
+        applied = round(float(os.environ.get("QT_SCALE_FACTOR", "1") or 1) * 100)
+        if self.s.ui_scale == applied:
+            self.toast.show_message(f"Taille de l'interface : {self.s.ui_scale} % (taille actuelle).", "green", 5000)
+            return
+        self.toast.show_message(f"Taille de l'interface : {self.s.ui_scale} % — s'applique au redémarrage de "
+                                "Scolarix (Ctrl+0 : taille normale).", "blue", 20000,
+                                action=("Redémarrer maintenant", self.restart))
+
+    def restart(self) -> None:
+        """Relance Scolarix (même exécutable, mêmes arguments) après une fermeture normale."""
+        from PySide6.QtCore import QProcess
+        program = sys.executable
+        args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+        if self.close():
+            QProcess.startDetached(program, list(args))
+
     def _new_demande(self) -> None:
         """Ctrl+N : au guichet (pré-remplie avec le relevé affiché) comme sur l'écran Demandes."""
         page = self.stack.currentWidget()
@@ -165,7 +212,10 @@ class MainWindow(QMainWindow):
         self.guichet.run_search(self.guichet.omni.text())
 
     def open_settings(self) -> None:
+        scale = self.s.ui_scale
         if SettingsDialog(self.s, self).exec():
+            if self.s.ui_scale != scale:
+                self._scale_notice()
             from . import effects
             effects.configure(self.s)
             self.guichet.refresh_header()

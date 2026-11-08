@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QPushButton,
                                QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
-from core.config import DEFAULT_TEXT_RULES, Settings, config_path, save_settings
+from core.config import DEFAULT_TEXT_RULES, UI_SCALES, Settings, config_path, save_settings
 from core.indexer import default_workers
 from core.text_rules import RuleError, apply_text, compile_rules
 
@@ -431,6 +431,18 @@ class SettingsDialog(QDialog):
         self.anims.setChecked(settings.ui_animations)
         form.addRow("Confort", self.sounds)
         form.addRow("", self.anims)
+        self.scale = QComboBox()
+        for v in UI_SCALES:
+            self.scale.addItem(f"{v} %" + (" (normale)" if v == 100 else ""), v)
+        self.scale.setCurrentIndex(max(0, self.scale.findData(settings.ui_scale)))
+        self.scale.setToolTip("Agrandit ou réduit toute l'interface (textes, boutons, tableaux), en plus de la "
+                              "mise à l'échelle de Windows. Raccourcis : Ctrl+Plus, Ctrl+Moins, Ctrl+0.\n"
+                              "S'applique au redémarrage de Scolarix. Sur un écran 1366×768, au-delà de 110 % "
+                              "l'aperçu du relevé devient petit.")
+        srow = QHBoxLayout()
+        srow.addWidget(self.scale)
+        srow.addWidget(muted("Ctrl+Plus / Ctrl+Moins / Ctrl+0 · au redémarrage", 8.5), 1)
+        form.addRow("Taille de l'interface", srow)
         form.addRow("Commande d'impression",
                     self._line("print_command", r'"C:\Outils\SumatraPDF.exe" -print-to-default -silent "{file}"'))
         form.addRow("Tesseract (OCR)", self._line("tesseract_cmd", r"C:\Program Files\Tesseract-OCR\tesseract.exe", "file"))
@@ -573,6 +585,7 @@ class SettingsDialog(QDialog):
         self.s.duplex = self.duplex.isChecked()
         self.s.ui_sounds = self.sounds.isChecked()
         self.s.ui_animations = self.anims.isChecked()
+        self.s.ui_scale = self.scale.currentData() or 100
         self.s.index_workers = self.workers.value()
         self.s.exports_retention_days = self.retention.value()
         self.s.delivery_ref_stamp = self.ref_stamp.isChecked()
