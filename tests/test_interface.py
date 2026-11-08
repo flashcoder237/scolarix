@@ -347,7 +347,7 @@ def test_ctrl_d_sur_un_autre_etudiant_propose_une_nouvelle_demande(app, window, 
     g.add_to_demande()
     first = g.demande_bar.active
     assert window.db.demande(first)["matricule"] == "18P203"
-    g.run_search("19P017")                                   # une autre personne
+    g.run_search("18M042")                                   # une autre personne (PDF texte : pas d'OCR requis)
     assert wait_for(app, lambda: g.model.rowCount() > 0)
     g.on_row(0)
     asked = []
@@ -357,7 +357,7 @@ def test_ctrl_d_sur_un_autre_etudiant_propose_une_nouvelle_demande(app, window, 
     monkeypatch.setattr(W, "ask_choice", lambda *a, **k: 0)  # « Nouvelle demande pour … »
     g.add_to_demande()
     second = g.demande_bar.active
-    assert second != first and window.db.demande(second)["matricule"] == "19P017"
+    assert second != first and window.db.demande(second)["matricule"] == "18M042"
     assert window.db.demande(first)["n"] == 1                # la demande de la 1re personne est intacte
     g.demande_bar.set_active(first)
     monkeypatch.setattr(W, "ask_choice", lambda *a, **k: 1)  # « Ajouter quand même » : choix explicite
