@@ -38,6 +38,7 @@ def releve_dict(rel: Releve | None) -> dict | None:
     d = dataclasses.asdict(rel)
     for p in RELEVE_PROPS:
         d[p] = getattr(rel, p)
+    d["pages_span"] = page_span_label(rel)      # « 1 (p. 41) » : colonne Pages des demandes et du cursus
     return d
 
 

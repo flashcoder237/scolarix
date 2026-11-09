@@ -30,6 +30,7 @@ export interface Releve {
   flags: string[];
   nb_pages: number;
   pages_label: string;
+  pages_span?: string;
   preview_pdf: string | null;
   is_success: boolean;
   periode: string;

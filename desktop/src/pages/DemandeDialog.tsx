@@ -146,7 +146,7 @@ export function DemandeDialog({ did, onClose }: { did: number; onClose: () => vo
                 <td className="ellipsis">{it.releve ? it.releve.periode : "relevé retiré de l'index"}</td>
                 <td>{it.releve?.annee_academique || "?"}</td>
                 <td>{it.releve && <Badge text={it.releve.statut || "—"} tone={statutTone(it.releve.statut)} />}</td>
-                <td className="muted">{it.releve?.pages_label.replace("Pages ", "").replace("Page ", "")}</td>
+                <td className="muted" title={it.releve?.pages_label}>{it.releve?.pages_span ?? it.releve?.pages_label}</td>
                 <td className="small ellipsis" title={it.item.etat || ""}>{it.item.etat ? <Badge text={it.item.etat.startsWith("PRÊT") ? `PRÊT · ${it.item.reference}` : it.item.etat} tone={it.item.etat.startsWith("PRÊT") ? "green" : "red"} /> : <span className="muted">à préparer</span>}</td>
                 <td>
                   {editable && <div className="row" style={{ gap: 2 }}>

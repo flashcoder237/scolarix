@@ -19,7 +19,9 @@ export function samePerson(a: string | null | undefined, b: string | null | unde
   const ta = new Set(normText(a).split(" ").filter(Boolean)), tb = new Set(normText(b).split(" ").filter(Boolean));
   if (!ta.size || !tb.size) return false;
   const sub = (x: Set<string>, y: Set<string>) => [...x].every((w) => y.has(w));
-  return sub(ta, tb) || sub(tb, ta);
+  if (sub(ta, tb) || sub(tb, ta)) return true;
+  // mots collés dans certains fichiers (« PRUDENCE NOM » / « PRUDENCENOM ») : même clé sans espaces
+  return normText(a).replace(/ /g, "") === normText(b).replace(/ /g, "");
 }
 
 type Pending = { kind: "print" | "export"; id: number } | null;
