@@ -52,6 +52,26 @@ jobs:
               /d "Scolarix - moteur" dist\scolarix-engine\scolarix-engine.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Robot d'indexation du moteur compilé (1 puis 2 processus, délai maximal)
+        shell: pwsh
+        run: |
+          python tools/generate_samples.py archives_demo | Out-Null
+          foreach ($w in 1, 2) {
+            $env:FMSP_DATA_DIR = "$PWD\ci_data_$w"
+            $out = "ci_index_$w.log"; $err = "ci_index_$w.err"
+            $p = Start-Process -FilePath "dist\scolarix-engine\scolarix-engine.exe" -PassThru -NoNewWindow `
+                 -ArgumentList "--index","--json","--source","archives_demo","--no-ocr","--workers","$w","--db","$PWD\ci_$w.db" `
+                 -RedirectStandardOutput $out -RedirectStandardError $err
+            if (-not $p.WaitForExit(120000)) {
+              Write-Host "BLOQUÉ avec $w processus"; Get-Content $out -Tail 15; Get-Content $err -Tail 40
+              Get-Process scolarix-engine -ErrorAction SilentlyContinue | Format-Table Id, StartTime, CPU
+              Get-Process scolarix-engine -ErrorAction SilentlyContinue | Stop-Process -Force
+              exit 1
+            }
+            Write-Host "$w processus : code $($p.ExitCode)"; Get-Content $out -Tail 2; Get-Content $err -Tail 20
+            if (-not (Select-String -Path $out -Pattern '"type": "done"' -Quiet)) { exit 1 }
+          }
+
       - name: Interface (dépendances, types, compilation)
         working-directory: desktop
         run: |
