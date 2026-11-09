@@ -307,3 +307,9 @@ def test_publication_apercu_resiste_a_un_verrou_passager(tmp_path, monkeypatch):
     with pytest.raises(PermissionError):
         preview._publish(tmp, dest, "sig", attempts=3)
     assert not tmp.exists()                                      # pas de fichier temporaire abandonné
+
+
+def test_word_absent_message_clair():
+    from core.extractors import WORD_MISSING, _word_error
+    assert _word_error(Exception(-2147221005, "Invalid class string", None, None)) == WORD_MISSING
+    assert _word_error(RuntimeError("autre chose")).startswith("Word COM : ")

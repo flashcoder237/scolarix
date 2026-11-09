@@ -532,7 +532,7 @@ class WordConverter:
                 except ExtractionError:
                     raise
                 except Exception as exc:  # Word absent : on tente LibreOffice
-                    errors.append(f"Word COM : {exc}")
+                    errors.append(_word_error(exc))
                     self.kill()
                     break
         if self._soffice:
@@ -541,10 +541,13 @@ class WordConverter:
                 return
             except Exception as exc:
                 errors.append(f"LibreOffice : {exc}")
+        if errors and not self._soffice and any(e.startswith(WORD_MISSING) for e in errors):
+            raise ExtractionError(WORD_MISSING + " (ni LibreOffice) : les relevés Word ne peuvent être ni affichés ni "
+                                  "imprimés sur ce poste. Installez Microsoft Word ou LibreOffice.")
         raise ExtractionError(f"Conversion en {fmt.upper()} impossible. " + " | ".join(errors) if errors
-                              else "Aucun convertisseur Word → PDF disponible (installer Word ou LibreOffice).")
+                              else "Aucun convertisseur Word → PDF disponible : installez Microsoft Word ou LibreOffice.")
 
-    def _convert_com(self, src: Path, dest: Path, fmt: str = "pdf") -> None:
+    def _convert_com(self, src: Path, dest: Path, fmt: str = "pdf") -> None:  # noqa: D401
         word = self._word_app()
         try:
             # Mot de passe factice : un document protégé lève une erreur au lieu d'ouvrir une boîte de dialogue.
@@ -662,3 +665,16 @@ def docx_pages_text(path: Path) -> list[PageText]:
 def file_signature(path: Path) -> tuple[int, float]:
     st = os.stat(path)
     return st.st_size, st.st_mtime
+
+
+WORD_MISSING = "Microsoft Word n'est pas installé"
+# Codes COM : classe inconnue (Word absent), serveur introuvable ou impossible à lancer.
+_WORD_ABSENT_CODES = (-2147221005, -2147221164, -2146959355)
+
+
+def _word_error(exc: BaseException) -> str:
+    """Erreur COM traduite pour l'agent : « Word n'est pas installé » plutôt que « Invalid class string »."""
+    code = exc.args[0] if getattr(exc, "args", None) and isinstance(exc.args[0], int) else None
+    if code in _WORD_ABSENT_CODES or "invalid class string" in str(exc).lower():
+        return WORD_MISSING
+    return f"Word COM : {exc}"

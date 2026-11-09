@@ -82,6 +82,7 @@ jobs:
           python desktop\e2e\setup_data.py "$work"
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $env:E2E_EXE = (Resolve-Path desktop\release\win-unpacked\Scolarix.exe).Path
+          $env:E2E_NO_WORD = "1"     # ni Word ni LibreOffice sur la machine de compilation
           node desktop\e2e\run.mjs "$work" desktop\e2e\out
           $code = $LASTEXITCODE
           Get-Content (Join-Path $work "data\logs\interface.log") -Tail 40 -ErrorAction SilentlyContinue

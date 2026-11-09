@@ -118,14 +118,39 @@ async function search(q) {
   });
 
   await scenario("Export PDF d'un relevé (Ctrl+E)", async () => {
-    await page.keyboard.press("ArrowUp");
+    for (let i = 0; i < 10; i++) {          // relevé N1 : un PDF (pas besoin de Word)
+      const line = await page.locator('[data-testid="results"] tbody tr.sel').innerText();
+      if (/N1\b/.test(line)) break;
+      await page.getByTestId("search").press("ArrowUp");
+      await page.waitForTimeout(120);
+    }
     await page.waitForTimeout(300);
     await page.keyboard.press("Control+e");
     const t = await waitToast(/Exporté \(réf\./);
     if (!/Ouvrir le dossier/.test(t)) throw new Error("bouton « Ouvrir le dossier » absent");
   });
 
-  await scenario("Relevé Word : Ctrl+P immédiat, l'impression part toute seule", async () => {
+  if (process.env.E2E_NO_WORD) await scenario("Poste sans Word : message clair, délivrance bloquée", async () => {
+    await search("2021");
+    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    const rows = page.locator('[data-testid="results"] tbody tr');
+    const n = await rows.count();
+    for (let i = 0; i < n; i++) {
+      await rows.nth(i).click();
+      const msg = page.locator('[data-testid="viewer"] .msg', { hasText: "Microsoft Word n'est pas installé" });
+      if (await msg.count() || await msg.waitFor({ timeout: 4000 }).then(() => true, () => false)) {
+        await shot("sans_word");
+        const before = printedCount();
+        await page.keyboard.press("Control+p");
+        await waitToast(/indisponible|impossible/i, 10000);
+        if (printedCount() !== before) throw new Error("un relevé Word sans aperçu contrôlé a été imprimé");
+        return;
+      }
+    }
+    throw new Error("aucun relevé Word avec le message « Microsoft Word n'est pas installé »");
+  });
+
+  if (!process.env.E2E_NO_WORD) await scenario("Relevé Word : Ctrl+P immédiat, l'impression part toute seule", async () => {
     await search("2021");
     await page.locator('[data-testid="results"] tbody tr').first().waitFor();
     const rows = page.locator('[data-testid="results"] tbody tr');
