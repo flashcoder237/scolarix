@@ -26,14 +26,19 @@ UI_SCALES = (80, 90, 100, 110, 125, 150)    # tailles d'interface proposées (en
 # Corrections d'en-tête par défaut des relevés Word (modifiables dans Réglages).
 DEFAULT_TEXT_RULES = (
     {"actif": True, "regex": True, "description": "Retirer l'ancien numéro de téléphone",
-     "chercher": r"Tel\s*:\s*33\s*01\s*41\s*39\s*/\s*33\s*01\s*41\s*29\s*[.,]?", "remplacer": ""},
+     "chercher": r"Tel\s*:\s*33\s*01\s*41\s*39\s*/\s*33\s*01\s*41\s*29\s*[.,]?", "remplacer": "",
+     "interligne": None, "espace_avant": None, "espace_apres": None},
     {"actif": True, "regex": True, "description": "Ajouter « Ref N° » devant le titre",
      "chercher": r"(?<!N° )RELEVE\s+DE\s+NOTES\s*/\s*TRANSCRIPT", "remplacer": "Ref N° RELEVE DE NOTES /TRANSCRIPT",
-     "taille": 8, "gras": False, "sauf_si": r"R[ée]f\.?\s*N\s*[°o]"},
+     "taille": 8, "gras": False, "sauf_si": r"R[ée]f\.?\s*N\s*[°o]",
+     "interligne": None, "espace_avant": None, "espace_apres": None},
     {"actif": True, "regex": True, "description": "Nouvelle référence des services",
      "chercher": r"/?FMSP(?:/[A-Z]{2,8})+", "remplacer": " /FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE",
-     "taille": 7, "sauf_si": r"/FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE"},
+     "taille": 7, "sauf_si": r"/FMSP/VDPSAA/VDSSE/VDRC/CDAASSR/SSE",
+     "interligne": None, "espace_avant": None, "espace_apres": None},
 )
+# interligne / espace_avant / espace_apres : paragraphe qui reçoit le remplacement (None = celui du document) ;
+# voir core/text_rules.py (parse_line_spacing).
 
 
 def data_dir() -> Path:

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { call, sx, type Settings, type TextRule } from "../api";
+import { call, sx, type Interligne, type Settings, type TextRule } from "../api";
 import { useApp, type SettingsTab } from "../state";
 import { Icon, Modal, Seg, Switch, useDebounced, useDialogs, useToast } from "../components/ui";
 
@@ -169,18 +169,35 @@ const FONTS = ["Arial", "Arial Narrow", "Book Antiqua", "Bookman Old Style", "Ca
 const SAMPLE = "Tel  : 33 01 41 39  / 33 01 41 29.  RELEVE DE NOTES /TRANSCRIPT   FMSP/VDAAP/VDSSSE/SSSE";
 const tri = (x: boolean | null | undefined) => (x == null ? "" : x ? "1" : "0");
 const untri = (x: string) => (x === "" ? null : x === "1");
+// Interligne d'une règle : « » = d'origine, multiple, ou valeur en points (exact / au moins)
+const lsKind = (x: Interligne | undefined) => (x == null ? "" : typeof x === "string" ? x : "exact" in x ? "exact" : "au_moins");
+const lsPt = (x: Interligne | undefined) => (x && typeof x === "object" ? ("exact" in x ? x.exact : x.au_moins) : undefined);
+const lsMake = (kind: string, pt: number | undefined): Interligne =>
+  kind === "" ? null : kind === "exact" ? { exact: pt || 12 } : kind === "au_moins" ? { au_moins: pt || 12 } : (kind as Interligne);
+const lsLabel = (x: Interligne | undefined) => {
+  const k = lsKind(x);
+  return !k ? "" : k === "exact" ? `interligne exact ${lsPt(x)} pt` : k === "au_moins" ? `interligne au moins ${lsPt(x)} pt` : `interligne ${k}`;
+};
+/** Hauteur de ligne CSS de l'échantillon (1 pt ≈ 1,333 px). */
+const lsCss = (x: Interligne | undefined, size: number) => {
+  const k = lsKind(x);
+  if (!k) return undefined;
+  if (k === "exact") return `${(lsPt(x) || 12) * 1.333}px`;
+  if (k === "au_moins") return `${Math.max(lsPt(x) || 12, size * 1.15) * 1.333}px`;
+  return String((k === "simple" ? 1 : k === "double" ? 2 : Number(k)) * 1.15);
+};
 
 function Corrections({ enabled, rules, onEnabled, onRules }: {
   enabled: boolean; rules: TextRule[]; onEnabled: (x: boolean) => void; onRules: (r: TextRule[]) => void;
 }) {
   const { ask } = useDialogs();
   const [sample, setSample] = useState(SAMPLE);
-  const [result, setResult] = useState<{ text?: string; count?: number; error?: string }>({});
+  const [result, setResult] = useState<{ text?: string; count?: number; error?: string; avertissements?: string[] }>({});
   const [open, setOpen] = useState<number | null>(rules.length ? 0 : null);
   const probe = useDebounced(JSON.stringify([rules, sample]), 250);
   useEffect(() => {
     let alive = true;
-    call<{ text: string; count: number }>("rules_test", { rules, text: sample })
+    call<{ text: string; count: number; avertissements?: string[] }>("rules_test", { rules, text: sample })
       .then((r) => alive && setResult(r))
       .catch((e) => alive && setResult({ error: (e as Error).message || String(e) }));
     return () => { alive = false; };
@@ -219,7 +236,8 @@ function Corrections({ enabled, rules, onEnabled, onRules }: {
 
       {rules.map((r, i) => {
         const isOpen = open === i;
-        const style = [r.police, r.taille ? `${r.taille} pt` : "", r.gras == null ? "" : r.gras ? "gras" : "non gras", r.italique == null ? "" : r.italique ? "italique" : "droit"].filter(Boolean).join(" · ");
+        const style = [r.police, r.taille ? `${r.taille} pt` : "", r.gras == null ? "" : r.gras ? "gras" : "non gras", r.italique == null ? "" : r.italique ? "italique" : "droit", lsLabel(r.interligne)].filter(Boolean).join(" · ");
+        const kind = lsKind(r.interligne);
         return (
           <div key={i} className="soft col" style={{ gap: 8, opacity: r.actif === false ? 0.6 : 1 }} data-testid={`rule-${i}`}>
             <div className="row">
@@ -254,9 +272,26 @@ function Corrections({ enabled, rules, onEnabled, onRules }: {
                   <select className="field" value={r.style_sur === "tout" ? "tout" : "ajout"} onChange={(e) => setRule(i, { style_sur: e.target.value === "tout" ? "tout" : null })}>
                     <option value="ajout">au texte ajouté seulement</option><option value="tout">à tout le texte de remplacement</option></select></label>
               </div>
-              <div style={{ background: "#fff", color: "#0F172A", border: "1px solid var(--line)", borderRadius: 10, padding: "6px 12px", minHeight: 40, display: "flex", alignItems: "center",
-                fontFamily: r.police || undefined, fontSize: `${Math.min(r.taille || 11, 28) * 1.333}px`, fontWeight: r.gras ? 700 : 400, fontStyle: r.italique ? "italic" : "normal" }}>
-                {r.remplacer || <span className="muted small" style={{ fontFamily: "inherit" }}>(suppression : aucun texte de remplacement)</span>}
+              <div className="row wrap" title="S'applique au seul paragraphe qui reçoit le remplacement, jamais aux autres. Vide = celui du document.">
+                <label className="lbl">Interligne du paragraphe
+                  <select className="field" value={kind} onChange={(e) => setRule(i, { interligne: lsMake(e.target.value, lsPt(r.interligne)) })} data-testid={`rule-${i}-interligne`}>
+                    <option value="">comme l'original</option><option value="simple">simple</option><option value="1.15">1,15</option><option value="1.5">1,5</option>
+                    <option value="double">double</option><option value="exact">exactement (pt)</option><option value="au_moins">au moins (pt)</option></select></label>
+                {(kind === "exact" || kind === "au_moins") &&
+                  <label className="lbl">Valeur (pt)<input className="field" style={{ width: 96 }} type="number" min={1} max={200} step={0.5} value={lsPt(r.interligne) ?? ""}
+                    onChange={(e) => setRule(i, { interligne: lsMake(kind, e.target.value ? Number(e.target.value) : undefined) })} /></label>}
+                <label className="lbl">Espace avant (pt)<input className="field" style={{ width: 96 }} type="number" min={0} max={200} step={0.5} value={r.espace_avant ?? ""} placeholder="d'origine"
+                  onChange={(e) => setRule(i, { espace_avant: e.target.value ? Number(e.target.value) : null })} /></label>
+                <label className="lbl">Espace après (pt)<input className="field" style={{ width: 96 }} type="number" min={0} max={200} step={0.5} value={r.espace_apres ?? ""} placeholder="d'origine"
+                  onChange={(e) => setRule(i, { espace_apres: e.target.value ? Number(e.target.value) : null })} /></label>
+              </div>
+              <div style={{ background: "#fff", color: "#0F172A", border: "1px solid var(--line)", borderRadius: 10, padding: "6px 12px", minHeight: 40,
+                fontFamily: r.police || undefined, fontSize: `${Math.min(r.taille || 11, 28) * 1.333}px`, fontWeight: r.gras ? 700 : 400, fontStyle: r.italique ? "italic" : "normal",
+                lineHeight: lsCss(r.interligne, r.taille || 11) }}>
+                <div style={{ paddingTop: (r.espace_avant || 0) * 1.333, paddingBottom: (r.espace_apres || 0) * 1.333 }}>
+                  {r.remplacer || <span className="muted small" style={{ fontFamily: "inherit" }}>(suppression : aucun texte de remplacement)</span>}
+                  {kind && <><br /><span className="muted" style={{ fontFamily: "inherit" }}>ligne suivante du même paragraphe</span></>}
+                </div>
               </div>
             </>}
           </div>
@@ -276,6 +311,7 @@ function Corrections({ enabled, rules, onEnabled, onRules }: {
           style={{ background: result.error ? "var(--red-soft, #FEE2E2)" : "#0F172A", color: result.error ? "#991B1B" : "#E2E8F0", borderRadius: 12, padding: "8px 12px", fontWeight: 500 }}>
           {result.error ? `⚠ ${result.error}` : result.text === undefined ? "…" : `Résultat (${result.count} remplacement(s)) : ${result.text}`}
         </div>
+        {!result.error && (result.avertissements || []).map((w, k) => <div key={k} className="small" style={{ color: "#92400E" }} data-testid="rules-warning">⚠ {w}</div>)}
       </div>
       <div className="muted small">Toute modification refait les aperçus à la consultation suivante. Une taille plus petite évite d'allonger l'en-tête.</div>
     </div>

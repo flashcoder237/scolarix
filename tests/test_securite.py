@@ -133,7 +133,7 @@ def test_remap_ne_confond_pas_normale_et_rattrapage(tmp_path):
 
 def test_garde_fou_word_persistant(tmp_path, data_dir, monkeypatch):
     """Un relevé introuvable sur le rendu reste bloqué aux appels suivants (pas seulement au premier)."""
-    from test_preview import FakeConverter, two_releves_docx
+    from test_preview import FakeConverter, two_releves_docx, word_jobs
     archives = tmp_path / "a"
     archives.mkdir()
     two_releves_docx(archives / "EM3_S1.docx")
@@ -161,7 +161,7 @@ def test_garde_fou_word_persistant(tmp_path, data_dir, monkeypatch):
 
 
 def test_apercu_refait_si_source_restauree_avec_date_ancienne(tmp_path, data_dir, monkeypatch):
-    from test_preview import FakeConverter, two_releves_docx
+    from test_preview import FakeConverter, two_releves_docx, word_jobs
     archives = tmp_path / "a"
     archives.mkdir()
     src = two_releves_docx(archives / "EM3_S1.docx")
@@ -172,14 +172,14 @@ def test_apercu_refait_si_source_restauree_avec_date_ancienne(tmp_path, data_dir
     preview.render_preview(str(src), "DOCX", s, conv)
     old = src.stat().st_mtime
     preview.render_preview(str(src), "DOCX", s, conv)
-    assert len(FakeConverter.calls) == 1                 # inchangé : réutilisé
+    assert word_jobs(FakeConverter.calls) == 1                 # inchangé : réutilisé
     from docx import Document
     d = Document(str(src))
     d.add_paragraph("CORRECTION")
     d.save(str(src))
     os.utime(src, (old - 3600, old - 3600))              # restauré avec une date PLUS ANCIENNE
     preview.render_preview(str(src), "DOCX", s, conv)
-    assert len(FakeConverter.calls) == 2                 # quand même refait
+    assert word_jobs(FakeConverter.calls) == 2                 # quand même refait
 
 
 def test_exclusion_sur_racine_resolue(tmp_path):

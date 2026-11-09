@@ -7,6 +7,11 @@ consultation :
 
     original .doc/.docx ──(.doc : Word → .docx)──> copie .docx ──(corrections de texte)──> PDF (cache)
 
+Fidélité (2.0.5) : quand une correction s'applique, Word rend AUSSI la copie sans correction (« original », gardée
+en cache : bouton « Aperçu : original » du guichet) et les deux rendus sont comparés (core/layout_check.py). Si la
+correction a déplacé quoi que ce soit d'autre que le texte remplacé, l'aperçu publié est l'original, et l'agent
+est averti (« Corrections non appliquées : mise en page à risque »). Sans correction applicable, un seul rendu.
+
 Le rendu de Word peut paginer légèrement autrement que l'estimation faite à l'indexation : les numéros
 de page de TOUS les relevés du fichier sont donc recalculés sur le PDF obtenu, en retrouvant chaque
 relevé par son matricule. Un relevé introuvable sur le PDF bloque l'aperçu (jamais la page d'un autre
@@ -38,7 +43,7 @@ from .database import Database, Releve
 from .extractors import WORD_TIMEOUT, ExtractionError, WordConverter, pdf_pages_text
 from .normalize import norm_matricule
 from .parsing import parse_pages
-from .text_rules import compile_rules, rewrite_docx, rules_digest
+from .text_rules import RewriteReport, compile_rules, rewrite_docx, rules_digest
 
 WORD_TYPES = ("DOC", "DOCX")
 
@@ -62,7 +67,7 @@ def preview_name(source: str, settings: Settings) -> str:
     return cache_name_for(source).replace(".pdf", f"_{digest}.pdf")
 
 
-ENGINE_VERSION = "4"   # à incrémenter quand le rendu ou les corrections changent : refait les aperçus
+ENGINE_VERSION = "5"   # à incrémenter quand le rendu ou les corrections changent : refait les aperçus
 
 
 def _signature(src: Path, extra: str = "") -> str:
@@ -104,11 +109,15 @@ def ensure_intermediate_docx(source: str, cache_dir: Path, converter: WordConver
     src = Path(source)
     inter = intermediate_docx(source, cache_dir)
     sig = _signature(src, "docx")
-    if _fresh(inter, sig):
+    # Word disponible : un .docx intermédiaire écrit par LibreOffice (indexation sur un poste sans Word, ou Word
+    # en échec ce jour-là) n'est jamais repris — sa mise en page peut différer de celle de Word.
+    word = bool(getattr(converter, "word_available", False))
+    if _fresh(inter, sig) and (not word or produced_by_word(inter)):
         return inter
     meta = inter.with_suffix(inter.suffix + ".sig")
     try:
-        legacy = inter.exists() and not meta.exists() and inter.stat().st_mtime >= src.stat().st_mtime
+        legacy = (inter.exists() and not meta.exists() and inter.stat().st_mtime >= src.stat().st_mtime
+                  and (not word or produced_by_word(inter)))
     except OSError:
         legacy = False
     if legacy:
@@ -122,8 +131,81 @@ def ensure_intermediate_docx(source: str, cache_dir: Path, converter: WordConver
     return inter
 
 
+def produced_by_word(docx: Path) -> bool:
+    """Le .docx a été écrit par Microsoft Word (docProps/app.xml, élément <Application>)."""
+    return "microsoft" in docx_producer(docx).lower()
+
+
+def docx_producer(docx: Path) -> str:
+    """Logiciel qui a écrit le .docx (« Microsoft Office Word », « LibreOffice/24.2… ») ; « » si inconnu."""
+    import re
+    import zipfile
+    try:
+        with zipfile.ZipFile(docx) as z:
+            xml = z.read("docProps/app.xml").decode("utf-8", "replace")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return ""
+    m = re.search(r"<(?:\w+:)?Application>([^<]*)</(?:\w+:)?Application>", xml)
+    return m.group(1).strip() if m else ""
+
+
+def original_name(source: str) -> str:
+    """PDF du document SANS correction (même nom que l'aperçu quand les corrections sont désactivées)."""
+    return cache_name_for(source).replace(".pdf", "_brut.pdf")
+
+
+def preview_meta(pdf: str | Path | None) -> dict:
+    """Ce qui a été fait pour produire cet aperçu : {"corrections": n, "repli": bool, "motif": str, …}."""
+    if not pdf:
+        return {}
+    try:
+        import json
+        return json.loads(Path(pdf).with_suffix(".json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_meta(dest: Path, meta: dict) -> None:
+    import json
+    try:
+        dest.with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def render_original(source: str, kind: str, settings: Settings, converter: WordConverter,
+                    work: Path | None = None) -> Path:
+    """PDF du document tel qu'il est, SANS aucune correction de texte (cache séparé, réutilisé)."""
+    cache_dir = settings.resolved_cache_dir()
+    dest = cache_dir / original_name(source)
+    src = Path(source)
+    sig = _signature(src, "brut")
+    if _fresh(dest, sig):
+        return dest
+    if not converter.available:
+        raise ExtractionError("Aperçu impossible : ni Microsoft Word ni LibreOffice n'est installé sur ce poste.")
+    if work is None:
+        work = ensure_intermediate_docx(source, cache_dir, converter) if kind == "DOC" else src
+    with tempfile.TemporaryDirectory(prefix="scolarix_orig_", ignore_cleanup_errors=True) as tmp:
+        copy = Path(tmp) / "releve.docx"
+        try:
+            rewrite_docx(work, copy, [])          # orthographe déclarée vérifiée seulement (export plus rapide)
+        except Exception:
+            shutil.copyfile(work, copy)
+        out = Path(tmp) / "rendu.pdf"
+        converter.convert(copy, out, "pdf", label=src.name)
+        part = dest.with_name(f"{dest.stem}.{os.getpid()}.{threading.get_ident()}.tmp.pdf")
+        shutil.copyfile(out, part)
+        _write_meta(dest, {"corrections": 0, "original": True})
+        _publish(part, dest, sig)
+    return dest
+
+
 def render_preview(source: str, kind: str, settings: Settings, converter: WordConverter) -> tuple[str, int]:
-    """Produit (ou réutilise) le PDF d'aperçu d'un fichier Word. Renvoie (nom dans le cache, nb de corrections)."""
+    """Produit (ou réutilise) le PDF d'aperçu d'un fichier Word. Renvoie (nom dans le cache, nb de corrections
+    réellement visibles : 0 si elles ont été écartées par le contrôle du rendu, -1 si l'aperçu était déjà prêt)."""
+    from . import layout_check
+
     cache_dir = settings.resolved_cache_dir()
     name = preview_name(source, settings)
     dest = cache_dir / name
@@ -135,19 +217,36 @@ def render_preview(source: str, kind: str, settings: Settings, converter: WordCo
         raise ExtractionError("Aperçu impossible : ni Microsoft Word ni LibreOffice n'est installé sur ce poste.")
     work = ensure_intermediate_docx(source, cache_dir, converter) if kind == "DOC" else src
     rules = compile_rules(settings.text_rules) if settings.text_rules_enabled else []
+    if not rules or name == original_name(source):  # sans règle active, l'aperçu EST le rendu d'origine
+        render_original(source, kind, settings, converter, work)
+        return original_name(source), 0
+    report = RewriteReport()
     with tempfile.TemporaryDirectory(prefix="scolarix_prev_", ignore_cleanup_errors=True) as tmp:
         copy = Path(tmp) / "releve.docx"
         try:
-            n = rewrite_docx(work, copy, rules)
+            n = rewrite_docx(work, copy, rules, report)
         except Exception as exc:  # .docx malformé
-            if rules:
-                raise ExtractionError(f"Corrections de texte impossibles sur ce fichier : {exc}") from exc
-            shutil.copyfile(work, copy)
-            n = 0
-        out = Path(tmp) / "rendu.pdf"
-        converter.convert(copy, out, "pdf", label=src.name)
+            raise ExtractionError(f"Corrections de texte impossibles sur ce fichier : {exc}") from exc
+        meta: dict = {"corrections": n, "ecartees": report.skipped[:10]}
+        if n == 0:
+            # aucune correction ne s'applique : l'aperçu est le rendu d'origine (une seule conversion)
+            out = render_original(source, kind, settings, converter, work)
+        else:
+            original = render_original(source, kind, settings, converter, work)
+            out = Path(tmp) / "rendu.pdf"
+            converter.convert(copy, out, "pdf", label=src.name)
+            try:
+                motif = layout_check.compare(original, out, report.replacements)
+            except Exception as exc:     # contrôle impossible : on ne prend pas le risque
+                motif = f"contrôle du rendu impossible ({exc.__class__.__name__})"
+            if motif:
+                _log.warning("%s : corrections non appliquées (mise en page à risque) : %s", src.name, motif)
+                meta.update(corrections=0, repli=True, motif=motif, prevues=n)
+                n = 0
+                out = original
         part = dest.with_name(f"{dest.stem}.{os.getpid()}.{threading.get_ident()}.tmp.pdf")
         shutil.copyfile(out, part)
+        _write_meta(dest, meta)
         _publish(part, dest, sig)
     return name, n
 
@@ -362,6 +461,27 @@ class PreviewService:
         if out is None:
             raise ExtractionError("Relevé supprimé de l'index pendant la préparation de l'aperçu.")
         return out
+
+    def original(self, rel: Releve) -> tuple[str, int, int]:
+        """Rendu SANS correction du fichier de ``rel`` (cache séparé) et pages du relevé sur ce rendu.
+        Renvoie (PDF, page de début, page de fin). Exécuté dans le fil Word (affinité COM)."""
+        if rel.type_fichier not in WORD_TYPES:
+            return rel.preview_pdf or rel.chemin, rel.numero_page, rel.page_fin
+
+        def job():
+            if self._converter is None:
+                self._converter = WordConverter(self.s)
+            pdf = render_original(rel.chemin, rel.type_fichier, self.s, self._converter)
+            mapping, _missing = remap_pages(pdf, self._wdb.releves_of_file(rel.fichier_id), rel.chemin)
+            return pdf, mapping
+        try:
+            pdf, mapping = self._pool.submit(job).result(timeout=self.job_timeout)
+        except FuturesTimeout as exc:
+            raise ExtractionError("Word ne répond plus : aperçu d'origine abandonné. Réessayer.") from exc
+        if rel.id not in mapping:
+            raise ExtractionError(f"Le relevé {rel.matricule} n'a pas été retrouvé dans le rendu d'origine.")
+        first, last = mapping[rel.id]
+        return str(pdf), first, last
 
     def ensure_many(self, rels: list[Releve], progress: ProgressFn | None = None,
                     cancelled: CancelFn | None = None) -> tuple[dict[int, Releve], dict[int, str]]:

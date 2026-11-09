@@ -49,6 +49,18 @@ class FakeConverter:
         pass
 
 
+def word_jobs(calls) -> int:
+    """Travaux Word par fichier : le rendu d'origine (contrôle de fidélité) suivi du rendu corrigé du même
+    fichier comptent pour UN travail."""
+    n, last = 0, None
+    for src, _fmt, label in calls:
+        kind = "orig" if "scolarix_orig_" in str(src) else "prev"
+        if not (last and last == (label, "orig") and kind == "prev"):
+            n += 1
+        last = (label, kind)
+    return n
+
+
 def two_releves_docx(path):
     """Deux relevés dans un même fichier Word (fichier collectif), séparés par un saut de page."""
     make_releve_docx(path, "98EM101", "PREMIER ETUDIANT")
@@ -101,7 +113,9 @@ def test_apercu_produit_a_la_demande_avec_corrections(word_index):
     other = db.search("98EM101")[0]
     assert not svc.needs_render(other)
     assert svc.ensure(other).preview_pdf == out.preview_pdf
-    assert len(FakeConverter.calls) == 1
+    # deux rendus pour tout le fichier : l'original (contrôle de fidélité, bouton « original ») et le corrigé
+    assert len(FakeConverter.calls) == 2
+    assert preview.preview_meta(out.preview_pdf)["corrections"] == 3
     svc.close()
 
 

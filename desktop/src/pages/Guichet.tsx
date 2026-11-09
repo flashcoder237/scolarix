@@ -6,6 +6,7 @@ import {
 import { useApp, useShortcuts } from "../state";
 import { Alert, Badge, Chip, Icon, Seg, Switch, dateFr, highlight, play, useDebounced, useDialogs, useToast } from "../components/ui";
 import { PdfView, forget } from "../components/PdfView";
+import { PreviewVariantToggle, useOriginalPreview, type PreviewVariant } from "../components/PreviewVariantToggle";
 import { DemandeDialog, STATUT_AIDE, STATUT_TONE } from "./DemandeDialog";
 import { CursusDialog } from "./CursusDialog";
 
@@ -275,6 +276,10 @@ export function Guichet() {
   const rel = detail && current && detail.releve.id === current.id ? detail.releve : current;
   const message = !current ? (query.trim() ? "Aucun résultat : voir les pistes à gauche." : null)
     : render === "en cours" ? "Préparation de l'aperçu Word…" : render === "échec" ? `Aperçu Word impossible : ${renderErr}` : null;
+  const shownDetail = detail && current && detail.releve.id === current.id ? detail : null;
+  const [variant, setVariant] = useState<PreviewVariant>("corrige");
+  useEffect(() => setVariant("corrige"), [current?.id]);
+  const apercu = useOriginalPreview(shownDetail?.apercu?.original_disponible ? shownDetail.releve.id : null, variant);
 
   return (
     <>
@@ -338,10 +343,13 @@ export function Guichet() {
               ))}
               {rel && rel.nb_pages === 1 && <span className="badge t-gray">Page {rel.numero_page}</span>}
               <span className="grow" />
+              <PreviewVariantToggle releveId={shownDetail?.releve.id} value={variant} onChange={setVariant} available={!!shownDetail?.apercu?.original_disponible} />
               <Switch checked={duplicata} onChange={setDuplicata} label="Duplicata" title="Timbre « Duplicata conforme » horodaté et journalisé · l'original reste intact" />
             </div>
-            <PdfView file={detail && current && detail.releve.id === current.id ? detail.preview_pdf : null} first={rel?.numero_page || 1}
-              last={rel?.page_fin || 1} version={`${rel?.id}-${version}`} message={message} stamp={duplicata} jumpTo={jump || undefined} />
+            <PdfView file={apercu.original?.file ?? (detail && current && detail.releve.id === current.id ? detail.preview_pdf : null)}
+              first={apercu.original?.first ?? (rel?.numero_page || 1)} last={apercu.original?.last ?? (rel?.page_fin || 1)}
+              version={`${rel?.id}-${version}${apercu.original ? "-o" : ""}`} message={apercu.message ?? message}
+              stamp={duplicata && !apercu.original} jumpTo={jump || undefined} />
           </div>
           <div className="card" style={{ flex: "none", flexDirection: "row", gap: 8, padding: app.compact ? "10px 12px" : 14 }}>
             <button className="btn primary grow" disabled={!current || !!busy} onClick={() => void doPrint()} data-testid="print">

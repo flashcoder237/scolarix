@@ -517,6 +517,11 @@ class WordConverter:
     def available(self) -> bool:
         return self._com_ok or bool(self._soffice)
 
+    @property
+    def word_available(self) -> bool:
+        """Microsoft Word (COM) est le convertisseur de ce poste (LibreOffice n'est alors qu'un secours)."""
+        return self._com_ok
+
     def warm(self) -> bool:
         """Démarre Word à l'avance (dans le fil qui fera les conversions) : le premier aperçu de la journée
         ne paie plus les secondes de lancement de Word. Sans effet sans Word."""
@@ -717,7 +722,10 @@ class WordConverter:
                 t0 = time.monotonic()
                 try:
                     if fmt == "docx":
-                        doc.SaveAs2(str(out), FileFormat=16, AddToRecentFiles=False)  # 16 = .docx
+                        # 16 = wdFormatXMLDocument (.docx). CompatibilityMode=0 : le mode de compatibilité du
+                        # document est CONSERVÉ (un .doc reste en mode Word 97-2003 : même mise en page) — c'est
+                        # la valeur par défaut documentée, écrite explicitement pour ne jamais en dépendre.
+                        doc.SaveAs2(str(out), FileFormat=16, AddToRecentFiles=False, CompatibilityMode=0)
                     else:
                         doc.ExportAsFixedFormat(OutputFileName=str(out), ExportFormat=17,  # 17 = PDF
                                                 OpenAfterExport=False, OptimizeFor=0, Range=0, Item=0,
