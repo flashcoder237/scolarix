@@ -90,11 +90,14 @@ class Engine:
         self.pool.submit(self._run, mid, method, fn, params)
 
     def _run(self, mid, method, fn, params) -> None:
+        from core.extractors import ExtractionError
+        from core.guard import PrintBlocked
         from core.service import ServiceError
         try:
             result = fn(**params) if isinstance(params, dict) else fn(*params)
             self.send({"id": mid, "result": result})
-        except ServiceError as exc:
+        except (ServiceError, ExtractionError, PrintBlocked) as exc:     # messages écrits pour l'agent
+            log.info("%s : %s", method, exc)
             self.send({"id": mid, "error": {"message": str(exc), "kind": "user"}})
         except Exception as exc:
             log.exception("échec de %s(%s)", method, _short(params))

@@ -76,6 +76,34 @@ build_windows.bat
 
 Le script lance les tests, produit `dist\Scolarix\Scolarix.exe`, puis l'installateur `Output\Scolarix_Setup_x.y.z.exe` si [Inno Setup 6](https://jrsoftware.org/isinfo.php) est installé. Tesseract est nécessaire **uniquement sur le poste qui indexe** ; Word ou LibreOffice sur le poste qui indexe des `.doc` **et** sur les postes qui affichent ou impriment des relevés Word (l'aperçu PDF est produit à la première consultation, puis gardé en cache).
 
+## Scolarix 2 (Electron) — l'interface ne se fige plus
+
+La version 2 remplace l'interface Qt par une interface **Electron + React** ; le moteur de lecture des
+relevés (Python, inchangé et testé) tourne dans un **processus séparé** :
+
+- l'interface ne fait jamais de travail lourd : elle reste réactive pendant un aperçu Word, une fusion de
+  cursus ou une indexation (mesuré par les tests : au pire quelques millisecondes de retard) ;
+- si le moteur plante ou ne répond plus pendant 20 s, il est **relancé automatiquement** ;
+- l'aperçu des relevés utilise **pdf.js**, lu en mémoire (aucun fichier tenu ouvert) ;
+- même dossier de données que la 1.x : index, réglages, demandes et registre sont repris sans réindexer ;
+- journal des incidents : `%APPDATA%\FMSP_Archives\logs` (`interface.log`, `moteur.log`,
+  `moteur_plantages.log`), accessible depuis Réglages ;
+- installateur : `Scolarix_Setup_2.x.exe` (raccourci « Scolarix 2 »), signé avec le certificat interne ;
+  il peut cohabiter avec la 1.x pendant la transition.
+
+Développement :
+
+```
+cd desktop
+npm ci
+npm start                                   # compile l'interface et lance Electron (moteur : python -m engine.server)
+python e2e/setup_data.py /tmp/e2e           # archives fictives indexées
+node e2e/run.mjs /tmp/e2e                   # 17 scénarios de bout en bout sur la vraie application
+```
+
+La CI Windows (`build-electron.yml`) compile le moteur (PyInstaller) et l'installateur (electron-builder),
+puis rejoue les scénarios sur l'application compilée, dans un dossier au nom accentué.
+
 ## Finitions de l'interface
 
 - **Polices embarquées** (licence SIL OFL, dans `assets/fonts`) : Inter pour le texte, Inter Display pour les
