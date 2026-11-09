@@ -27,6 +27,11 @@ from .extractors import PageText
 from .normalize import (FILIERES, MATRICULE_RE, filiere_code_from_matricule, find_matricules, niveau_number,
                         norm_text, roman_or_int, strip_accents)
 
+# Version de l'ANALYSE (découpage + lecture des champs). À augmenter à chaque changement des règles de
+# lecture : l'indexation différentielle relit alors les fichiers analysés par une version antérieure, même
+# inchangés (sinon seuls « Vider l'index » ou une indexation complète appliqueraient la correction).
+PARSER_VERSION = "2026.11-niveaux-1"
+
 
 def lab(word: str) -> str:
     """Libellé tolérant aux espaces parasites entre les lettres : NOM -> N\\s?O\\s?M."""
@@ -73,6 +78,12 @@ PATTERNS = {
     "niveau_ordinal": re.compile(r"\b(\d)\s*(?:e|è|ème|eme|i[eè]me)\s*ann[ée]e\b", re.I),
     "semestre": re.compile(lab("SEMESTRE") + r"\s*:\s*" + ROMAN_OR_INT, re.I),
     "master": re.compile(r"\bmaster\s*(\d)\b", re.I),
+    # « ÉTUDES MÉDICALES 4ème ANNÉE », « ETUDES MEDICALES : 4e année », « 5ème ANNÉE DES ÉTUDES MÉDICALES »
+    # (cherchés sur le texte normalisé : majuscules sans accents)
+    "etudes_medicales": re.compile(r"\bETUDES?\s+MEDICALES?\s*[,:(\-]*\s*(\d{1,2}|[IVX]{1,4})\s*"
+                                   r"(?:ERE|ER|EME|IEME|E)?\s*(?:ANNEE|ANNE)\b"),
+    "annee_medicale": re.compile(r"\b(\d)\s*(?:ERE|ER|EME|IEME|E)\s*ANNEE\s+(?:DE\s+|DES\s+|D\s+)?"
+                                 r"(?:ETUDES?\s+)?MED(?:ICALES?|ECINE)\b"),
     "annee_label": re.compile(r"ANN[ÉE]E\s*ACAD[ÉE]MIQUE\s*:?\s*((?:19|20)\d{2})\s*[-/–]\s*((?:19|20)?\d{2})\b", re.I),
     "annee": re.compile(r"\b((?:19|20)\d{2})\s*[-/–]\s*((?:19|20)\d{2})\b"),
     "session": re.compile(r"session\s*(?:de\s*)?(normale|ordinaire|rattrapage|de\s*rattrapage|sp[ée]ciale)", re.I),
@@ -134,6 +145,7 @@ class PathHints:
     session: str | None = None
     niveau: str | None = None
     semestre: int | None = None
+    annee_etudes: int | None = None   # « EM4 S1.docx » : 4e année d'études médicales (EP : pharmacie)
 
 
 def hints_from_path(path: str) -> PathHints:
@@ -156,6 +168,10 @@ def hints_from_path(path: str) -> PathHints:
     m = re.search(r"(?:^|[_\- ])(?:NIV(?:EAU)?|[NPB]|E[MP])\s*_?(\d)(?=[_\- .]|$)", name)
     if m:
         h.niveau = f"Niveau {m.group(1)}"
+    m = re.search(r"(?:^|[_\- ])(E[MP])\s*_?(\d)(?=[_\- .]|$)", name)
+    if m:
+        h.annee_etudes = int(m.group(2))
+        h.filiere_code = h.filiere_code or ("M" if m.group(1) == "EM" else "P")
     m = re.search(r"(?:^|[_\- ])(?:S|SEM)(\d{1,2})(?=[_\- .]|$)", name)
     if m:
         h.semestre = int(m.group(1))
@@ -437,6 +453,18 @@ def detect_statut(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def medical_year(text: str) -> int | None:
+    """Année d'études médicales écrite en toutes lettres : « ÉTUDES MÉDICALES 4ème ANNÉE » -> 4."""
+    zone = norm_text(text[:4000])
+    for pat in ("etudes_medicales", "annee_medicale"):
+        m = PATTERNS[pat].search(zone)
+        if m:
+            v = roman_or_int(m.group(1))
+            if v and 1 <= v <= 8:
+                return v
+    return None
+
+
 def detect_filiere(text: str, matricule: str, hints: PathHints) -> tuple[str, str]:
     for pat in ("filiere", "filiere_lache"):
         m = PATTERNS[pat].search(text)
@@ -446,16 +474,52 @@ def detect_filiere(text: str, matricule: str, hints: PathHints) -> tuple[str, st
             for kw, code in FILIERE_KEYWORDS:
                 if kw in val:
                     return code, FILIERES.get(code, raw)
-    if re.search(r"\bMASTER\s*\d", norm_text(text[:800])):
+    if medical_year(text):
+        return "M", FILIERES["M"]
+    mat_code = filiere_code_from_matricule(matricule)
+    # « MASTER 1 » dans l'en-tête : un vrai master, sauf si le matricule est celui d'un cursus long
+    # (Médecine, Pharmacie : « Master » n'y désigne que le cycle des 4e-5e années).
+    if mat_code not in LONG_CURSUS and re.search(r"\bMASTER\s*\d", norm_text(text[:800])):
         return "MS", FILIERES["MS"]
-    code = filiere_code_from_matricule(matricule) or hints.filiere_code or ""
+    code = mat_code or hints.filiere_code or ""
     return code, FILIERES.get(code, code or "")
 
 
-def detect_niveau(text: str, hints: PathHints, recap: dict | None) -> tuple[str | None, int | None]:
-    """(libellé « Niveau 2 » / « Master 1 », numéro de semestre)."""
+# Filières à cursus long (6 à 7 années) : les cycles LMD n'y sont que des étapes du même cursus.
+# Licence = années 1-3 (S1-S6), Master = années 4-5 (S7-S10), Doctorat = années 6-7 (S11-S14).
+LONG_CURSUS = {"M", "P"}
+CYCLE_START = {"LICENCE": 1, "MASTER": 4, "DOCTORAT": 6}
+
+
+def _semestre_absolu(sem: int, n: int, cycle: str) -> tuple[int, str | None]:
+    """Semestre du cursus pour l'année ``n`` : le relevé peut numéroter le semestre dans l'année
+    (« SEMESTRE: I » en 5e année = S9) ou dans le cycle (Master : « SEMESTRE: III » en 5e année = S9).
+    Renvoie (semestre, explication de la conversion ou None)."""
+    lo, hi = 2 * n - 1, 2 * n
+    if lo <= sem <= hi:
+        return sem, None
+    if sem <= 2 and n > 1:
+        return 2 * (n - 1) + sem, None            # semestre dans l'année
+    candidates = [cycle] if cycle in CYCLE_START else []
+    candidates += [c for c in ("MASTER", "DOCTORAT") if c not in candidates]
+    for c in candidates:                           # semestre dans le cycle (S1-S4 du Master…)
+        start = CYCLE_START[c]
+        if start > 1 and start <= n and sem <= 2 * (n - start + 1):
+            cand = 2 * (start - 1) + sem
+            if lo <= cand <= hi:
+                return cand, f"semestre {sem} du cycle {c.lower()} = S{cand} du cursus"
+    return sem, None
+
+
+def detect_niveau(text: str, hints: PathHints, recap: dict | None, filiere_code: str | None = None,
+                  notes: list[str] | None = None) -> tuple[str | None, int | None]:
+    """(libellé « Niveau 2 » / « Master 1 », numéro de semestre).
+
+    Médecine / Pharmacie (cursus long) : le niveau est TOUJOURS l'année d'études (« Niveau 4 »), jamais
+    « Master » : sur ces relevés « CYCLE: MASTER » ne désigne que le cycle des 4e-5e années. Le niveau
+    peut y être écrit dans le cycle (« Master 1 » = 4e année) et le semestre dans l'année ou dans le cycle."""
+    notes = notes if notes is not None else []
     sem = None
-    sem_from_hint = False  # noqa: F841 (conservé pour lisibilité)
     m = PATTERNS["semestre"].search(text)
     if m:
         sem = roman_or_int(m.group(1))
@@ -477,8 +541,10 @@ def detect_niveau(text: str, hints: PathHints, recap: dict | None) -> tuple[str 
                     break
     if sem is None and hints.semestre and not (recap and recap.get("annuel")):
         sem = hints.semestre
-    cycle = PATTERNS["cycle"].search(text)
-    is_master = bool(cycle and norm_text(cycle.group(1)).startswith("MASTER"))
+    cycle_m = PATTERNS["cycle"].search(text)
+    cycle = norm_text(cycle_m.group(1)) if cycle_m else ""
+    cycle = next((c for c in CYCLE_START if cycle.startswith(c)), cycle)
+    is_master = cycle == "MASTER"
     n = None
     m = PATTERNS["niveau"].search(text)
     if m:
@@ -491,6 +557,9 @@ def detect_niveau(text: str, hints: PathHints, recap: dict | None) -> tuple[str 
             if m:
                 n = int(m.group(1))
                 break
+    year = medical_year(text) or hints.annee_etudes
+    if filiere_code in LONG_CURSUS or year:
+        return _niveau_cursus_long(n, sem, cycle, year, text, hints, notes)
     if n is None:
         m = PATTERNS["master"].search(text[:1200])
         if m:
@@ -505,6 +574,34 @@ def detect_niveau(text: str, hints: PathHints, recap: dict | None) -> tuple[str 
         # « NIVEAU: VI SEMESTRE: I » ou fichier « EM3_S2 » : semestre DANS l'année -> semestre du cursus
         sem = 2 * (n - 1) + sem
     return (f"Master {n}" if is_master else f"Niveau {n}"), sem
+
+
+def _niveau_cursus_long(n: int | None, sem: int | None, cycle: str, year: int | None, text: str,
+                        hints: PathHints, notes: list[str]) -> tuple[str | None, int | None]:
+    if n is None:
+        m = PATTERNS["master"].search(text[:1200])
+        if m:                                   # « Master 1 » écrit seul : 1re année du cycle Master
+            n, cycle = int(m.group(1)), "MASTER"
+    start = CYCLE_START.get(cycle, 1)
+    if n is not None and start > 1 and n <= 2 and (year in (None, n + start - 1) or (sem or 0) > 2 * (start - 1)):
+        # « CYCLE: MASTER  NIVEAU: I » = 1re année du cycle Master = 4e année d'études (Doctorat : 6e)
+        notes.append(f"niveau {n} du cycle {cycle.lower()} = {n + start - 1}e année d'études")
+        n += start - 1
+    if n is None:
+        hint_n = re.search(r"(\d+)", hints.niveau or "")
+        n = year or (int(hint_n.group(1)) if hint_n and "MASTER" not in (hints.niveau or "").upper() else None)
+    elif year and year != n:
+        notes.append(f"niveau {n} lu sur le relevé, {year}e année d'après l'en-tête ou le nom du fichier")
+    if n is None:
+        if sem:
+            n = (sem + 1) // 2
+        else:
+            return None, sem
+    if sem:
+        sem, why = _semestre_absolu(sem, n, cycle)
+        if why:
+            notes.append(why)
+    return f"Niveau {n}", sem
 
 
 def detect_session(text: str, hints: PathHints) -> str | None:
@@ -578,7 +675,11 @@ def parse_block(block: Block, hints: PathHints) -> tuple[dict, list[str]]:
         warnings.append(f"{block.matricule} (page {block.page_debut}) : nom non détecté.")
     recap = extract_recap(text)
     code, filiere = detect_filiere(text, block.matricule, hints)
-    niveau, semestre = detect_niveau(text, hints, recap)
+    niveau_notes: list[str] = []
+    niveau, semestre = detect_niveau(text, hints, recap, code, niveau_notes)
+    for note in niveau_notes:
+        if "lu sur le relevé" in note:
+            warnings.append(f"{block.matricule} (page {block.page_debut}) : {note} — à vérifier.")
     am = PATTERNS["annee_label"].search(text) or PATTERNS["annee"].search(text)
     annee = hints.annee
     if am:
@@ -633,6 +734,11 @@ def parse_block(block: Block, hints: PathHints) -> tuple[dict, list[str]]:
     if semestre and not annuel and 0 < n < 100 and not (2 * n - 1 <= semestre <= 2 * n):
         warnings.append(f"{block.matricule} (page {block.page_debut}) : niveau {n} incohérent avec le semestre "
                         f"{semestre} — à vérifier.")
+    if statut in ("VALIDÉ", "ADMIS") and moyenne and re.fullmatch(r"0+(?:,0+)?", moyenne):
+        # « SEMESTRE VALIDE » avec 0,00 de moyenne : gabarit non rempli ou mauvaise case lue
+        warnings.append(f"{block.matricule} (page {block.page_debut}) : « {decision} » avec une moyenne de "
+                        f"{moyenne} — décision incohérente, à vérifier.")
+        statut = "À VÉRIFIER"
     if statut in ("VALIDÉ", "ADMIS") and recap and recap.get("credits") is not None \
             and recap["credits"] < (60 if annuel else 30):
         warnings.append(f"{block.matricule} (page {block.page_debut}) : « {decision} » avec {recap['credits']} crédits "
@@ -674,14 +780,38 @@ def parse_block(block: Block, hints: PathHints) -> tuple[dict, list[str]]:
         "page_fin": block.page_fin,
         "ocr_confiance": round(sum(block.ocr) / len(block.ocr), 1) if block.ocr else None,
         "extrait": re.sub(r"\s+", " ", text)[:400],
+        "empreinte": content_fingerprint(block.matricule, text),
     }, warnings
+
+
+_NOTE_RE = re.compile(r"(?<![\d,.])(\d{1,2})[,.](\d{2})(?![\d,.])")
+
+
+def content_fingerprint(matricule: str, text: str) -> str | None:
+    """Empreinte du CONTENU d'un relevé : l'ensemble (trié) de ses notes et moyennes à deux décimales.
+    Indépendante de la mise en page, de l'ordre de lecture et de l'en-tête : un relevé recopié d'une
+    compilation Word dans un fichier individuel, ou converti en PDF, garde la même empreinte ; une note
+    corrigée (« … UPDATE ») la change. Les MGP (« 2,7 », une décimale), les barèmes (« [18-20] ») et les
+    0,00 des gabarits vides n'y entrent pas. None si moins de 4 notes : trop peu pour conclure."""
+    vals = sorted(f"{int(a)}.{b}" for a, b in _NOTE_RE.findall(text) if int(a) <= 20 and not (int(a) == 0 and b == "00"))
+    if len(vals) < 4:
+        return None
+    import hashlib
+    return hashlib.sha1(f"{matricule}|{' '.join(vals)}".encode()).hexdigest()[:20]
 
 
 def parse_pages(pages: list[PageText], source_path: str) -> tuple[list[dict], list[str]]:
     hints = hints_from_path(source_path)
     blocks, warnings = split_blocks(pages)
     releves = []
+    # « ILLISIBLE-P42 » n'identifie personne : sans suffixe propre au fichier, les relevés illisibles de la
+    # page 42 de TOUS les fichiers partageraient ce « matricule » (même dossier au guichet, même cursus,
+    # proposés comme « autre matricule de la même personne »).
+    import hashlib
+    tag = hashlib.sha1(str(source_path).replace("\\", "/").casefold().encode()).hexdigest()[:4].upper()
     for b in blocks:
+        if b.matricule.startswith("ILLISIBLE-") and b.matricule.count("-") == 1:
+            b.matricule = f"{b.matricule}-{tag}"
         rel, w = parse_block(b, hints)
         releves.append(rel)
         warnings.extend(w)

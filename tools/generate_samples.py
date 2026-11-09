@@ -11,6 +11,12 @@ Contenu produit (données fictives) :
 - homonymes et quasi-homonymes : TCHOUA Marie-Claire, TCHOUWA Serge, KOUAME / KOUAM, N'DOUKOU ;
 - matricules écrits avec tirets ou slashs (18-M-203, 17/M/090) ;
 - un .doc corrompu, pour vérifier que l'indexation continue malgré l'erreur.
+
+``generate_medecine_em(root)`` (option ``--medecine-em``) produit à part le cas « études médicales »
+observé sur l'installation réelle, avec des données INVENTÉES : compilations Word « EM4 S1.docx »…
+(« ÉTUDES MÉDICALES 4ème ANNÉE », « CYCLE: MASTER », semestre écrit dans l'année ou dans le cycle),
+le même relevé extrait dans un fichier individuel et sa copie « … UPDATE », un nom aux espaces manquants
+et des en-têtes sans matricule lisible.
 """
 from __future__ import annotations
 
@@ -249,5 +255,73 @@ def generate(root: Path) -> None:
     print(f"{count} fichiers générés dans {root.resolve()}")
 
 
+# ---------------------------------------------------------------- études médicales (format récent)
+EM_ETUDIANTS = {   # tout est inventé
+    "19MM901": ("AURORE BELLE NGO ESSAMA", "14/02/2001"),
+    "19MM902": ("FICTIF PATRICE ONDOA", "03/09/2000"),
+    "19MM903": ("FICTIVE LINDA ABEGA", "27/06/2001"),
+}
+ROMAINS = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII", 8: "VIII", 9: "IX", 10: "X"}
+
+
+def em_releve(mat, annee_etudes, sem_ecrit, annee="2022 - 2023", nom=None, cycle="MASTER", matricule=True,
+              seed=None, moyenne=None):
+    """Lignes d'un relevé « ÉTUDES MÉDICALES » au format récent. ``sem_ecrit`` : le semestre tel qu'imprimé
+    (dans l'année : I/II, ou dans le cycle Master : III/IV pour la 5e année)."""
+    nom_reel, dob = EM_ETUDIANTS[mat]
+    seed = seed if seed is not None else int(mat[-3:]) * 7 + annee_etudes * 3 + sem_ecrit
+    vals = [10 + ((seed * 31 + i * 17) % 80) / 10 for i in range(6)]
+    moy = moyenne or f"{sum(vals) / len(vals):.2f}".replace(".", ",")
+    ues = ["CARDIOLOGIE", "PNEUMOLOGIE", "GASTRO-ENTEROLOGIE", "NEPHROLOGIE", "PEDIATRIE", "GYNECOLOGIE"]
+    lines = [f"ETUDES MEDICALES {annee_etudes}ème ANNEE",
+             "REPUBLIQUE DU CAMEROUN", "UNIVERSITE DE DOUALA", "FACULTE DE MEDECINE ET DES SCIENCES PHARMACEUTIQUES",
+             "RELEVE DE NOTES /TRANSCRIPT",
+             f"NOM ET PRENOM: {nom or nom_reel}" + (f" MATRICULE: {mat}" if matricule else " MATRICULE:"),
+             "surname and name: Registration N°:",
+             f"NÉ(E) LE : {dob} A : VILLE FICTIVE",
+             f"CYCLE: {cycle} ANNÉE ACADÉMIQUE: {annee} FILIÈRE: MEDECINE",
+             f"NIVEAU: {ROMAINS[annee_etudes]} SEMESTRE: {ROMAINS[sem_ecrit]}",
+             "CODE UNITE D’ENSEIGNEMENT ELEMENT CONSTITUTIF NOTE/20 MOYENNE CREDIT"]
+    for i, (ue, v) in enumerate(zip(ues, vals)):
+        lines.append(f"UE M{annee_etudes}{sem_ecrit}{i} {ue} {ue} {v:.2f} {v:.2f} 5".replace(".", ","))
+    lines += ["RELEVE NIVEAU SEMESTRE TOTAL CREDIT / 30 MOYENNE SEMESTRIELLE / 20 MGP GRADE DECISION DU JURY",
+              f"{annee_etudes} {sem_ecrit} 30 {moy} 2,7 B- SEMESTRE VALIDE",
+              "Grade Note/4 Appréciation Moy /20", "A + 4.0 Excellent [18-20]"]
+    return lines
+
+
+def generate_medecine_em(root: Path) -> dict:
+    """Le cas réel reproduit avec des données inventées. Renvoie {nom logique: chemin}."""
+    base = root / "DOCUMENTS ACADEMIQUE FMSP 2022-" / "RN NON TRAITES"
+    f = {
+        "em4s1": base / "EM4 S1.docx", "em4s2": base / "EM4 S2.docx",
+        "em5s1": base / "EM5 S1.docx", "em5s2": base / "EM5 S2.docx",
+        "indiv": base / "Relevé em10901.docx", "update": base / "Relevé em10901 UPDATE.docx",
+        "autre": root / "AUTRES" / "Compilation fictive.docx",
+    }
+    # Compilations de promotion (le relevé de 19MM901 est au milieu)
+    write_docx(f["em4s1"], [em_releve("19MM902", 4, 1), em_releve("19MM901", 4, 1), em_releve("19MM903", 4, 1)])
+    write_docx(f["em4s2"], [em_releve("19MM903", 4, 2), em_releve("19MM901", 4, 2), em_releve("19MM902", 4, 2)])
+    # 5e année : semestre numéroté dans le cycle Master (III, IV) ; niveau écrit « I/II » du cycle sur EM5 S2
+    write_docx(f["em5s1"], [em_releve("19MM901", 5, 3), em_releve("19MM902", 5, 3)])
+    em5s2 = em_releve("19MM901", 5, 4)
+    write_docx(f["em5s2"], [em_releve("19MM902", 5, 4), em5s2,
+                            # en-tête sans matricule lisible, même personne (nom collé)
+                            em_releve("19MM901", 5, 4, nom="AURORE BELLENGO ESSAMA", matricule=False, seed=77)])
+    # Le même relevé extrait dans un fichier individuel (nom aux espaces manquants), puis sa copie « UPDATE »
+    indiv = [em_releve("19MM901", 4, 1, nom="AURORE BELLENGO ESSAMA"), em_releve("19MM901", 4, 2)]
+    write_docx(f["indiv"], indiv)
+    write_docx(f["update"], indiv)
+    # Ailleurs : un AUTRE étudiant dont le matricule est illisible à la même page (ne doit jamais être mêlé)
+    write_docx(f["autre"], [em_releve("19MM902", 4, 1, annee="2021 - 2022", seed=5),
+                            em_releve("19MM903", 4, 1, matricule=False, seed=9),
+                            em_releve("19MM903", 4, 2, matricule=False, seed=11)])
+    return f
+
+
 if __name__ == "__main__":
-    generate(Path(sys.argv[1] if len(sys.argv) > 1 else "archives_demo"))
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    dest = Path(args[0] if args else "archives_demo")
+    generate(dest)
+    if "--medecine-em" in sys.argv:
+        generate_medecine_em(dest)

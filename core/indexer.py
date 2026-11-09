@@ -16,7 +16,10 @@ Vitesse (10 000 fichiers et plus) :
   Le PDF d'aperçu est produit plus tard, à la première consultation (voir ``core/preview.py``).
 * **Exploration rapide** : ``os.scandir`` (taille et date fournies par le listage du dossier,
   sans appel supplémentaire sur un partage réseau) et élagage des sous-dossiers exclus.
-* **Différentiel** : les fichiers inchangés (même taille, même date) sont ignorés.
+* **Différentiel** : les fichiers inchangés (même taille, même date) sont ignorés — SAUF s'ils ont été
+  analysés par une version antérieure des règles de lecture (``PARSER_VERSION``) : ils sont alors relus,
+  pour qu'une correction de l'analyse (niveaux, doublons…) s'applique sans « Vider l'index ». Les relevés
+  d'un fichier inchangé relu gardent leur identifiant (demandes en cours et journal intacts).
 
 Utilisable aussi en ligne de commande :
     python main.py --index --source "\\\\SRV-FMSP\\Archives" [--only-new] [--no-ocr]
@@ -43,7 +46,7 @@ from .config import Settings, load_settings
 from .database import Database
 from .extractors import (MIN_TEXT_CHARS, ExtractionError, PageText, WordConverter, configure_tesseract,
                          detect_type, docx_pages_text, kill_orphan_words, ocr_pdf_pages, pdf_pages_text)
-from .parsing import parse_pages
+from .parsing import PARSER_VERSION, parse_pages
 from .preview import cache_name_for, intermediate_docx, render_preview
 
 EXTENSIONS = {".pdf", ".doc", ".docx"}
@@ -58,6 +61,7 @@ class Counters:
     blocs: int = 0
     ecrits: int = 0
     ignores: int = 0
+    relus: int = 0        # fichiers inchangés relus parce que l'analyse a changé de version
     exclus: int = 0
     echecs: int = 0
     illisibles: list = field(default_factory=list)
@@ -387,7 +391,8 @@ class Indexer:
         for attempt in range(5):     # base occupée par le guichet : on patiente plutôt que d'arrêter l'indexation
             try:
                 self.db.store_result(res.chemin, res.type_fichier, res.taille, res.mtime, res.nb_pages,
-                                     res.cache_pdf, res.statut, res.message, res.releves, res.anomalies)
+                                     res.cache_pdf, res.statut, res.message, res.releves, res.anomalies,
+                                     version=PARSER_VERSION)
                 break
             except sqlite3.OperationalError:
                 if attempt == 4:
@@ -421,13 +426,19 @@ class Indexer:
             self.emit({"type": "warning", "message": msg})
             self.db.add_anomaly("AVERTISSEMENT", str(root), msg, "Vérifier l'accès réseau")
         if only_new:
-            known = {_path_key(k): v for k, v in self.db.file_signatures().items()}
+            known = {_path_key(k): v for k, v in self.db.file_signatures(with_version=True).items()}
             for f in files:
                 state = known.get(_path_key(f.path))
                 if state is not None and state[0] == f.taille and abs((state[1] or 0) - f.mtime) < 1:
-                    self.counters.ignores += 1   # inchangé depuis la dernière passe (même en erreur)
-                else:
-                    todo.append(f)
+                    if state[2] == PARSER_VERSION:
+                        self.counters.ignores += 1   # inchangé depuis la dernière passe (même en erreur)
+                        continue
+                    self.counters.relus += 1         # inchangé, mais lu par une version antérieure de l'analyse
+                todo.append(f)
+            if self.counters.relus:
+                self.emit({"type": "warning", "message": f"{self.counters.relus} fichier(s) inchangé(s) relu(s) : "
+                                                         f"les règles de lecture ont été mises à jour "
+                                                         f"({PARSER_VERSION})."})
         else:
             todo = files
 
