@@ -250,11 +250,41 @@ class PreviewService:
     def _key(self, rel: Releve) -> str:
         return f"{rel.fichier_id}:{preview_name(rel.chemin, self.s)}"
 
-    def _submit(self, rel: Releve, interactive: bool) -> _Job:
+    def warm_up(self) -> None:
+        """Lance Word à l'avance dans le fil des conversions (au démarrage du moteur), sans rien attendre."""
+        def _warm():
+            if self._converter is None:
+                self._converter = WordConverter(self.s)
+            warm = getattr(self._converter, "warm", None)
+            if warm:
+                warm()
+        try:
+            self._pool.submit(_warm)
+        except RuntimeError:          # moteur en cours d'arrêt
+            pass
+
+    def prefetch(self, rels: list[Releve], limit: int = 12) -> int:
+        """Prépare en arrière-plan les aperçus des autres fichiers Word de l'étudiant affiché : le cursus ou la
+        demande qui suit est alors immédiat. Ces travaux cèdent la place : un nouvel aperçu demandé au guichet
+        annule ceux qui n'ont pas commencé (au pire, un fichier déjà commencé se termine). Renvoie le nombre
+        de fichiers mis en file."""
+        n, seen = 0, set()
+        for rel in rels:
+            key = self._key(rel)
+            if key in seen or not self.needs_render(rel):
+                continue
+            seen.add(key)
+            self._submit(rel, interactive=True, supersede=False)
+            n += 1
+            if n >= limit:
+                break
+        return n
+
+    def _submit(self, rel: Releve, interactive: bool, supersede: bool = True) -> _Job:
         """Travail du fichier de ``rel`` : celui déjà en file / en cours s'il existe, sinon un nouveau."""
         key = self._key(rel)
         with self._lock:
-            if interactive:
+            if interactive and supersede:
                 # l'agent est passé à une autre ligne : les aperçus du guichet encore en attente sont abandonnés
                 for other in list(self._jobs.values()):
                     if (other.key != key and other.interactive_only and other.started is None

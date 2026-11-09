@@ -302,3 +302,60 @@ def test_cursus_partage_le_travail_d_un_apercu_en_cours(fonds, monkeypatch):
     th.join(20)
     assert out and out["missing"] == []
     assert len(FakeConverter.calls) == 3               # chaque fichier une seule fois, guichet et cursus confondus
+
+
+def _wait_idle(svc, timeout=20):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        with svc._lock:
+            if not svc._jobs:
+                return
+        time.sleep(0.05)
+    raise AssertionError("travaux Word toujours en file")
+
+
+def test_apercu_prepare_d_avance_les_autres_fichiers_de_l_etudiant(fonds):
+    """Après l'aperçu d'un relevé, les autres fichiers Word du même étudiant sont convertis en arrière-plan :
+    le cursus qui suit ne convertit plus rien (aucune attente au guichet)."""
+    service, svc, db, _events = fonds
+    rels = db.cursus(MAT)
+    first = next(r for r in rels if "EM4" in r.chemin)
+    service.preview(first.id)
+    _wait_idle(svc)
+    converted = {c[2] for c in FakeConverter.calls}
+    assert converted == {"EM1 compil.docx", "EM4 S1.docx", "EM5 S1.docx"}
+    FakeConverter.calls = []
+    out = service.cursus_build(MAT, [r.id for r in rels], cover=False, duplicata=False)
+    assert FakeConverter.calls == [] and out["pages"] >= len(rels)
+
+
+def test_preparation_d_avance_cede_la_place_a_l_agent(fonds, monkeypatch):
+    """Les préparations anticipées encore en attente sont abandonnées dès que l'agent ouvre un autre aperçu."""
+    service, svc, db, _events = fonds
+    gate = threading.Event()
+    real = FakeConverter.convert
+
+    def slow(self, src, dest, fmt="pdf", label=None):
+        gate.wait(5)
+        return real(self, src, dest, fmt, label)
+
+    monkeypatch.setattr(FakeConverter, "convert", slow)
+    rels = db.cursus(MAT)
+    em4 = next(r for r in rels if "EM4" in r.chemin)
+    others = [r for r in rels if r.fichier_id != em4.fichier_id]
+    assert svc.prefetch(others) == 2
+    t = threading.Thread(target=lambda: svc.ensure(em4, interactive=True))
+    t.start()
+    time.sleep(0.2)
+    gate.set()
+    t.join(10)
+    _wait_idle(svc)
+    names = [c[2] for c in FakeConverter.calls]
+    assert "EM4 S1.docx" in names and len(names) <= 2     # au plus le fichier anticipé déjà commencé
+
+
+def test_word_demarre_a_l_avance_sans_word_ne_fait_rien(fonds):
+    _service, svc, _db, _events = fonds
+    svc.warm_up()
+    _wait_idle(svc)
+    assert not WordConverter(svc.s).warm()          # pas de Word sous Linux : aucun effet, aucune erreur

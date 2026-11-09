@@ -334,18 +334,53 @@ def _replace_in_paragraph(paragraph, rules: list[CompiledRule]) -> int:
     return count
 
 
+def quiet_proofing(settings_xml: bytes) -> bytes:
+    """Copie de travail uniquement : l'orthographe et la grammaire sont déclarées déjà vérifiées et masquées.
+    Sans cela, Word relance à l'ouverture la vérification de TOUT le document (lent sur une compilation de
+    40 pages en français) alors qu'il ne s'agit que d'exporter un PDF. L'original n'est jamais modifié."""
+    from lxml import etree
+
+    try:
+        root = etree.fromstring(settings_xml)
+    except etree.XMLSyntaxError:
+        return settings_xml
+    for tag in ("proofState", "hideSpellingErrors", "hideGrammaticalErrors"):
+        for old in root.findall(W + tag):
+            root.remove(old)
+    # ordre du schéma (CT_Settings) : ces éléments suivent writeProtection/view/zoom/removePersonalInformation…
+    anchor = 0
+    for i, child in enumerate(root):
+        if etree.QName(child).localname in ("writeProtection", "view", "zoom", "removePersonalInformation",
+                                            "removeDateAndTime", "doNotDisplayPageBoundaries",
+                                            "displayBackgroundShape", "printPostScriptOverText",
+                                            "printFractionalCharacterWidth", "printFormsData", "embedTrueTypeFonts",
+                                            "embedSystemFonts", "saveSubsetFonts", "saveFormsData", "mirrorMargins",
+                                            "alignBordersAndEdges", "bordersDoNotSurroundHeader",
+                                            "bordersDoNotSurroundFooter", "gutterAtTop"):
+            anchor = i + 1
+    root.insert(anchor, etree.Element(W + "hideSpellingErrors"))
+    root.insert(anchor + 1, etree.Element(W + "hideGrammaticalErrors"))
+    pos = anchor + 2
+    while pos < len(root) and etree.QName(root[pos]).localname == "activeWritingStyle":
+        pos += 1                                  # proofState vient après activeWritingStyle
+    proof = etree.Element(W + "proofState")
+    proof.set(W + "spelling", "clean")
+    proof.set(W + "grammar", "clean")
+    root.insert(pos, proof)
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
 def rewrite_docx(src: Path, dest: Path, rules: list[CompiledRule]) -> int:
     """Copie ``src`` vers ``dest`` en appliquant les règles. Renvoie le nombre de remplacements."""
     from lxml import etree
 
-    if not rules:
-        shutil.copyfile(src, dest)
-        return 0
     total = 0
     with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             data = zin.read(item.filename)
-            if _PARTS.match(item.filename):
+            if item.filename == "word/settings.xml":
+                data = quiet_proofing(data)
+            if rules and _PARTS.match(item.filename):
                 try:
                     root = etree.fromstring(data)
                 except etree.XMLSyntaxError:

@@ -101,6 +101,7 @@ export interface Settings {
   ui_scale: number;
   delivery_ref_stamp: boolean;
   docx_convert_at_index: boolean;
+  prefetch_student_previews?: boolean;
   ocr_preprocess: boolean;
   word_com_enabled: boolean;
   tesseract_cmd: string;

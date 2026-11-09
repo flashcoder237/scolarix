@@ -62,6 +62,9 @@ class Engine:
         self.data_dir = data_dir()
         self.methods = self._methods()
         threading.Thread(target=self._housekeeping, name="menage", daemon=True).start()
+        # Word lancé à l'avance (quelques secondes après le démarrage, pour ne pas ralentir l'ouverture) :
+        # le premier aperçu Word de la journée ne paie plus son lancement.
+        threading.Timer(4.0, self.previews.warm_up).start()
 
     def _housekeeping(self) -> None:
         """Au démarrage, comme la 1.x : PDF temporaires d'une session interrompue, instances de Word orphelines,

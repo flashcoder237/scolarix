@@ -129,7 +129,12 @@ def test_docx_sans_regle_copie_identique(tmp_path):
     src = make_releve_docx(tmp_path / "r.docx")
     out = tmp_path / "o.docx"
     assert rewrite_docx(src, out, []) == 0
-    assert out.read_bytes() == src.read_bytes()
+    # contenu identique ; seul word/settings.xml change (vérification orthographique déclarée faite)
+    zi, zo = zipfile.ZipFile(src), zipfile.ZipFile(out)
+    assert zi.namelist() == zo.namelist()
+    for n in zi.namelist():
+        if n != "word/settings.xml":
+            assert zi.read(n) == zo.read(n), n
 
 
 def test_regles_par_defaut_dans_la_configuration():
@@ -224,3 +229,21 @@ def test_anciennes_regles_enregistrees_mises_a_niveau(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "config_path", lambda: cfg)
     s = config.load_settings()
     assert s.text_rules[1]["sauf_si"] == DEFAULT_TEXT_RULES[1]["sauf_si"]
+
+
+def test_copie_de_travail_sans_verification_orthographique(tmp_path):
+    """La copie envoyée à Word déclare l'orthographe et la grammaire déjà vérifiées (export plus rapide) ;
+    le document reste lisible et l'original intact."""
+    import zipfile
+    from core.text_rules import rewrite_docx
+    src = tmp_path / "releve.docx"
+    make_releve_docx(src, "99XX001", "ETUDIANT FICTIF")
+    before = src.read_bytes()
+    for rules in ([], compile_rules(DEFAULT_TEXT_RULES)):
+        out = tmp_path / f"copie{len(rules)}.docx"
+        rewrite_docx(src, out, rules)
+        xml = zipfile.ZipFile(out).read("word/settings.xml").decode()
+        assert 'w:proofState w:spelling="clean" w:grammar="clean"' in xml
+        assert "<w:hideSpellingErrors/>" in xml and "<w:hideGrammaticalErrors/>" in xml
+        assert Document(str(out)).paragraphs                  # toujours un .docx valide
+    assert src.read_bytes() == before

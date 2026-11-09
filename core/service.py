@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import logging
 import threading
 import time
 from datetime import datetime
@@ -23,6 +24,8 @@ from .extractors import ExtractionError
 from .guard import PrintBlocked, VisualCheckRequired, check_before_print
 from .normalize import best_display_name, looks_like_matricule, norm_matricule, norm_text
 from .text_rules import RuleError, apply_text, compile_rules
+
+_log = logging.getLogger("scolarix.service")
 
 RELEVE_PROPS = ("nb_pages", "pages_label", "preview_pdf", "is_success", "periode", "sem_label", "annuel", "is_word",
                 "decision_deduite", "date_connue")
@@ -264,7 +267,21 @@ class Service:
             rel = self.previews.ensure(rel, interactive=True)   # remplace l'aperçu précédent encore en attente
         if not rel.preview_pdf or not Path(rel.preview_pdf).exists():
             raise ServiceError("Aperçu indisponible : fichier source introuvable ou conversion impossible.")
+        self._prefetch_student(rel)
         return self.releve(rel.id)
+
+    def _prefetch_student(self, rel: Releve) -> None:
+        """Après l'aperçu demandé : les autres fichiers Word du même étudiant sont préparés en arrière-plan
+        (réglage « prefetch_student_previews »), pour que « Cursus » ou « Ajouter à la demande » soient immédiats."""
+        if self.previews is None or not getattr(self.s, "prefetch_student_previews", True) or not rel.matricule:
+            return
+        try:
+            others = [r for r in self.db.cursus(rel.matricule) if r.is_word and r.fichier_id != rel.fichier_id]
+            n = self.previews.prefetch(others)
+            if n:
+                _log.info("aperçus préparés en arrière-plan : %d fichier(s) Word du même étudiant", n)
+        except Exception as exc:     # jamais bloquant : ce n'est qu'une anticipation
+            _log.warning("préparation anticipée impossible : %s", exc)
 
     # ------------------------------------------------------------------ contrôle, impression, export
     def check(self, releve_id: int, visually_checked: bool = False) -> dict:
@@ -697,7 +714,7 @@ class Service:
     PUBLIC = ("operateur", "poste", "source_root", "exports_root", "exports_retention_days", "printer_name",
               "print_command", "duplex", "fuzzy_threshold", "max_results", "ocr_enabled", "differential",
               "index_workers", "exclusions", "text_rules_enabled", "text_rules", "ui_sounds", "ui_animations",
-              "ui_scale", "delivery_ref_stamp", "docx_convert_at_index", "ocr_preprocess", "word_com_enabled",
+              "ui_scale", "delivery_ref_stamp", "docx_convert_at_index", "prefetch_student_previews", "ocr_preprocess", "word_com_enabled",
               "tesseract_cmd", "soffice_cmd", "db_path", "cache_dir")
 
     def settings_get(self) -> dict:

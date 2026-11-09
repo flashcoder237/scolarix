@@ -102,6 +102,7 @@ export function SettingsDialog() {
             <Switch blue checked={v.word_com_enabled} onChange={(x) => set("word_com_enabled", x)} label="Passerelle COM Word (.doc 97-2003)" />
             <Switch blue checked={v.differential} onChange={(x) => set("differential", x)} label="Indexation différentielle" />
             <Switch blue checked={v.docx_convert_at_index} onChange={(x) => set("docx_convert_at_index", x)} label="Produire les aperçus Word pendant l'indexation" />
+            <Switch blue checked={v.prefetch_student_previews !== false} onChange={(x) => set("prefetch_student_previews", x)} label="Préparer d'avance les autres relevés Word de l'étudiant affiché (cursus et demandes immédiats)" />
           </div>
           <div className="muted small">{app.info?.cpu_count || "?"} cœurs détectés. Chaque processus lit ses fichiers et, pour les .doc, pilote sa propre instance de Word : au-delà de 4, le gain est faible et la mémoire augmente. Sur un partage réseau lent, 2 à 3 processus suffisent souvent.</div>
         </>}

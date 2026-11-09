@@ -71,6 +71,7 @@ class Settings:
     ocr_lang: str = "fra"
     word_com_enabled: bool = True
     preview_cache_enabled: bool = True     # aperçu PDF des fichiers Word (produit à la première consultation)
+    prefetch_student_previews: bool = True   # aperçus Word des autres fichiers de l'étudiant préparés d'avance
     docx_convert_at_index: bool = False    # préconvertir les .docx pendant l'indexation (aperçu immédiat, très lent)
     differential: bool = True
     index_workers: int = 0

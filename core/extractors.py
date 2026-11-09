@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -502,6 +503,7 @@ class WordConverter:
         self._word = None
         self._owner: int | None = None         # fil qui a créé l'objet Word (affinité COM)
         self._timed_out = False
+        self.last_phases: dict = {}
         self.timeout = float(timeout or getattr(settings, "word_timeout", 0) or WORD_TIMEOUT)
         self._com_ok = settings.word_com_enabled and platform.system() == "Windows"
         self._soffice = settings.soffice_cmd or shutil.which("soffice") or shutil.which("libreoffice")
@@ -514,6 +516,22 @@ class WordConverter:
     @property
     def available(self) -> bool:
         return self._com_ok or bool(self._soffice)
+
+    def warm(self) -> bool:
+        """Démarre Word à l'avance (dans le fil qui fera les conversions) : le premier aperçu de la journée
+        ne paie plus les secondes de lancement de Word. Sans effet sans Word."""
+        if not self._com_ok:
+            return False
+        try:
+            t0 = time.monotonic()
+            cold = self._word is None
+            self._word_app()
+            if cold:
+                _log.info("Word démarré à l'avance en %.1f s", time.monotonic() - t0)
+            return True
+        except Exception as exc:
+            _log.warning("démarrage anticipé de Word impossible : %s", exc)
+            return False
 
     def backend(self) -> str:
         if self._com_ok:
@@ -612,7 +630,11 @@ class WordConverter:
             _log.warning("conversion %s -> %s : ÉCHEC après %.1f s : %s", name, fmt.upper(),
                          time.monotonic() - t0, describe_error(exc))
             raise
-        _log.info("conversion %s -> %s : terminée en %.1f s", name, fmt.upper(), time.monotonic() - t0)
+        detail = " · ".join(f"{k} {v:.1f} s" if isinstance(v, float) else f"{k} {v}"
+                            for k, v in (getattr(self, "last_phases", None) or {}).items())
+        _log.info("conversion %s -> %s : terminée en %.1f s%s", name, fmt.upper(), time.monotonic() - t0,
+                  f" ({detail})" if detail else "")
+        self.last_phases = {}
 
     def _convert(self, src: Path, dest: Path, fmt: str) -> None:
         errors = []
@@ -658,12 +680,16 @@ class WordConverter:
                 raise ExtractionError(f"Lecture du fichier impossible (verrouillé ou déplacé ?) : {exc}") from exc
             out = Path(tmp) / f"sortie.{fmt}"
             self._timed_out = False
+            t_launch = time.monotonic()
+            cold = self._word is None
             word = self._word_app()
+            phases = {"lancement Word": time.monotonic() - t_launch} if cold else {}
             watchdog = threading.Timer(self.timeout, self._on_timeout)
             watchdog.daemon = True
             watchdog.start()
             doc = None
             try:
+                t0 = time.monotonic()
                 try:
                     # Mots de passe factices : un document protégé lève une erreur au lieu d'ouvrir une boîte de dialogue.
                     doc = word.Documents.Open(str(work), ConfirmConversions=False, ReadOnly=True,
@@ -680,6 +706,15 @@ class WordConverter:
                     if "password" in text or "mot de passe" in text:
                         raise ExtractionError("Fichier protégé par mot de passe : ignoré, indexation poursuivie.") from exc
                     raise ExtractionError(f"Word ne peut pas ouvrir le fichier (endommagé ?) : {exc}") from exc
+                phases["ouverture"] = time.monotonic() - t0
+                # Réglages du SEUL document ouvert (jamais enregistré) : pas de vérification orthographique ni
+                # grammaticale en arrière-plan pendant l'export (la copie les déclare déjà faites, cf. text_rules).
+                for prop in ("ShowSpellingErrors", "ShowGrammaticalErrors"):
+                    try:
+                        setattr(doc, prop, False)
+                    except Exception:
+                        pass
+                t0 = time.monotonic()
                 try:
                     if fmt == "docx":
                         doc.SaveAs2(str(out), FileFormat=16, AddToRecentFiles=False)  # 16 = .docx
@@ -695,6 +730,8 @@ class WordConverter:
                     if _rpc_dead(exc):
                         raise WordDied(str(exc)) from exc
                     raise
+                phases["export " + fmt.upper()] = time.monotonic() - t0
+                self.last_phases = phases
             finally:
                 watchdog.cancel()
                 if doc is not None and not self._timed_out:
