@@ -24,7 +24,10 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="scolarix-engine",
-    console=True,          # entrée/sortie standard fiables ; lancé caché par Electron (windowsHide)
+    # Sans console, comme la 1.x : lancé caché par Electron, un moteur « console » n'a pas de console et ses
+    # processus de lecture parallèles tentent chacun d'en créer une (blocage constaté sous Windows).
+    # Les tubes d'entrée/sortie fournis par Electron fonctionnent sans console.
+    console=False,
     upx=False,
     icon=os.path.join(ROOT, "assets", "scolarix.ico"),
     version=os.path.join(ROOT, "installer", "version_info_engine.txt"),

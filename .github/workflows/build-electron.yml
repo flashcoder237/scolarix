@@ -72,6 +72,16 @@ jobs:
             if (-not (Select-String -Path $out -Pattern '"type": "done"' -Quiet)) { exit 1 }
           }
 
+      - name: Moteur piloté comme par Electron (tubes, sans console, dossier accentué, réindexation complète)
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "Moteur É2E"
+          python desktop\e2e\setup_data.py "$work" | Out-Null
+          python tools\ci_engine_index.py dist\scolarix-engine\scolarix-engine.exe "$work"
+          $code = $LASTEXITCODE
+          Get-Content (Join-Path $work "data\logs\indexation.log") -Tail 30 -ErrorAction SilentlyContinue
+          if ($code -ne 0) { exit 1 }
+
       - name: Interface (dépendances, types, compilation)
         working-directory: desktop
         run: |
