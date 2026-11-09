@@ -217,3 +217,24 @@ def test_vider_l_index_conserve_la_tracabilite(indexed, tmp_path):
         assert not (tmp_path / "cache" / "apercu.pdf").exists()
     finally:
         c.close()
+
+
+def test_remplacements_essai_origine_et_controle(engine):
+    """Réglages › Remplacements (Word) : essai en direct, règles d'origine, règle invalide refusée à l'enregistrement."""
+    origine = engine.call("rules_defaults")
+    assert len(origine) == 3 and any("Ref N°" in r["remplacer"] for r in origine)
+    sample = "Tel  : 33 01 41 39  / 33 01 41 29.  RELEVE DE NOTES /TRANSCRIPT   FMSP/VDAAP/VDSSSE/SSSE"
+    res = engine.call("rules_test", rules=origine, text=sample)
+    assert res["count"] == 3 and "Ref N° RELEVE DE NOTES" in res["text"] and "33 01" not in res["text"]
+    # texte simple : les espaces du modèle acceptent plusieurs espaces
+    res = engine.call("rules_test", rules=[{"chercher": "Faculté  de Médecine", "remplacer": "FMSP"}],
+                      text="Faculté de   Médecine")
+    assert res == {"text": "FMSP", "count": 1}
+    before = engine.call("settings_get")["text_rules"]
+    for bad in ({"regex": True, "chercher": "(abc", "remplacer": ""},
+                {"regex": True, "chercher": "abc", "remplacer": r"\2"}):
+        err = engine.wait(engine.send("rules_test", rules=[bad], text="abc"))["error"]
+        assert err["kind"] == "user" and "Règle 1" in err["message"]
+        err = engine.wait(engine.send("settings_save", values={"text_rules": [bad]}))["error"]
+        assert err["kind"] == "user" and "Corrections Word" in err["message"]
+    assert engine.call("settings_get")["text_rules"] == before          # rien d'enregistré

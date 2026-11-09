@@ -105,6 +105,7 @@ export interface TextRule {
   gras?: boolean | null;
   italique?: boolean | null;
   police?: string | null;
+  style_sur?: "ajout" | "tout" | null;
 }
 
 export interface Info {

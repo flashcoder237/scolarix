@@ -71,7 +71,7 @@ class Engine:
                  "demande_get", "demande_create", "demande_update", "demande_add", "demande_remove",
                  "demande_reorder", "demande_prepare", "demande_files_to_print", "demande_printed", "demande_mark",
                  "years", "extraction", "extraction_export", "journal", "anomalies", "verify_identify",
-                 "verify_compare", "verify_report", "settings_get", "settings_save"]
+                 "verify_compare", "verify_report", "settings_get", "settings_save", "rules_defaults", "rules_test"]
         table = {n: getattr(s, n) for n in names}
         table.update({"index_start": self.index_start, "index_stop": self.index_stop,
                       "index_reset": self.index_reset, "index_impact": s.index_impact,

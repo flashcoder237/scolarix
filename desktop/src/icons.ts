@@ -36,6 +36,7 @@ export const ICONS: Record<string, string> = {
  "arrow_up": "<path d=\"M12 19V5\"/><path d=\"m6 11 6-6 6 6\"/>",
  "arrow_down": "<path d=\"M12 5v14\"/><path d=\"m6 13 6 6 6-6\"/>",
  "chevron_down": "<path d=\"m6 9 6 6 6-6\"/>",
+ "chevron_right": "<path d=\"m9 6 6 6-6 6\"/>",
  "user": "<circle cx=\"12\" cy=\"8\" r=\"4\"/><path d=\"M4 21a8 8 0 0 1 16 0\"/>",
  "external": "<path d=\"M14 4h6v6\"/><path d=\"M20 4 10 14\"/><path d=\"M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5\"/>"
 };

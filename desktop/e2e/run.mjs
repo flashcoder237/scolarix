@@ -391,6 +391,46 @@ async function search(q) {
     await waitToast(/Réglages enregistrés/);
   });
 
+  await scenario("Réglages : barre latérale, Ctrl+, et remplacements Word", async () => {
+    const dlg = page.getByRole("dialog", { name: "Réglages" });
+    await page.getByTestId("nav-reglages").click();
+    await dlg.waitFor();
+    await page.keyboard.press("Escape");
+    await dlg.waitFor({ state: "detached" });
+    await page.keyboard.press("Control+,");
+    await dlg.waitFor();
+    await dlg.getByRole("radio", { name: "Remplacements (Word)" }).click();
+    const result = page.getByTestId("rules-result");
+    await result.filter({ hasText: "3 remplacement(s)" }).waitFor({ timeout: 10000 });
+    if (!/Ref N° RELEVE DE NOTES/.test(await result.innerText())) throw new Error("essai : « Ref N° » absent");
+    await shot("reglages_remplacements");
+    // une règle ajoutée est essayée aussitôt
+    await page.getByTestId("rule-add").click();
+    const n = (await page.locator('[data-testid="rules"] > .soft').count()) - 1;
+    await page.getByTestId(`rule-${n}-chercher`).fill("TRANSCRIPT");
+    await page.getByTestId(`rule-${n}-remplacer`).fill("RELEVÉ");
+    await result.filter({ hasText: "4 remplacement(s)" }).waitFor({ timeout: 10000 });
+    // une expression invalide est signalée et l'enregistrement refusé, la fenêtre reste ouverte
+    await page.getByTestId(`rule-${n}`).getByText("Expression régulière", { exact: true }).click();
+    await page.getByTestId(`rule-${n}-chercher`).fill("(TRANSCRIPT");
+    await result.filter({ hasText: "Règle 4" }).waitFor({ timeout: 10000 });
+    await page.getByTestId("settings-save").click();
+    await waitToast(/Enregistrement impossible.*Corrections Word/);
+    await dlg.waitFor();
+    // Échap sur la question ne ferme que la question, pas les Réglages
+    await page.getByTestId("rules-restore").click();
+    await page.getByRole("dialog", { name: "Rétablir les règles d'origine" }).waitFor();
+    await page.keyboard.press("Escape");
+    await page.getByRole("dialog", { name: "Rétablir les règles d'origine" }).waitFor({ state: "detached" });
+    await dlg.waitFor();
+    await page.getByTestId("rules-restore").click();
+    await page.getByRole("dialog", { name: "Rétablir les règles d'origine" }).getByRole("button", { name: "Rétablir" }).click();
+    await result.filter({ hasText: "3 remplacement(s)" }).waitFor({ timeout: 10000 });
+    await page.getByTestId("settings-save").click();
+    await waitToast(/Réglages enregistrés/);
+    await dlg.waitFor({ state: "detached" });
+  });
+
   await electronApp.close();
   const ko = results.filter((r) => !r.ok);
   console.log(`\n${results.length - ko.length}/${results.length} scénarios réussis · imprimante simulée : ${printedCount()} document(s)`);

@@ -15,10 +15,11 @@ from datetime import datetime
 from pathlib import Path
 
 from . import alerts, demandes, exports, pdf_tools, verification
-from .config import APP_NAME, APP_VERSION, UI_SCALES, Settings, save_settings
+from .config import APP_NAME, APP_VERSION, DEFAULT_TEXT_RULES, UI_SCALES, Settings, save_settings
 from .database import Database, Releve, missing_periods
 from .guard import PrintBlocked, VisualCheckRequired, check_before_print
 from .normalize import norm_text
+from .text_rules import RuleError, apply_text, compile_rules
 
 RELEVE_PROPS = ("nb_pages", "pages_label", "preview_pdf", "is_success", "periode", "sem_label", "annuel", "is_word",
                 "decision_deduite", "date_connue")
@@ -484,11 +485,31 @@ class Service:
         return {k: getattr(self.s, k) for k in self.PUBLIC if hasattr(self.s, k)}
 
     def settings_save(self, values: dict) -> dict:
+        if "text_rules" in (values or {}):
+            self._check_rules(values["text_rules"])
         for k, v in (values or {}).items():
             if k in self.PUBLIC and hasattr(self.s, k):
                 setattr(self.s, k, v)
         save_settings(self.s)
         return self.settings_get()
+
+
+    # ------------------------------------------------------------------ corrections Word
+    @staticmethod
+    def _check_rules(rules) -> list:
+        try:
+            return compile_rules(rules or [])
+        except RuleError as exc:
+            raise ServiceError(f"Corrections Word : {exc}") from exc
+
+    def rules_defaults(self) -> list:
+        """Les règles livrées avec Scolarix (bouton « Rétablir les règles d'origine »)."""
+        return [dict(r) for r in DEFAULT_TEXT_RULES]
+
+    def rules_test(self, rules: list, text: str) -> dict:
+        """Essai des règles sur une phrase : rien n'est enregistré ni appliqué aux fichiers."""
+        out, n = apply_text(text or "", self._check_rules(rules))
+        return {"text": out, "count": n}
 
 
 def _unlink_temp(file: str | None) -> None:

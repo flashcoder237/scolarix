@@ -100,12 +100,21 @@ export function ToastHost({ children }: { children: ReactNode }) {
 }
 
 // ------------------------------------------------------------------ fenêtres modales
+const modalStack: object[] = [];     // Échap ne ferme que la fenêtre du dessus (une question posée par-dessus les Réglages)
 export function Modal({ children, onClose, width = 560, label }: { children: ReactNode; onClose: () => void; width?: number; label: string }) {
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
-    const k = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
+    const me = {};
+    modalStack.push(me);
+    const k = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || modalStack[modalStack.length - 1] !== me) return;
+      e.stopPropagation();
+      close.current();
+    };
     window.addEventListener("keydown", k, true);
-    return () => window.removeEventListener("keydown", k, true);
-  }, [onClose]);
+    return () => { window.removeEventListener("keydown", k, true); const i = modalStack.indexOf(me); if (i >= 0) modalStack.splice(i, 1); };
+  }, []);
   return (
     <div className="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="modal" role="dialog" aria-modal="true" aria-label={label} style={{ width }}>{children}</div>

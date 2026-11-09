@@ -73,6 +73,10 @@ def compile_rules(rules: Iterable[dict]) -> list[CompiledRule]:
         repl = r.get("remplacer") or ""
         if not r.get("regex"):
             repl = repl.replace("\\", "\\\\")   # texte simple : aucune référence de groupe
+        try:
+            pat.sub(repl, "")                    # référence de groupe inexistante : signalée ici, pas à l'aperçu
+        except (re.error, IndexError) as exc:
+            raise RuleError(f"Règle {i} : texte de remplacement invalide ({exc}).") from exc
         size = r.get("taille")
         try:
             size = float(size) if size not in (None, "", 0) else None
