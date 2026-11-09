@@ -217,7 +217,7 @@ class CursusDialog(QDialog):
 
         def failed(err):
             finish()
-            self.toast.show_message(f"Échec de la fusion : {err}", "red")
+            self.toast.show_message(f"Échec de la fusion : {err}", "red", 30000)
 
         task.signals.done.connect(lambda res: (finish(), on_done(*res)))
         task.signals.failed.connect(failed)

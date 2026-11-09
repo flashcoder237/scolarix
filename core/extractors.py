@@ -108,15 +108,38 @@ def pdf_pages_text(pdf_path: Path) -> list[PageText]:
     return pages
 
 
-def page_count_and_text(pdf_path: Path, numbers: list[int]) -> tuple[int, dict[int, str]]:
-    """(nombre de pages, {numéro: texte}) pour quelques pages seulement (contrôle avant impression)."""
+def open_pdf(pdf_path: Path):
+    """Document pypdfium2 lu à travers un fichier ouvert par Python, et non par son chemin : sous Windows, un
+    chemin accentué (C:\\Users\\Cédric\\…) ou un fichier déjà ouvert ailleurs (aperçu, antivirus) faisait
+    échouer l'ouverture par PDFium (« File access error »)."""
     import pypdfium2 as pdfium
-    doc = pdfium.PdfDocument(str(pdf_path))
+    fh = open(pdf_path, "rb")
+    try:
+        return pdfium.PdfDocument(fh, autoclose=True)
+    except Exception:
+        fh.close()
+        raise
+
+
+def describe_error(exc: BaseException) -> str:
+    """« PdfiumError : Failed to load page » : la classe ET le message, pour savoir quoi corriger."""
+    msg = " ".join(str(exc).split())
+    return f"{exc.__class__.__name__} : {msg[:160]}" if msg else exc.__class__.__name__
+
+
+def read_pages(pdf_path: Path, numbers: list[int]) -> tuple[int, dict[int, str], dict[int, str]]:
+    """(nombre de pages, {numéro: texte}, {numéro: raison}) pour quelques pages (contrôle avant impression).
+    Une page que PDFium ne sait pas lire est relue avec pdfplumber ; si elle reste illisible, elle est
+    signalée (pas de plantage du contrôle entier pour une seule page)."""
+    doc = open_pdf(pdf_path)
     out: dict[int, str] = {}
+    bad: dict[int, str] = {}
     try:
         n = len(doc)
         for num in numbers:
-            if 1 <= num <= n:
+            if not 1 <= num <= n:
+                continue
+            try:
                 page = doc[num - 1]
                 try:
                     tp = page.get_textpage()
@@ -124,15 +147,36 @@ def page_count_and_text(pdf_path: Path, numbers: list[int]) -> tuple[int, dict[i
                     tp.close()
                 finally:
                     page.close()
+            except Exception as exc:
+                bad[num] = describe_error(exc)
     finally:
-        doc.close()
+        try:
+            doc.close()
+        except Exception:     # fermeture : jamais une raison de bloquer une impression déjà contrôlée
+            pass
+    if bad:
+        try:
+            import pdfplumber
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                for num in list(bad):
+                    text = pdf.pages[num - 1].extract_text() or ""
+                    if text.strip():
+                        out[num] = text
+                        del bad[num]
+        except Exception:
+            pass
+    return n, out, bad
+
+
+def page_count_and_text(pdf_path: Path, numbers: list[int]) -> tuple[int, dict[int, str]]:
+    n, out, _bad = read_pages(pdf_path, numbers)
     return n, out
 
 
 def _pages_pdfium(pdf_path: Path) -> list[PageText]:
     import pypdfium2 as pdfium
     try:
-        doc = pdfium.PdfDocument(str(pdf_path))
+        doc = open_pdf(pdf_path)
     except pdfium.PdfiumError as exc:
         msg = str(exc).lower()
         if "password" in msg:
@@ -251,7 +295,7 @@ def ocr_pdf_pages(pdf_path: Path, page_numbers: list[int], settings: Settings) -
     import pytesseract
 
     out: dict[int, PageText] = {}
-    doc = pdfium.PdfDocument(str(pdf_path))
+    doc = open_pdf(pdf_path)
     try:
         for n in page_numbers:
             page = doc[n - 1]

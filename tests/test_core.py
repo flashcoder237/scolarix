@@ -250,3 +250,20 @@ def test_libelle_semestre_annuel():
     assert r.sem_label == "S7-S8" and r.annuel
     assert Releve(**{**base, "semestre": 3, "semestre_fin": 3}).sem_label == "S3"
     assert Releve(**{**base}).sem_label == ""
+
+
+def test_cursus_jamais_vide_presente_comme_exporte(indexed, tmp_path):
+    """Si tous les relevés sont écartés par le contrôle, la fusion échoue en disant pourquoi (avant : 0 page)."""
+    import pytest
+
+    from core import pdf_tools
+    from core.guard import PrintBlocked
+    db = indexed[0] if isinstance(indexed, tuple) else indexed
+
+    def blocked(rel):
+        raise PrintBlocked(f"Impression bloquée pour {rel.matricule} : aperçu Word illisible par le contrôle "
+                           "automatique. [PdfiumError : Failed to load document]")
+    with pytest.raises(ValueError) as e:
+        pdf_tools.merge_releves(db.cursus("18M042")[:2], tmp_path / "c.pdf", prepare=blocked)
+    assert "aucun relevé" in str(e.value) and "PdfiumError" in str(e.value) and "Impression bloquée" not in str(e.value)
+    assert not (tmp_path / "c.pdf").exists()

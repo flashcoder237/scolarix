@@ -26,6 +26,15 @@ class PrintBlocked(Exception):
     """Impression refusée : le message explique pourquoi et quoi faire."""
 
 
+class VisualCheckRequired(PrintBlocked):
+    """Le texte d'une page n'est pas lisible par le contrôle automatique : au guichet, l'agent peut confirmer
+    sur l'aperçu que c'est le bon étudiant (journalisé). Ailleurs (demandes, cursus) : bloqué."""
+
+    def __init__(self, message: str, pages: list[int]):
+        super().__init__(message)
+        self.pages = pages
+
+
 _LABELED = re.compile(r"MATRICULE\s*(?:N[°O]\.?)?\s*[:：]?\s*(\d{2}\s*[-/. ]?\s*[A-Z]{1,4}\s*[-/. ]?\s*\d{2,4})", re.I)
 _HEADER = re.compile(r"NOMS?\s*(?:\(S\))?\s*(?:ET|&)\s*PR[ÉE]NOMS?", re.I)
 
@@ -47,9 +56,10 @@ def source_unchanged(rel: Releve) -> str | None:
     return None
 
 
-def check_before_print(rel: Releve) -> None:
-    """Lève PrintBlocked si l'impression de ce relevé n'est pas sûre."""
-    from .extractors import page_count_and_text
+def check_before_print(rel: Releve, visually_checked: bool = False) -> None:
+    """Lève PrintBlocked si l'impression de ce relevé n'est pas sûre. ``visually_checked`` : l'agent a confirmé
+    sur l'aperçu les pages que le contrôle automatique ne sait pas lire (les autres restent contrôlées)."""
+    from .extractors import describe_error, read_pages
 
     why = source_unchanged(rel)
     if why:
@@ -61,21 +71,37 @@ def check_before_print(rel: Releve) -> None:
         raise PrintBlocked(f"Impression bloquée pour {rel.matricule} : la page n'a pas été confirmée sur le rendu "
                            "de Word. Ouvrir le fichier d'origine.")
     pages = list(range(rel.numero_page, rel.page_fin + 1))
+    what = "aperçu Word" if rel.is_word else "PDF"
     try:
-        n, texts = page_count_and_text(Path(pdf), pages)
+        n, texts, unreadable = read_pages(Path(pdf), pages)
+    except PermissionError as exc:
+        raise PrintBlocked(f"Impression bloquée pour {rel.matricule} : le fichier {what} est verrouillé par un autre "
+                           f"programme (antivirus, Word, sauvegarde). Réessayez dans un instant. "
+                           f"[{describe_error(exc)} · {pdf}]") from exc
     except Exception as exc:
-        raise PrintBlocked(f"Impression bloquée : PDF illisible ({exc.__class__.__name__}).") from exc
+        raise PrintBlocked(f"Impression bloquée pour {rel.matricule} : {what} illisible par le contrôle "
+                           f"automatique. [{describe_error(exc)} · {pdf}]") from exc
     if rel.numero_page < 1 or rel.page_fin > n:
         raise PrintBlocked(f"Impression bloquée pour {rel.matricule} : pages {rel.numero_page}–{rel.page_fin} "
                            f"absentes du document ({n} pages). Relancer l'indexation.")
     if rel.type_fichier == "PDF_SCAN":
         return
+    if unreadable and not visually_checked:
+        nums = sorted(unreadable)
+        raise VisualCheckRequired(
+            f"Le contrôle automatique ne peut pas lire le texte de la page {', '.join(map(str, nums))} de ce {what} "
+            f"[{unreadable[nums[0]]}]. Vérifiez sur l'aperçu que c'est bien {rel.nom_complet or '—'} "
+            f"(matricule {rel.matricule}).", nums)
     mat = norm_matricule(rel.matricule)
     first = texts.get(rel.numero_page, "")
+    if rel.numero_page in unreadable:
+        first = mat           # page confirmée à l'œil par l'agent
     if mat not in _compact(first):
         raise PrintBlocked(f"Impression bloquée : le matricule {rel.matricule} n'apparaît pas sur la page "
                            f"{rel.numero_page}. Le fichier a peut-être changé : relancer l'indexation.")
     for num in pages[1:]:
+        if num in unreadable:
+            continue          # confirmée à l'œil par l'agent
         text = texts.get(num, "")
         others = {norm_matricule(m) for m in _LABELED.findall(text)} - {mat}
         if others or (_HEADER.search(text) and mat not in _compact(text)):

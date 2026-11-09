@@ -223,3 +223,87 @@ def test_copie_de_base_sur_partage_refusee():
     assert is_network_path(r"\\SRV-FMSP\Archives\index.db")
     assert not is_network_path(str(Path.home() / "index.db"))
     shutil.rmtree(Path.home() / "inexistant", ignore_errors=True)
+
+
+# ------------------------------------------------------------------------------------------------
+# Terrain (Windows, gros recueils Word de ~100 pages) : « Impression bloquée : PDF illisible (PdfiumError) »
+
+def test_chemin_accentue_lu_par_un_fichier_python(tmp_path):
+    from core.extractors import read_pages
+    d = tmp_path / "Cédric Écoles" / "Relevés été"
+    d.mkdir(parents=True)
+    pdf = releve_pdf(d / "promo é.pdf", [("PREMIER TEST", "98EM101"), ("SECOND TEST", "98EM102")])
+    n, texts, bad = read_pages(pdf, [1, 2, 5])
+    assert n == 2 and "98EM101" in texts[1] and not bad
+
+
+def test_une_page_illisible_ne_fait_pas_echouer_le_controle(pdf_index, monkeypatch):
+    import pypdfium2 as pdfium
+
+    import core.extractors as ex
+    db, s, _a, src = pdf_index
+    original = pdfium.PdfDocument.__getitem__
+
+    def broken(self, i):
+        if i == 1:
+            raise pdfium.PdfiumError("Failed to load page.")
+        return original(self, i)
+    monkeypatch.setattr(pdfium.PdfDocument, "__getitem__", broken)
+    n, texts, bad = ex.read_pages(src, [1, 2])                  # relue par pdfplumber
+    assert "98EM102" in texts[2] and not bad
+
+    import pdfplumber
+    monkeypatch.setattr(pdfplumber, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("non")))
+    n, texts, bad = ex.read_pages(src, [1, 2])
+    assert 2 in bad and "Failed to load page" in bad[2]
+    from core.guard import VisualCheckRequired
+    rel = next(r for r in db.search("98EM102", None, False, 80, 10))
+    with pytest.raises(VisualCheckRequired) as e:
+        check_before_print(rel)
+    assert e.value.pages == [2] and "SECOND TEST" in str(e.value)
+    check_before_print(rel, visually_checked=True)              # confirmé à l'œil par l'agent
+    rel1 = next(r for r in db.search("98EM101", None, False, 80, 10))
+    check_before_print(rel1)                                     # page 1 lisible : contrôle normal
+
+
+def test_message_de_blocage_donne_la_cause_exacte(pdf_index, monkeypatch):
+    import core.extractors as ex
+    db, s, _a, src = pdf_index
+    rel = next(r for r in db.search("98EM101", None, False, 80, 10))
+
+    def fail(*a, **k):
+        raise RuntimeError("Failed to load document (PDFium: File access error).")
+    monkeypatch.setattr(ex, "read_pages", fail)
+    with pytest.raises(PrintBlocked) as e:
+        check_before_print(rel)
+    assert "File access error" in str(e.value) and str(src) in str(e.value)
+
+    def locked(*a, **k):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(ex, "read_pages", locked)
+    with pytest.raises(PrintBlocked) as e:
+        check_before_print(rel)
+    assert "verrouillé" in str(e.value)
+
+
+def test_publication_apercu_resiste_a_un_verrou_passager(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    real = os.replace
+
+    def flaky(a, b):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(32, "Le processus ne peut pas accéder au fichier")
+        return real(a, b)
+    monkeypatch.setattr(preview.os, "replace", flaky)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    tmp, dest = tmp_path / "x.tmp.pdf", tmp_path / "x.pdf"
+    tmp.write_bytes(b"%PDF-1.4 nouveau")
+    dest.write_bytes(b"%PDF-1.4 ancien")
+    preview._publish(tmp, dest, "sig")
+    assert dest.read_bytes().endswith(b"nouveau") and calls["n"] == 3
+    tmp.write_bytes(b"%PDF")
+    calls["n"] = -100
+    with pytest.raises(PermissionError):
+        preview._publish(tmp, dest, "sig", attempts=3)
+    assert not tmp.exists()                                      # pas de fichier temporaire abandonné

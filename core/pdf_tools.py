@@ -199,7 +199,8 @@ def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
             try:
                 r = prepare(r)
             except Exception as exc:   # aperçu impossible ou impression bloquée par le contrôle : écarté
-                reason = str(exc).split(":")[-1].strip()[:70] if str(exc) else exc.__class__.__name__
+                reason = re.sub(r"^Impression bloquée( pour [^:]+)?\s*:\s*", "", str(exc)).strip()
+                reason = reason[:110] if reason else exc.__class__.__name__
                 missing.append(f"{r.periode} {r.annee_academique or ''} ({reason})".strip())
                 continue
         src = r.preview_pdf
@@ -208,6 +209,9 @@ def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
             continue
         reader = readers.setdefault(src, PdfReader(src))
         chunks.append((r, reader, range(r.numero_page - 1, min(r.page_fin, len(reader.pages)))))
+    if not chunks:
+        # jamais un « cursus » vide présenté comme exporté : on dit pourquoi chaque relevé a été écarté
+        raise ValueError("aucun relevé n'a pu être fusionné — " + " ; ".join(missing or ["aucun relevé choisi"]))
     writer = PdfWriter()
     kept = [c[0] for c in chunks]
     if cover and kept:

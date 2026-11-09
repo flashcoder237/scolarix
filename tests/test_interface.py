@@ -495,3 +495,37 @@ def test_raccourcis_sans_ambiguite(app, window):
     keys = Counter(sc.key().toString() for sc in window.findChildren(QShortcut))
     assert not [k for k, n in keys.items() if n > 1]          # une touche = un seul raccourci
     assert {"Ctrl++", "Ctrl+-", "Ctrl+0", "Ctrl+="} <= set(keys)
+
+
+def test_controle_visuel_au_guichet(app, window, monkeypatch):
+    import ui.guichet_page as gp
+    import ui.widgets as W
+    from core.guard import VisualCheckRequired
+
+    def guard(rel, visually_checked=False):
+        if not visually_checked:
+            raise VisualCheckRequired("Le contrôle automatique ne peut pas lire le texte de la page 98", [98])
+    monkeypatch.setattr(gp, "check_before_print", guard)
+    g = window.guichet
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    g.on_row(next(i for i, r in enumerate(g.model.rows) if not r.is_word))
+    monkeypatch.setattr(W, "ask_choice", lambda *a, **k: -1)
+    assert g._ready(g.current) is None
+    monkeypatch.setattr(W, "ask_choice", lambda *a, **k: 0)
+    assert g._ready(g.current) is g.current
+    assert any(j["action"] == "CONTRÔLE VISUEL" for j in window.db.journal("18M042"))
+
+
+def test_apercu_ne_verrouille_pas_le_fichier(app, window, tmp_path):
+    import shutil
+    g = window.guichet
+    g.run_search("18M042")
+    assert wait_for(app, lambda: g.model.rowCount() > 0)
+    rel = next(r for r in g.model.rows if not r.is_word)
+    copy = tmp_path / "apercu.pdf"
+    shutil.copy(rel.preview_pdf, copy)
+    v = g.preview.viewer
+    assert v.show_page(str(copy), 0)
+    copy.unlink()                                            # lu en mémoire : le fichier est libre
+    assert v.view.document().pageCount() > 0

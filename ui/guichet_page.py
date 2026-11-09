@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QFrame, QGridLay
 from core import exports, pdf_tools
 from core.config import Settings
 from core.database import Database, Releve, missing_periods
-from core.guard import PrintBlocked, check_before_print
+from core.guard import PrintBlocked, VisualCheckRequired, check_before_print
 from core.printer_service import print_pdf
 
 from .cursus_dialog import CursusDialog
@@ -25,6 +25,7 @@ from .demandes_ui import DemandeBar
 from .omnibox_widget import Omnibox
 from .pdf_preview_panel import PreviewPanel
 from .results_table_model import ResultsModel, RowDelegate
+from . import widgets
 from .widgets import (TONES, Badge, Card, Segmented, StatCard, Task, eyebrow, muted, statut_tone, title)
 
 JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
@@ -572,8 +573,25 @@ class GuichetPage(QWidget):
             return None
         try:
             check_before_print(rel)
+        except VisualCheckRequired as exc:
+            # page que le contrôle automatique ne sait pas lire : l'agent confirme sur l'aperçu, c'est tracé
+            if widgets.ask_choice(self, "Contrôle visuel", str(exc),
+                                  [f"C'est bien {rel.nom_complet or rel.matricule} : continuer"], default=0,
+                                  details="Comparez le nom et le matricule sur l'aperçu avant de confirmer.") != 0:
+                self.db.log("IMPRESSION BLOQUÉE", self.s.operateur, self.s.poste, rel.id, rel.matricule,
+                            str(exc)[:300])
+                return None
+            try:
+                check_before_print(rel, visually_checked=True)
+            except PrintBlocked as exc2:
+                self.preview.toast.show_message(str(exc2), "red", 15000)
+                self.db.log("IMPRESSION BLOQUÉE", self.s.operateur, self.s.poste, rel.id, rel.matricule,
+                            str(exc2)[:300])
+                return None
+            self.db.log("CONTRÔLE VISUEL", self.s.operateur, self.s.poste, rel.id, rel.matricule,
+                        f"Page(s) {', '.join(map(str, exc.pages))} confirmée(s) à l'œil : {str(exc)[:200]}")
         except PrintBlocked as exc:
-            self.preview.toast.show_message(str(exc), "red", 9000)
+            self.preview.toast.show_message(str(exc), "red", 15000)
             self.db.log("IMPRESSION BLOQUÉE", self.s.operateur, self.s.poste, rel.id, rel.matricule, str(exc)[:300])
             return None
         return rel

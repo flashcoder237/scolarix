@@ -5,7 +5,7 @@ import os
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMargins, QPointF, QThreadPool, Qt, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QMargins, QPointF, QThreadPool, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -71,8 +71,19 @@ class PdfViewer(QFrame):
         if key in self._docs:
             self._docs.move_to_end(key)
             return self._docs[key]
+        # Chargé en mémoire : le fichier n'est pas tenu ouvert, Windows laisse Word le remplacer
+        # (nouvel aperçu) et l'antivirus le scanner sans conflit.
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return None
         doc = QPdfDocument(self)
-        if doc.load(path) != QPdfDocument.Error.None_:
+        buf = QBuffer(doc)
+        buf.setData(QByteArray(data))
+        buf.open(QIODevice.OpenModeFlag.ReadOnly)
+        doc.load(buf)
+        if doc.status() != QPdfDocument.Status.Ready or doc.pageCount() == 0:
+            doc.deleteLater()
             return None
         self._docs[key] = doc
         while len(self._docs) > 4:

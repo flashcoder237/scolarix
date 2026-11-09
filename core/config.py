@@ -17,7 +17,7 @@ from pathlib import Path
 
 APP_NAME = "Scolarix"
 APP_SUBTITLE = "Archives des relevés de notes · FMSP"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 UI_SCALES = (80, 90, 100, 110, 125, 150)    # tailles d'interface proposées (en %)
 
 # Corrections d'en-tête par défaut des relevés Word (modifiables dans Réglages).

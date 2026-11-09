@@ -71,9 +71,23 @@ def _fresh(dest: Path, sig: str) -> bool:
         return False
 
 
-def _publish(tmp: Path, dest: Path, sig: str) -> None:
-    """Écriture atomique : un export interrompu (Word planté, disque plein) ne laisse jamais un PDF tronqué."""
-    os.replace(tmp, dest)
+def _publish(tmp: Path, dest: Path, sig: str, attempts: int = 25) -> None:
+    """Écriture atomique : un export interrompu (Word planté, disque plein) ne laisse jamais un PDF tronqué.
+    Sous Windows, un antivirus ou un autre lecteur peut verrouiller l'ancien fichier quelques instants :
+    on réessaie (5 s au plus) avant d'abandonner."""
+    import time
+    for i in range(attempts):
+        try:
+            os.replace(tmp, dest)
+            break
+        except PermissionError:
+            if i == attempts - 1:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.2)
     dest.with_suffix(dest.suffix + ".sig").write_text(sig, encoding="utf-8")
 
 
