@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { call, sx } from "../api";
 import { useApp } from "../state";
-import { Badge, Chip, Icon, Seg, Switch, useToast } from "../components/ui";
+import { Badge, Chip, Icon, Seg, Switch, useDialogs, useToast } from "../components/ui";
 
 interface Anomalie { id: number; horodatage: string; niveau: string; chemin: string | null; message: string; action: string | null }
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -10,6 +10,7 @@ const short = (p: string, n = 90) => (p.length > n ? "…" + p.slice(-n) : p);
 export function Indexation() {
   const app = useApp();
   const toast = useToast();
+  const { ask } = useDialogs();
   const s = app.settings;
   const [src, setSrc] = useState(s?.source_root || "");
   const [anoms, setAnoms] = useState<Anomalie[]>([]);
@@ -61,6 +62,30 @@ export function Indexation() {
     await call("index_stop", { force });
     setLive((l) => ({ ...l, status: "ARRÊT…", detail: force ? "Arrêt forcé." : "Arrêt demandé : fin des fichiers en cours… (cliquer encore pour forcer)" }));
   };
+  const reset = async () => {
+    try {
+      const n = await call<Record<string, number>>("index_impact");
+      const fr = (x: number) => x.toLocaleString("fr-FR");
+      const i = await ask({
+        title: "Vider l'index",
+        danger: true,
+        text: `Seront retirés : ${fr(n.releves)} relevé(s) indexé(s), ${fr(n.fichiers)} fichier(s), ${fr(n.anomalies)} anomalie(s) et les aperçus Word en cache.\n\n`
+          + `Seront conservés : le journal (${fr(n.journal)} ligne(s)), le registre des délivrances (${fr(n.delivrances)} document(s)) et les demandes (${fr(n.demandes)}).`
+          + (n.demandes_ouvertes ? `\n\nAttention : ${n.demandes_ouvertes} demande(s) en cours. Leurs relevés devront être ajoutés à nouveau après la réindexation.` : ""),
+        details: "Les archives d'origine ne sont jamais touchées. La recherche au guichet sera vide jusqu'à la fin de la réindexation.",
+        choices: ["Vider et tout réindexer", "Vider seulement"],
+      });
+      if (i < 0) return;
+      const r = await call<{ releves: number; stats: any }>("index_reset", { confirm: "VIDER" });
+      app.refreshStats();
+      setLive({ total: 0, done: 0, pct: 0, detail: "", current: "", stages: [0, 0, 0, 0], status: "PRÊT" });
+      toast(`Index vidé : ${fr(r.releves)} relevé(s) retiré(s). Journal, registre et demandes conservés.`, { tone: "green", ms: 12000 });
+      if (i === 0) {
+        await call("index_start", { source: src, full: true });
+        setLive({ total: 0, done: 0, pct: 0, detail: "Analyse de l'arborescence…", current: "", stages: [0, 0, 0, 0], status: "EN COURS" });
+      }
+    } catch (e) { toast(errMsg(e), { tone: "red" }); }
+  };
   const tone = live.status === "EN COURS" ? "blue" : live.status === "TERMINÉ" ? "green" : live.status.startsWith("ARR") ? "amber" : "gray";
   const st = app.stats;
 
@@ -97,6 +122,11 @@ export function Indexation() {
       <section className="card">
         <div className="row"><h2 className="h2 grow">Base d'index</h2>
           <span className="muted small">{st ? `${st.releves.toLocaleString("fr-FR")} relevés · ${st.etudiants.toLocaleString("fr-FR")} étudiants · ${st.fichiers.toLocaleString("fr-FR")} fichiers · dernière passe : ${st.derniere_indexation || "jamais"}` : ""}</span></div>
+        <div className="row soft">
+          <Icon name="refresh" />
+          <span className="grow small">Recommencer de zéro : retire tous les relevés indexés et les aperçus en cache, puis relit toutes les archives. Le journal, le registre des délivrances et les demandes sont conservés.</span>
+          <button className="btn danger" disabled={running} onClick={() => void reset()} data-testid="index-reset" title={running ? "Arrêtez d'abord l'indexation en cours" : ""}><Icon name="trash" />Vider l'index…</button>
+        </div>
       </section>
       <section className="card" style={{ minHeight: 280 }}>
         <div className="row"><h2 className="h2 grow">Anomalies</h2>

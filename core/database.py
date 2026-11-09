@@ -580,6 +580,32 @@ class Database:
             self.conn.execute("DELETE FROM anomalies WHERE chemin=?", (chemin,))
             self.conn.commit()
 
+    def reset_index(self) -> dict:
+        """Vide l'INDEX seulement : relevés, fichiers, anomalies, date de dernière indexation.
+        Conservés : journal, registre des délivrances, demandes (traçabilité et vérification d'authenticité)."""
+        with self._lock:
+            c = self.conn
+            counts = {"releves": c.execute("SELECT COUNT(*) FROM etudiants_releves").fetchone()[0],
+                      "fichiers": c.execute("SELECT COUNT(*) FROM fichiers").fetchone()[0],
+                      "anomalies": c.execute("SELECT COUNT(*) FROM anomalies").fetchone()[0]}
+            cur = c.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                cur.execute("DELETE FROM etudiants_releves")
+                cur.execute("DELETE FROM fichiers")
+                cur.execute("DELETE FROM anomalies")
+                cur.execute("DELETE FROM meta WHERE cle = 'derniere_indexation'")
+                cur.execute("INSERT INTO etudiants_fts(etudiants_fts) VALUES ('rebuild')")
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+            try:
+                c.execute("VACUUM")
+            except sqlite3.Error:
+                pass          # une autre connexion lit la base : l'espace sera récupéré plus tard
+        return counts
+
     def clear_anomalies(self) -> None:
         with self._lock:
             self.conn.execute("DELETE FROM anomalies")

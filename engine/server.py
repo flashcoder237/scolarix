@@ -74,6 +74,7 @@ class Engine:
                  "verify_compare", "verify_report", "settings_get", "settings_save"]
         table = {n: getattr(s, n) for n in names}
         table.update({"index_start": self.index_start, "index_stop": self.index_stop,
+                      "index_reset": self.index_reset, "index_impact": s.index_impact,
                       "index_status": self.index_status, "logs_dir": lambda: str(self.data_dir / "logs")})
         return table
 
@@ -127,6 +128,12 @@ class Engine:
                                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             threading.Thread(target=self._relay_index, args=(self.indexer,), daemon=True).start()
         return {"running": True}
+
+    def index_reset(self, confirm: str = "") -> dict:
+        from core.service import ServiceError
+        if self.indexer and self.indexer.poll() is None:
+            raise ServiceError("Une indexation est en cours : arrêtez-la avant de vider l'index.")
+        return self.service.index_reset(confirm)
 
     def _relay_index(self, proc: subprocess.Popen) -> None:
         for raw in proc.stdout:

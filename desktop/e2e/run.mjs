@@ -329,6 +329,26 @@ async function search(q) {
     await shot("indexation");
   });
 
+  await scenario("Vider l'index puis tout réindexer (journal et registre conservés)", async () => {
+    await page.getByTestId("index-reset").click();
+    const dlg = page.getByRole("dialog", { name: "Vider l'index" });
+    await dlg.waitFor();
+    const text = await dlg.innerText();
+    if (!/registre des délivrances \(\d+/.test(text)) throw new Error(`fenêtre : ${text.slice(0, 200)}`);
+    await shot("vider_index");
+    await dlg.getByRole("button", { name: "Vider et tout réindexer" }).click();
+    await waitToast(/Index vidé/);
+    await page.getByText("TERMINÉ").first().waitFor({ timeout: 180000 });
+    await page.keyboard.press("Control+1");
+    await search("18M042");
+    await page.locator('[data-testid="results"] tbody tr').first().waitFor({ timeout: 30000 });
+    await page.keyboard.press("Control+4");
+    await page.waitForTimeout(800);
+    const j = await page.locator("table.grid").last().innerText();
+    if (!/INDEX VIDÉ/.test(j) || !/IMPRESSION|EXPORT/.test(j)) throw new Error("journal incomplet après le vidage");
+    await page.keyboard.press("Control+3");
+  });
+
   await scenario("Taille de l'interface : Ctrl+Plus immédiat, Ctrl+0", async () => {
     await page.keyboard.press("Control+1");
     const z0 = await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getZoomFactor());

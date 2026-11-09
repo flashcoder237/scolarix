@@ -174,3 +174,46 @@ def test_fin_de_l_entree_arrete_le_moteur(indexed, tmp_path):
     c.proc.stdin.close()                         # Electron fermé ou planté
     assert c.proc.wait(30) == 0
     assert (tmp_path / "logs" / "moteur.log").exists()
+
+
+def test_vider_l_index_conserve_la_tracabilite(indexed, tmp_path):
+    """« Vider l'index » retire relevés, fichiers et anomalies ; garde journal, registre et demandes."""
+    import shutil
+
+    from core.config import save_settings
+    db, settings, archives, _ = indexed
+    home = tmp_path / "data"
+    home.mkdir()
+    copy_db = tmp_path / "index.db"
+    db.conn.execute("PRAGMA wal_checkpoint(FULL)")
+    shutil.copy(settings.db_path, copy_db)
+    import dataclasses
+    s2 = dataclasses.replace(settings, db_path=str(copy_db), cache_dir=str(tmp_path / "cache"),
+                             exports_root=str(tmp_path / "Exports"))
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / "apercu.pdf").write_bytes(b"%PDF")
+    old = os.environ.get("FMSP_DATA_DIR")
+    os.environ["FMSP_DATA_DIR"] = str(home)
+    try:
+        save_settings(s2)
+    finally:
+        os.environ["FMSP_DATA_DIR"] = old or ""
+    c = Client(dict(os.environ, FMSP_DATA_DIR=str(home), PYTHONIOENCODING="utf-8"))
+    try:
+        rel = next(r for r in c.call("search", q="18M042")["results"] if not r["is_word"])
+        c.call("export", releve_id=rel["id"])                       # une délivrance au registre
+        c.call("demande_create", matricule="18M042", nom="TCHOUA Alain", demandeur="test")
+        before = c.call("index_impact")
+        assert before["releves"] > 0 and before["delivrances"] >= 1
+        res = c.wait(c.send("index_reset"))
+        assert "error" in res                                        # sans confirmation : refusé
+        out = c.call("index_reset", confirm="VIDER")
+        assert out["releves"] == before["releves"] and out["stats"]["releves"] == 0
+        after = c.call("index_impact")
+        assert after["releves"] == after["fichiers"] == after["anomalies"] == 0
+        assert after["delivrances"] == before["delivrances"] and after["demandes"] == before["demandes"]
+        assert after["journal"] >= before["journal"]                  # le vidage lui-même est journalisé
+        assert c.call("search", q="18M042")["results"] == []
+        assert not (tmp_path / "cache" / "apercu.pdf").exists()
+    finally:
+        c.close()

@@ -397,6 +397,41 @@ class Service:
     def anomalies(self, niveau: str | None = None) -> list[dict]:
         return [_row(r) for r in self.db.anomalies(niveau or None, 500)]
 
+    def index_reset(self, confirm: str = "") -> dict:
+        """Vide l'index (pas le journal, ni le registre, ni les demandes) et le cache des aperçus Word."""
+        if confirm != "VIDER":
+            raise ServiceError("Confirmation manquante.")
+        import shutil
+        counts = self.db.reset_index()
+        cache = Path(self.s.resolved_cache_dir())
+        removed = 0
+        if cache.exists():
+            for f in cache.iterdir():
+                try:
+                    if f.is_dir():
+                        shutil.rmtree(f)
+                    else:
+                        f.unlink()
+                    removed += 1
+                except OSError:
+                    pass       # fichier en cours d'utilisation : il sera remplacé à la prochaine passe
+        open_items = self.db.conn.execute(
+            "SELECT COUNT(*) FROM demande_items i JOIN demandes d ON d.id = i.demande_id "
+            "WHERE d.statut IN ('EN COURS','PRÊTE','IMPRIMÉE')").fetchone()[0]
+        self._log("INDEX VIDÉ", None, f"{counts['releves']} relevé(s), {counts['fichiers']} fichier(s), "
+                                      f"{counts['anomalies']} anomalie(s) retirés ; {removed} élément(s) du cache "
+                                      "supprimés ; journal, registre et demandes conservés")
+        return {**counts, "cache": removed, "demandes_items_ouverts": open_items, "stats": self.stats()}
+
+    def index_impact(self) -> dict:
+        """Ce que « Vider l'index » retirerait et conserverait (affiché avant confirmation)."""
+        c = self.db.conn
+        one = lambda sql: c.execute(sql).fetchone()[0]  # noqa: E731
+        return {"releves": one("SELECT COUNT(*) FROM etudiants_releves"), "fichiers": one("SELECT COUNT(*) FROM fichiers"),
+                "anomalies": one("SELECT COUNT(*) FROM anomalies"), "journal": one("SELECT COUNT(*) FROM journal"),
+                "delivrances": one("SELECT COUNT(*) FROM delivrances"), "demandes": one("SELECT COUNT(*) FROM demandes"),
+                "demandes_ouvertes": one("SELECT COUNT(*) FROM demandes WHERE statut IN ('EN COURS','PRÊTE','IMPRIMÉE')")}
+
     # ------------------------------------------------------------------ vérification
     def verify_identify(self, path: str) -> dict:
         """Registre des délivrances (à l'octet près) puis lecture du document : l'original le plus probable."""
