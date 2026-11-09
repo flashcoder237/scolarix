@@ -87,6 +87,8 @@ jobs:
           $code = $LASTEXITCODE
           Get-Content (Join-Path $work "data\logs\interface.log") -Tail 40 -ErrorAction SilentlyContinue
           Get-Content (Join-Path $work "data\logs\moteur.log") -Tail 40 -ErrorAction SilentlyContinue
+          Write-Host "----- indexation.log"
+          Get-Content (Join-Path $work "data\logs\indexation.log") -Tail 60 -ErrorAction SilentlyContinue
           if ($code -ne 0) { exit 1 }
 
       - uses: actions/upload-artifact@v4

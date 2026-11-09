@@ -122,10 +122,16 @@ class Engine:
                               "--full" if (full or not self.settings.differential) else "--only-new"]
             if not self.settings.ocr_enabled:
                 args.append("--no-ocr")
-            env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+            # erreurs du robot conservées (logs/indexation.log) : jamais d'échec silencieux
+            errlog = open(self.data_dir / "logs" / "indexation.log", "a", encoding="utf-8")
+            errlog.write(f"\n===== {__import__('time').strftime('%Y-%m-%d %H:%M:%S')} {' '.join(args)}\n")
+            errlog.flush()
+            log.info("indexation lancée : %s", " ".join(args))
             self.indexer = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                            stderr=subprocess.DEVNULL, env=env,
+                                            stderr=errlog, env=env,
                                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            errlog.close()
             threading.Thread(target=self._relay_index, args=(self.indexer,), daemon=True).start()
         return {"running": True}
 
@@ -143,6 +149,7 @@ class Engine:
                 continue
             self.send({"event": "index", "data": ev})
         code = proc.wait()
+        log.info("indexation terminée (code %s)", code)
         self.send({"event": "index", "data": {"type": "exit", "code": code}})
 
     def index_stop(self, force: bool = False) -> dict:
