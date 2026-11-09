@@ -12,3 +12,10 @@ dist/
 .pytest_cache/
 .ruff_cache/
 tools/*.exe
+# Scolarix 2 (Electron)
+desktop/node_modules/
+desktop/dist/
+desktop/release/
+desktop/e2e/out/
+!desktop/build/
+desktop/tools/*.exe

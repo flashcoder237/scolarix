@@ -1,0 +1,102 @@
+name: Scolarix 2 (Electron) — compilation, tests de bout en bout sous Windows, installateur
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+      SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Dépendances du moteur (versions figées)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -c constraints-windows.txt pyinstaller pytest
+          python -c "import pypdfium2; print('pypdfium2', pypdfium2.version.PYPDFIUM_INFO)"
+
+      - name: Tests du moteur et de la sécurité
+        run: python -m pytest -q tests/test_engine.py tests/test_securite.py tests/test_core.py
+
+      - name: Moteur compilé (PyInstaller)
+        run: pyinstaller --noconfirm engine/scolarix-engine.spec
+
+      - name: Signature du moteur
+        if: env.SIGN_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+                       Where-Object FullName -match "x64" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool sign /f $pfx /p $env:SIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+              /d "Scolarix - moteur" dist\scolarix-engine\scolarix-engine.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Interface (dépendances, types, compilation)
+        working-directory: desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build:ui
+
+      - name: Installateur Electron (signé si le certificat est présent)
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          if ($env:SIGN_PFX_BASE64) {
+            $env:CSC_LINK = $env:SIGN_PFX_BASE64
+            $env:CSC_KEY_PASSWORD = $env:SIGN_PFX_PASSWORD
+          } else {
+            $env:CSC_IDENTITY_AUTO_DISCOVERY = "false"
+          }
+          npx electron-builder --win --x64 --publish never
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem release\*.exe | ForEach-Object { $s = Get-AuthenticodeSignature $_; Write-Host "$($_.Name) : $($s.Status) $($s.SignerCertificate.Subject)" }
+          $s = Get-AuthenticodeSignature release\win-unpacked\Scolarix.exe
+          Write-Host "Scolarix.exe : $($s.Status) $($s.SignerCertificate.Subject)"
+
+      - name: Tests de bout en bout sur l'application compilée (dossier au nom accentué)
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "Scolarix É2E données"
+          python desktop\e2e\setup_data.py "$work"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $env:E2E_EXE = (Resolve-Path desktop\release\win-unpacked\Scolarix.exe).Path
+          node desktop\e2e\run.mjs "$work" desktop\e2e\out
+          $code = $LASTEXITCODE
+          Get-Content (Join-Path $work "data\logs\interface.log") -Tail 40 -ErrorAction SilentlyContinue
+          Get-Content (Join-Path $work "data\logs\moteur.log") -Tail 40 -ErrorAction SilentlyContinue
+          if ($code -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Scolarix2_captures_tests_Windows
+          path: desktop/e2e/out/*.png
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Scolarix2_Installateur_Windows
+          path: desktop/release/Scolarix_Setup_*.exe
+          retention-days: 30

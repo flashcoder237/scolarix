@@ -1,0 +1,2 @@
+Déposez ici SumatraPDF.exe (ou PDFtoPrinter.exe) pour une impression vectorielle silencieuse.
+Sans ce fichier, Scolarix imprime par Chromium (rendu 300 ppp).

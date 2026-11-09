@@ -1,0 +1,17 @@
+# Métadonnées Windows de Scolarix.exe (Propriétés > Détails)
+VSVersionInfo(
+  ffi=FixedFileInfo(filevers=(2, 0, 0, 0), prodvers=(2, 0, 0, 0), mask=0x3f, flags=0x0, OS=0x40004,
+                    fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040C04B0', [
+      StringStruct('CompanyName', 'Cellule Informatique FMSP - Université de Douala'),
+      StringStruct('FileDescription', 'Scolarix - Archives des relevés de notes'),
+      StringStruct('FileVersion', '2.0.0'),
+      StringStruct('InternalName', 'Scolarix — moteur'),
+      StringStruct('LegalCopyright', 'FMSP - Université de Douala'),
+      StringStruct('OriginalFilename', 'Scolarix.exe'),
+      StringStruct('ProductName', 'Scolarix — moteur'),
+      StringStruct('ProductVersion', '2.0.0')])]),
+    VarFileInfo([VarStruct('Translation', [0x040C, 1200])])
+  ]
+)

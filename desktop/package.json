@@ -1,0 +1,96 @@
+{
+  "name": "scolarix",
+  "productName": "Scolarix",
+  "version": "2.0.0",
+  "description": "Archives des relevés de notes — FMSP, Université de Douala",
+  "author": "FMSP - Cellule Informatique",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "build:ui": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "vite build && electron .",
+    "e2e": "node e2e/run.mjs",
+    "dist": "vite build && electron-builder --win --x64"
+  },
+  "dependencies": {
+    "pdfjs-dist": "6.5.438",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "electron": "44.10.2",
+    "electron-builder": "26.18.0",
+    "playwright-core": "1.65.0",
+    "typescript": "5.9.3",
+    "vite": "8.3.7"
+  },
+  "build": {
+    "appId": "cm.udo.fmsp.scolarix",
+    "productName": "Scolarix",
+    "copyright": "FMSP - Université de Douala",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/scolarix-engine",
+        "to": "engine"
+      },
+      {
+        "from": "tools",
+        "to": "tools",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "Scolarix_Setup_${version}.${ext}",
+      "publisherName": "FMSP - Cellule Informatique (Scolarix)",
+      "signtoolOptions": {
+        "publisherName": "FMSP - Cellule Informatique (Scolarix)",
+        "signingHashAlgorithms": [
+          "sha256"
+        ],
+        "timeStampServer": "http://timestamp.digicert.com"
+      }
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerLanguages": [
+        "fr_FR"
+      ],
+      "language": "1036",
+      "shortcutName": "Scolarix 2",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "uninstallDisplayName": "Scolarix 2",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
