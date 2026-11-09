@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { call, sx, statutTone, type Releve } from "../api";
 import { Badge, Chip, Icon, Modal, Switch, play, useToast } from "../components/ui";
+import { isCancelled, useOperation } from "../operation";
 
 interface CursusInfo {
   matricule: string; nom: string; releves: Releve[]; missing: string[];
@@ -19,6 +20,7 @@ export function CursusDialog({ matricule, onClose }: { matricule: string; onClos
   const [cover, setCover] = useState(true);
   const [dup, setDup] = useState(false);
   const [busy, setBusy] = useState<"" | "export" | "print">("");
+  const opn = useOperation();
 
   useEffect(() => {
     call<CursusInfo>("cursus_info", { matricule })
@@ -33,21 +35,22 @@ export function CursusDialog({ matricule, onClose }: { matricule: string; onClos
   const run = async (mode: "export" | "print") => {
     if (!info || !selected.length) return;
     setBusy(mode);
-    toast("Préparation du dossier fusionné…", { tone: "blue", ms: 600000, sound: false, key: "op" });
+    const op = opn.start("cursus");
+    toast("Préparation du dossier fusionné…", { tone: "blue", ms: 8000, sound: false, key: "op" });
     try {
       const ids = selected.map((r) => r.id);
       if (mode === "export") {
-        const r = await call<{ path: string; name: string; pages: number; missing: string[]; ref: string }>("cursus_build", { matricule: info.matricule, releve_ids: ids, cover, duplicata: dup, mode: "export" });
+        const r = await call<{ path: string; name: string; pages: number; missing: string[]; ref: string }>("cursus_build", { matricule: info.matricule, releve_ids: ids, cover, duplicata: dup, mode: "export", op });
         toast(`Exporté (réf. ${r.ref}) : ${r.name} (${r.pages} pages)${r.missing.length ? ` — écartés : ${r.missing.join(", ")}` : ""}`,
           { tone: r.missing.length ? "amber" : "green", ms: 20000, key: "op", action: { label: "Ouvrir le dossier", run: () => void sx.reveal(r.path) } });
       } else {
-        const r = await sx.printCursus({ matricule: info.matricule, releve_ids: ids, cover, duplicata: dup });
+        const r = await sx.printCursus({ matricule: info.matricule, releve_ids: ids, cover, duplicata: dup, op });
         play("impression");
         toast(`Cursus envoyé à l'imprimante : ${r.pages} pages${r.missing.length ? `. Écartés : ${r.missing.join(", ")}` : ""}`, { tone: r.missing.length ? "amber" : "green", sound: false, ms: 15000, key: "op" });
       }
     } catch (e) {
-      toast(errMsg(e), { tone: "red", ms: 30000, key: "op" });
-    } finally { setBusy(""); }
+      toast(errMsg(e), { tone: isCancelled(e) ? "amber" : "red", ms: isCancelled(e) ? 6000 : 30000, key: "op" });
+    } finally { setBusy(""); opn.finish(); }
   };
 
   return (
@@ -90,6 +93,10 @@ export function CursusDialog({ matricule, onClose }: { matricule: string; onClos
         <span className="grow muted small">{selected.length} relevé(s) · {pages + (cover ? 1 : 0)} page(s)</span>
       </div>
       <div className="foot">
+        {busy && <span className="grow muted small" role="status" data-testid="cursus-progress">
+          {opn.cancelling ? "Annulation… (arrêt avant le fichier suivant)" : opn.progress?.message || "Préparation du dossier fusionné…"}</span>}
+        {busy && <button className="btn ghost" disabled={opn.cancelling} onClick={() => void opn.cancel()} data-testid="cursus-cancel">
+          <Icon name="x" />Annuler</button>}
         <button className="btn secondary" disabled={!selected.length || !!busy} onClick={() => void run("print")} data-testid="cursus-print">
           {busy === "print" ? <span className="spinner" /> : <Icon name="printer" />}Imprimer</button>
         <button className="btn primary" disabled={!selected.length || !!busy} onClick={() => void run("export")} data-testid="cursus-export">

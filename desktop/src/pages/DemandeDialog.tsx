@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { call, sx, plural, statutTone, type DemandeFull, type Tone } from "../api";
 import { Badge, Chip, Icon, Modal, Switch, play, useDialogs, useToast } from "../components/ui";
+import { isCancelled, useOperation } from "../operation";
 
 export const STATUT_TONE: Record<string, Tone> = { "EN COURS": "blue", "PRÊTE": "violet", "IMPRIMÉE": "amber", "REMISE": "green", "ANNULÉE": "gray" };
 export const STATUT_AIDE: Record<string, string> = { "EN COURS": "à préparer", "PRÊTE": "dossier prêt, à imprimer", "IMPRIMÉE": "à remettre", "REMISE": "remise au demandeur", "ANNULÉE": "annulée" };
@@ -18,6 +19,7 @@ export function DemandeDialog({ did, onClose }: { did: number; onClose: () => vo
   const { ask, prompt } = useDialogs();
   const [d, setD] = useState<DemandeFull | null>(null);
   const [busy, setBusy] = useState<"" | "prepare" | "print">("");
+  const opn = useOperation();
   const [bordereau, setBordereau] = useState(true);
   const [demandeur, setDemandeur] = useState("");
   const [motif, setMotif] = useState("");
@@ -45,29 +47,31 @@ export function DemandeDialog({ did, onClose }: { did: number; onClose: () => vo
   const prepare = async () => {
     await saveFields();
     setBusy("prepare");
-    toast("Préparation du dossier… (contrôle de chaque relevé avant copie)", { tone: "blue", ms: 600000, sound: false, key: "op" });
+    const op = opn.start("demande");
+    toast("Préparation du dossier… (contrôle de chaque relevé avant copie)", { tone: "blue", ms: 8000, sound: false, key: "op" });
     try {
-      const r = await call<DemandeFull & { prets: unknown[]; bloques: { periode: string; motif: string }[]; pages: number; dossier: string }>("demande_prepare", { did });
+      const r = await call<DemandeFull & { prets: unknown[]; bloques: { periode: string; motif: string }[]; pages: number; dossier: string }>("demande_prepare", { did, op });
       setD(r);
       toast(`Dossier prêt : ${plural(r.prets.length, "relevé")}, ${r.pages} page(s)` + (r.bloques.length ? ` — ${r.bloques.length} écarté(s) : ${r.bloques.map((b) => `${b.periode} (${b.motif})`).join(" ; ")}` : ""),
         { tone: r.bloques.length ? "amber" : "green", ms: 15000, key: "op", action: { label: "Ouvrir le dossier", run: () => void sx.reveal(r.dossier) } });
     } catch (e) {
-      toast(`Préparation impossible : ${errMsg(e)}`, { tone: "red", key: "op" });
-    } finally { setBusy(""); }
+      toast(isCancelled(e) ? errMsg(e) : `Préparation impossible : ${errMsg(e)}`, { tone: isCancelled(e) ? "amber" : "red", key: "op" });
+    } finally { setBusy(""); opn.finish(); }
   };
 
   const printAll = async () => {
     await saveFields();
     setBusy("print");
-    toast("Préparation et envoi à l'imprimante…", { tone: "blue", ms: 600000, sound: false, key: "op" });
+    const op = opn.start("demande");
+    toast("Préparation et envoi à l'imprimante…", { tone: "blue", ms: 8000, sound: false, key: "op" });
     try {
-      const r = await sx.printDemande({ did, with_bordereau: bordereau });
+      const r = await sx.printDemande({ did, with_bordereau: bordereau, op });
       setD(r);
       play("impression");
       toast(`Envoyé à l'imprimante${bordereau ? " (avec bordereau)" : ""}. Remettez les documents puis « Marquer remise ».`, { sound: false, key: "op" });
     } catch (e) {
-      toast(`Impression impossible : ${errMsg(e)}`, { tone: "red", key: "op" });
-    } finally { setBusy(""); }
+      toast(isCancelled(e) ? errMsg(e) : `Impression impossible : ${errMsg(e)}`, { tone: isCancelled(e) ? "amber" : "red", key: "op" });
+    } finally { setBusy(""); opn.finish(); }
   };
 
   const done = async () => {
@@ -150,6 +154,13 @@ export function DemandeDialog({ did, onClose }: { did: number; onClose: () => vo
         </table>
       </div>
       <div className="muted small">{plural(d.items.length, "relevé")} · {pages} page(s) à imprimer · {NEXT[st]}</div>
+      {busy && (
+        <div className="row small" role="status" data-testid="demande-progress">
+          <span className="spinner" />
+          <span className="grow muted">{opn.cancelling ? "Annulation… (arrêt avant le fichier suivant)" : opn.progress?.message || "Préparation du dossier…"}</span>
+          <button className="btn ghost" disabled={opn.cancelling} onClick={() => void opn.cancel()}><Icon name="x" />Arrêter</button>
+        </div>
+      )}
       <div className="foot" style={{ justifyContent: "space-between" }}>
         <div className="row">
           <button className="btn ghost" disabled={!d.demande.dossier} onClick={() => d.demande.dossier && void sx.reveal(d.demande.dossier)}><Icon name="folder" />Ouvrir le dossier</button>

@@ -92,15 +92,15 @@ async function printReleve({ releve_id, duplicata, visually_checked }) {
   }
 }
 
-async function printCursus({ matricule, releve_ids, cover, duplicata }) {
-  const out = await engine.call("cursus_build", { matricule, releve_ids, cover, duplicata, mode: "print" });
+async function printCursus({ matricule, releve_ids, cover, duplicata, op }) {
+  const out = await engine.call("cursus_build", { matricule, releve_ids, cover, duplicata, mode: "print", op: op || null });
   const how = await printFile(out.path, !!settingsCache.duplex);
   const res = await engine.call("cursus_printed", { matricule, ref: out.ref, pages: out.pages, how, file: out.path });
   return { ...out, how, stats: res.stats };
 }
 
-async function printDemande({ did, with_bordereau }) {
-  const res = await engine.call("demande_files_to_print", { did, with_bordereau: !!with_bordereau });
+async function printDemande({ did, with_bordereau, op }) {
+  const res = await engine.call("demande_files_to_print", { did, with_bordereau: !!with_bordereau, op: op || null });
   const hows = [];
   for (const f of res.files) hows.push(await printFile(f, !!settingsCache.duplex));
   return engine.call("demande_printed", { did, how: hows[hows.length - 1] || "" });

@@ -238,3 +238,50 @@ def test_remplacements_essai_origine_et_controle(engine):
         err = engine.wait(engine.send("settings_save", values={"text_rules": [bad]}))["error"]
         assert err["kind"] == "user" and "Corrections Word" in err["message"]
     assert engine.call("settings_get")["text_rules"] == before          # rien d'enregistré
+
+
+@pytest.fixture()
+def private_engine(indexed, tmp_path):
+    """Moteur sur une COPIE de l'index : les aperçus Word produits ici ne modifient pas le fonds partagé."""
+    import dataclasses
+    import shutil
+
+    from core.config import save_settings
+    _db, settings, _archives, _ = indexed
+    home = tmp_path / "engine_data"
+    home.mkdir()
+    shutil.copyfile(settings.db_path, tmp_path / "index.db")
+    own = dataclasses.replace(settings, db_path=str(tmp_path / "index.db"), cache_dir=str(tmp_path / "cache"),
+                              exports_root=str(home / "Exports"))
+    old = os.environ.get("FMSP_DATA_DIR")
+    os.environ["FMSP_DATA_DIR"] = str(home)
+    try:
+        save_settings(own)
+    finally:
+        os.environ["FMSP_DATA_DIR"] = old or ""
+    c = Client(dict(os.environ, FMSP_DATA_DIR=str(home), PYTHONIOENCODING="utf-8"))
+    yield c
+    c.close()
+
+
+def test_cursus_progression_et_annulation_par_le_moteur(private_engine):
+    """Fusion avec des relevés Word : événements « progress » relayés avec l'identifiant de l'opération ;
+    « cancel » répond tout de suite (hors file des fils de travail)."""
+    engine = private_engine
+    info = engine.call("cursus_info", matricule="18M042")
+    ids = [r["id"] for r in info["releves"]]
+    assert any(r["is_word"] for r in info["releves"])
+    t = time.time()
+    assert engine.call("cancel", timeout=5, op="inconnue") == {"cancelled": True} and time.time() - t < 2
+    out = engine.call("cursus_build", timeout=300, matricule="18M042", releve_ids=ids, cover=True, op="ui-42")
+    assert Path(out["path"]).exists()
+    events = []
+    while not engine.events.empty():
+        events.append(engine.events.get())
+    prog = [e["data"] for e in events if e.get("event") == "progress" and e["data"]["op"] == "ui-42"]
+    assert prog and prog[-1]["phase"] == "fusion"
+    conv = [p for p in prog if p["phase"] == "conversion"]
+    assert conv and all(p["message"].startswith(f"Conversion {p['i']}/{p['n']} : ") for p in conv)
+    engine.send("cancel", op="ui-43")                  # annulation reçue avant le début : retenue
+    res = engine.wait(engine.send("cursus_build", matricule="18M042", releve_ids=ids, op="ui-43"), 120)
+    assert res["error"]["kind"] == "user" and "annulée" in res["error"]["message"]

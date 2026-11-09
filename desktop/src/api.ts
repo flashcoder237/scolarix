@@ -148,8 +148,8 @@ export interface Group { matricule: string; nom: string; found: Releve[]; missin
 interface Bridge {
   call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
   printReleve(p: { releve_id: number; duplicata: boolean; visually_checked?: boolean }): Promise<{ ref: string; how: string; pages_label: string; stats: Stats }>;
-  printCursus(p: { matricule: string; releve_ids: number[]; cover: boolean; duplicata: boolean }): Promise<{ ref: string; how: string; pages: number; missing: string[]; stats: Stats }>;
-  printDemande(p: { did: number; with_bordereau: boolean }): Promise<DemandeFull & { stats: Stats }>;
+  printCursus(p: { matricule: string; releve_ids: number[]; cover: boolean; duplicata: boolean; op?: string }): Promise<{ ref: string; how: string; pages: number; missing: string[]; stats: Stats }>;
+  printDemande(p: { did: number; with_bordereau: boolean; op?: string }): Promise<DemandeFull & { stats: Stats }>;
   printFile(file: string): Promise<string>;
   printers(): Promise<{ name: string; isDefault: boolean }[]>;
   readPdf(file: string): Promise<Uint8Array>;
