@@ -229,7 +229,7 @@ def test_remplacements_essai_origine_et_controle(engine):
     # texte simple : les espaces du modèle acceptent plusieurs espaces
     res = engine.call("rules_test", rules=[{"chercher": "Faculté  de Médecine", "remplacer": "FMSP"}],
                       text="Faculté de   Médecine")
-    assert res == {"text": "FMSP", "count": 1}
+    assert res == {"text": "FMSP", "count": 1, "avertissements": []}
     before = engine.call("settings_get")["text_rules"]
     for bad in ({"regex": True, "chercher": "(abc", "remplacer": ""},
                 {"regex": True, "chercher": "abc", "remplacer": r"\2"}):

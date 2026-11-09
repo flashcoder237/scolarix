@@ -12,8 +12,11 @@ def _sources(doublons: list[dict], limit: int = 3) -> str:
     return ", ".join(parts) + (f" et {len(doublons) - limit} autre(s)" if len(doublons) > limit else "")
 
 
-def compute(rel: Releve, siblings: list[Releve], rules_active: bool) -> list[tuple[str, str]]:
-    """[(message, ton)] — ton : red, amber, blue, green."""
+def compute(rel: Releve, siblings: list[Releve], rules_active: bool,
+            apercu: dict | None = None) -> list[tuple[str, str]]:
+    """[(message, ton)] — ton : red, amber, blue, green. ``apercu`` : ce qu'a fait le rendu Word
+    (core.preview.preview_meta : corrections appliquées, ou écartées car la mise en page aurait changé)."""
+    apercu = apercu or {}
     out = []
     ok_sib = [s for s in siblings if s.is_success]
     if not Path(rel.chemin).exists():
@@ -57,7 +60,11 @@ def compute(rel: Releve, siblings: list[Releve], rules_active: bool) -> list[tup
     if rel.date_naissance and not rel.date_connue:
         out.append((f"Date de naissance fictive sur le relevé ({rel.date_naissance}) : à faire corriger "
                     "par la scolarité avant délivrance.", "amber"))
-    if rel.is_word and rules_active:
+    if rel.is_word and rules_active and apercu.get("repli"):
+        out.append(("Corrections non appliquées : mise en page à risque. L'aperçu et l'impression montrent le "
+                    "document d'origine (en-tête non corrigé), car la correction déplaçait d'autres éléments "
+                    f"({apercu.get('motif') or 'rendu différent'}).", "amber"))
+    elif rel.is_word and rules_active and apercu.get("corrections", 1):
         out.append(("En-tête corrigé à l'aperçu et à l'impression (règles de Réglages › Corrections). "
                     "Le fichier d'origine n'est pas modifié.", "blue"))
     if not rel.preview_pdf and not rel.is_word:

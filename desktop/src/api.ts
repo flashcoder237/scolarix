@@ -53,7 +53,19 @@ export interface ReleveDetail {
   alerts: Alert[];
   needs_render: boolean;
   preview_pdf: string | null;
+  /** Rendu Word : corrections appliquées, ou écartées (repli) car la mise en page aurait changé. */
+  apercu?: ApercuInfo;
 }
+
+export interface ApercuInfo {
+  corrections?: number;
+  repli?: boolean;
+  motif?: string;
+  original_disponible?: boolean;
+}
+
+/** Interligne d'une règle : d'origine (null), multiple (« simple », « 1.15 », « 1.5 », « double ») ou en points. */
+export type Interligne = null | "simple" | "1.15" | "1.5" | "double" | { exact: number } | { au_moins: number };
 
 export interface SearchResult {
   q: string;
@@ -122,6 +134,9 @@ export interface TextRule {
   italique?: boolean | null;
   police?: string | null;
   style_sur?: "ajout" | "tout" | null;
+  interligne?: Interligne;
+  espace_avant?: number | null;
+  espace_apres?: number | null;
 }
 
 export interface Info {

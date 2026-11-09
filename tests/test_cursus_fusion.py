@@ -12,7 +12,7 @@ import time
 import pytest
 from conftest import make_settings
 from docx import Document
-from test_preview import FakeConverter
+from test_preview import FakeConverter, word_jobs
 from test_text_rules import make_releve_docx
 
 import core.extractors as extractors
@@ -95,7 +95,7 @@ def test_une_seule_conversion_par_fichier_et_progression(fonds):
     out = service.cursus_build(MAT, word_ids(service), cover=True, op="op-1")
     assert out["missing"] == [] and out["pages"] == 1 + 5
     # 5 relevés dans 3 fichiers : 3 conversions, pas 5 (la compilation n'est convertie qu'une fois)
-    assert len(FakeConverter.calls) == 3
+    assert word_jobs(FakeConverter.calls) == 3
     conv = [e for e in events if e["phase"] == "conversion"]
     assert [(e["i"], e["n"]) for e in conv] == [(1, 3), (2, 3), (3, 3)]
     assert all(e["op"] == "op-1" and e["event"] == "progress" for e in events)
@@ -115,7 +115,7 @@ def test_demande_une_conversion_par_fichier(fonds):
         service.demande_add(did, rid)
     res = service.demande_prepare(did, op="dem-1")
     assert len(res["prets"]) == 5 and res["bloques"] == []
-    assert len(FakeConverter.calls) == 3
+    assert word_jobs(FakeConverter.calls) == 3
     assert [e["i"] for e in events if e["phase"] == "conversion"] == [1, 2, 3]
 
 
@@ -210,7 +210,7 @@ def test_annulation_arrete_entre_deux_fichiers(fonds):
     service.emit = emit
     with pytest.raises(ServiceError, match="annulée"):
         service.cursus_build(MAT, word_ids(service), op="op-x")
-    assert len(FakeConverter.calls) == 1               # le 2e et le 3e fichier ne sont jamais convertis
+    assert word_jobs(FakeConverter.calls) == 1               # le 2e et le 3e fichier ne sont jamais convertis
     assert len(db.deliveries()) == before              # aucun numéro de délivrance consommé
     # annulation reçue avant même le début : retenue
     service.cancel("op-y")
@@ -272,7 +272,7 @@ def test_apercu_du_guichet_remplace_par_le_plus_recent(fonds, monkeypatch):
     assert isinstance(results["EM1 compil.docx"], preview.PreviewCancelled)
     assert not isinstance(results["EM4 S1.docx"], Exception)
     assert not any("compil" in (lbl or "") for lbl in files_converted())
-    assert len(FakeConverter.calls) == 2
+    assert word_jobs(FakeConverter.calls) == 2
 
 
 def test_cursus_partage_le_travail_d_un_apercu_en_cours(fonds, monkeypatch):
@@ -301,7 +301,7 @@ def test_cursus_partage_le_travail_d_un_apercu_en_cours(fonds, monkeypatch):
     release.set()
     th.join(20)
     assert out and out["missing"] == []
-    assert len(FakeConverter.calls) == 3               # chaque fichier une seule fois, guichet et cursus confondus
+    assert word_jobs(FakeConverter.calls) == 3               # chaque fichier une seule fois, guichet et cursus confondus
 
 
 def _wait_idle(svc, timeout=20):
@@ -351,7 +351,8 @@ def test_preparation_d_avance_cede_la_place_a_l_agent(fonds, monkeypatch):
     t.join(10)
     _wait_idle(svc)
     names = [c[2] for c in FakeConverter.calls]
-    assert "EM4 S1.docx" in names and len(names) <= 2     # au plus le fichier anticipé déjà commencé
+    # au plus le fichier anticipé déjà commencé (rendus d'origine + corrigé d'un même fichier : un seul travail)
+    assert "EM4 S1.docx" in names and len(set(names)) <= 2 and word_jobs(FakeConverter.calls) <= 2
 
 
 def test_word_demarre_a_l_avance_sans_word_ne_fait_rien(fonds):

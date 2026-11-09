@@ -22,8 +22,9 @@ from .config import (APP_NAME, APP_VERSION, DEFAULT_TEXT_RULES, UI_SCALES, Setti
 from .database import Database, Releve, missing_periods
 from .extractors import ExtractionError
 from .guard import PrintBlocked, VisualCheckRequired, check_before_print
+from .preview import preview_meta
 from .normalize import best_display_name, looks_like_matricule, norm_matricule, norm_text
-from .text_rules import RuleError, apply_text, compile_rules
+from .text_rules import RuleError, apply_text, compile_rules, rule_warnings
 
 _log = logging.getLogger("scolarix.service")
 
@@ -247,9 +248,14 @@ class Service:
             self._consultation(rel)
         siblings = self.db.level_siblings(rel)
         needs = bool(self.previews is not None and self.previews.needs_render(rel))
+        apercu = preview_meta(rel.cache_pdf) if rel.is_word and not needs else {}
+        if apercu:
+            # « Aperçu : original » proposé quand l'aperçu affiché diffère du document d'origine
+            apercu = dict(apercu, original_disponible=bool(apercu.get("corrections")))
         return {"releve": releve_dict(rel), "siblings": [releve_dict(s) for s in siblings],
-                "alerts": [{"text": t, "tone": tone} for t, tone in alerts.compute(rel, siblings, self.rules_active)],
-                "needs_render": needs, "preview_pdf": None if needs else rel.preview_pdf}
+                "alerts": [{"text": t, "tone": tone}
+                           for t, tone in alerts.compute(rel, siblings, self.rules_active, apercu)],
+                "needs_render": needs, "preview_pdf": None if needs else rel.preview_pdf, "apercu": apercu}
 
     def _consultation(self, rel: Releve) -> None:
         """Traçabilité « qui a consulté quoi » : une ligne CONSULTATION par relevé affiché au guichet et par
@@ -269,6 +275,17 @@ class Service:
             raise ServiceError("Aperçu indisponible : fichier source introuvable ou conversion impossible.")
         self._prefetch_student(rel)
         return self.releve(rel.id)
+
+    def preview_original(self, releve_id: int) -> dict:
+        """Rendu du document SANS aucune correction de texte (bouton « Aperçu : original » du guichet), dans un
+        cache séparé. Pour consultation seulement : l'impression et l'export utilisent toujours l'aperçu normal."""
+        rel = self._get(releve_id)
+        if not rel.is_word:
+            return {"preview_pdf": rel.preview_pdf, "numero_page": rel.numero_page, "page_fin": rel.page_fin}
+        if self.previews is None:
+            raise ServiceError("Aperçu d'origine indisponible sur ce poste.")
+        pdf, first, last = self.previews.original(rel)
+        return {"preview_pdf": pdf, "numero_page": first, "page_fin": last}
 
     def _prefetch_student(self, rel: Releve) -> None:
         """Après l'aperçu demandé : les autres fichiers Word du même étudiant sont préparés en arrière-plan
@@ -751,8 +768,9 @@ class Service:
 
     def rules_test(self, rules: list, text: str) -> dict:
         """Essai des règles sur une phrase : rien n'est enregistré ni appliqué aux fichiers."""
-        out, n = apply_text(text or "", self._check_rules(rules))
-        return {"text": out, "count": n}
+        compiled = self._check_rules(rules)
+        out, n = apply_text(text or "", compiled)
+        return {"text": out, "count": n, "avertissements": rule_warnings(compiled)}
 
 
 def _unlink_temp(file: str | None) -> None:
