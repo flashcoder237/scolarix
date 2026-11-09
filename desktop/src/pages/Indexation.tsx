@@ -6,6 +6,8 @@ import { Badge, Chip, Icon, Seg, Switch, useDialogs, useToast } from "../compone
 interface Anomalie { id: number; horodatage: string; niveau: string; chemin: string | null; message: string; action: string | null }
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const short = (p: string, n = 90) => (p.length > n ? "…" + p.slice(-n) : p);
+const FORMATS: Record<string, [string, string]> = { DOCX: ["Word .docx", "#1D4ED8"], DOC: ["Word .doc 97-2003", "#6D28D9"], PDF_TEXT: ["PDF texte", "#15803D"], PDF_SCAN: ["PDF scanné (OCR)", "#B45309"] };
+const fr = (x: number | undefined) => (x || 0).toLocaleString("fr-FR");
 
 export function Indexation() {
   const app = useApp();
@@ -44,7 +46,11 @@ export function Indexation() {
         n.status = "TERMINÉ"; n.pct = 100;
         n.detail = `Terminé en ${ev.duree_s} s · ${ev.ecrits} relevé(s) écrit(s) · ${ev.ignores} inchangé(s) · ${ev.echecs} en échec`;
       } else if (ev.type === "exit") {
-        if (n.status === "EN COURS" || n.status === "ARRÊT…") { n.status = "ARRÊTÉ"; n.detail = n.detail || "Indexation arrêtée."; }
+        if (n.status === "EN COURS" || n.status === "ARRÊT…") {
+          n.status = "ARRÊTÉ";
+          n.detail = ev.error ? `Le robot s'est arrêté : ${ev.error}` : "Indexation arrêtée. Relancez en mode différentiel pour reprendre là où il s'est arrêté.";
+          toast(n.detail, { tone: "amber", ms: 15000 });
+        }
         app.refreshStats();
       }
       return n;
@@ -86,6 +92,18 @@ export function Indexation() {
       }
     } catch (e) { toast(errMsg(e), { tone: "red" }); }
   };
+  const integrity = async () => {
+    try {
+      const r = await call<{ orphelins: number }>("check_integrity");
+      if (r.orphelins) toast(`${r.orphelins} lien(s) orphelin(s) trouvé(s) : fichiers déplacés, renommés ou supprimés (voir les anomalies). Relancez une indexation différentielle sur le nouveau dossier : seuls les fichiers déplacés seront relus.`, { tone: "amber", ms: 15000 });
+      else toast("Intégrité vérifiée : tous les fichiers indexés sont présents.");
+      setNiveau(""); void call<Anomalie[]>("anomalies", { niveau: null }).then(setAnoms);
+      app.refreshStats();
+    } catch (e) { toast(errMsg(e), { tone: "red" }); }
+  };
+  const reveal = async (path: string) => {
+    if (!(await sx.reveal(path))) toast("Fichier introuvable à cet emplacement (déplacé ou renommé) : dossier le plus proche ouvert.", { tone: "amber", sound: false });
+  };
   const tone = live.status === "EN COURS" ? "blue" : live.status === "TERMINÉ" ? "green" : live.status.startsWith("ARR") ? "amber" : "gray";
   const st = app.stats;
 
@@ -103,9 +121,19 @@ export function Indexation() {
           </label>
           <button className="btn ghost" style={{ marginTop: 18 }} onClick={async () => { const d = await sx.pickFolder({ title: "Dossier racine des archives", defaultPath: src || undefined }); if (d) setSrc(d); }}>Parcourir…</button>
         </div>
+        <div className="muted tiny">Lecture seule : aucune écriture, suppression ni renommage dans ce dossier. Index local : <span className="mono selectable">{app.info?.db_path || "—"}</span></div>
+        <div className="row wrap" data-testid="index-options">
+          <Switch blue checked={!!s?.differential} onChange={(v) => void app.saveSettings({ differential: v })} label="Réindexation différentielle" title="Ignore les fichiers inchangés depuis la dernière passe" />
+          <Switch blue checked={!!s?.ocr_enabled} onChange={(v) => void app.saveSettings({ ocr_enabled: v })} label="OCR des scans" title="Tesseract sur les PDF d'imprimante (plus lent)" />
+          <Switch blue checked={!!s?.ocr_preprocess} onChange={(v) => void app.saveSettings({ ocr_preprocess: v })} label="Deskew + contraste Otsu" title="Redresse les scans de travers avant l'OCR" />
+          <Switch blue checked={!!s?.word_com_enabled} onChange={(v) => void app.saveSettings({ word_com_enabled: v })} label="Passerelle COM Word" title="Lit les .doc 97-2003 avec Word (sinon LibreOffice)" />
+          <Switch blue checked={!!s?.docx_convert_at_index} onChange={(v) => void app.saveSettings({ docx_convert_at_index: v })} label="Préconvertir les .docx" title="Aperçu immédiat, mais indexation bien plus lente. Sinon : aperçu produit à la 1re consultation." />
+        </div>
         <div className="row wrap">
-          <Switch blue checked={!!s?.differential} onChange={(v) => void app.saveSettings({ differential: v })} label="Seulement les fichiers nouveaux ou modifiés" />
-          <Switch blue checked={!!s?.ocr_enabled} onChange={(v) => void app.saveSettings({ ocr_enabled: v })} label="OCR des scans" />
+          <span className="muted small">Processus parallèles : {s?.index_workers ? s.index_workers : `automatique (${app.info?.default_workers ?? "?"})`}</span>
+          <button className="btn ghost sm" onClick={() => app.openSettings("indexation")} title={(s?.exclusions || []).join("\n") || "Aucun dossier ni motif exclu"} data-testid="index-exclusions">
+            <Icon name="filter" size={14} />{s?.exclusions?.length ? `Exclusions (${s.exclusions.length})…` : "Exclure des sous-dossiers…"}</button>
+          <button className="btn ghost sm" onClick={() => void integrity()} disabled={running} data-testid="index-integrity" title="Fichiers indexés déplacés, renommés ou supprimés"><Icon name="link" size={14} />Vérification d'intégrité (liens orphelins)</button>
           <span className="grow" />
           {running ? <button className="btn ink" onClick={() => void stop()} data-testid="index-stop"><Icon name="stop" />Arrêter</button>
             : <button className="btn primary" onClick={() => void start()} data-testid="index-start"><Icon name="play" />Lancer l'indexation</button>}
@@ -119,6 +147,38 @@ export function Indexation() {
           ))}
         </div>
       </section>
+      <div className="stats-grid five" data-testid="index-kpis">
+        {([["doc", "blue", "Relevés indexés", st?.releves], ["layers", "violet", "Étudiants distincts", st?.etudiants], ["eye", "green", "Pages analysées", st?.pages],
+          ["link", "amber", "Relevés sur plusieurs pages", st?.multi_pages], ["x", "red", "Fichiers en échec", st?.echecs]] as const).map(([icon, t, label, n]) => (
+          <div key={label} className="card kpi" style={{ flexDirection: "row", padding: 14 }}><Chip icon={icon} tone={t} size={36} />
+            <div style={{ minWidth: 0 }}><div className="eyebrow ellipsis" title={label}>{label}</div><div className="kpi"><span className="v" style={t === "red" && n ? { color: "var(--red)" } : undefined}>{st ? fr(n) : "—"}</span></div></div></div>
+        ))}
+      </div>
+      <div className="row" style={{ alignItems: "stretch", gap: 14 }}>
+        <section className="card" style={{ flex: 1 }}>
+          <div className="eyebrow">Fonds documentaire</div><h2 className="h3">Formats détectés</h2>
+          {Object.entries(st?.formats || {}).filter(([k]) => FORMATS[k]).map(([k, n], _i, arr) => {
+            const max = Math.max(1, ...arr.map(([, x]) => x));
+            return (<div key={k} className="col" style={{ gap: 3 }}>
+              <div className="row small"><span className="grow">{FORMATS[k][0]}</span><span className="muted">{fr(n)}</span></div>
+              <div style={{ height: 8, borderRadius: 4, background: "var(--line-3)" }}><div style={{ height: 8, borderRadius: 4, width: `${(n * 100) / max}%`, background: FORMATS[k][1] }} /></div>
+            </div>);
+          })}
+          {!Object.keys(st?.formats || {}).length && <div className="muted small">Aucun fichier indexé.</div>}
+        </section>
+        <section className="card" style={{ flex: 2 }}>
+          <div className="eyebrow">Relevés par année académique</div>
+          <h2 className="h3">{st?.annees?.length ? `${fr(st.releves)} relevés · ${st.annees[0][0].slice(0, 4)} → ${st.annees[st.annees.length - 1][0].slice(-4)}` : "—"}</h2>
+          <div className="row" style={{ alignItems: "flex-end", height: 110, gap: 6 }} data-testid="index-years">
+            {(st?.annees || []).map(([a, n]) => {
+              const max = Math.max(1, ...(st?.annees || []).map(([, x]) => x));
+              return (<div key={a} className="col" style={{ alignItems: "center", gap: 3, flex: 1 }} title={`${a} : ${fr(n)}`}>
+                <div style={{ height: (n * 80) / max, width: "100%", maxWidth: 30, borderRadius: 6, background: "#1D4ED8" }} />
+                <span className="tiny muted">{a.length >= 9 ? `${a.slice(2, 4)}-${a.slice(7, 9)}` : a}</span></div>);
+            })}
+          </div>
+        </section>
+      </div>
       <section className="card">
         <div className="row"><h2 className="h2 grow">Base d'index</h2>
           <span className="muted small">{st ? `${st.releves.toLocaleString("fr-FR")} relevés · ${st.etudiants.toLocaleString("fr-FR")} étudiants · ${st.fichiers.toLocaleString("fr-FR")} fichiers · dernière passe : ${st.derniere_indexation || "jamais"}` : ""}</span></div>
@@ -141,7 +201,7 @@ export function Indexation() {
                   <td className="small">{a.horodatage.slice(0, 16)}</td>
                   <td><Badge text={a.niveau} tone={a.niveau === "ERREUR" ? "red" : a.niveau === "AVERTISSEMENT" ? "amber" : "blue"} /></td>
                   <td className="cell2"><div className="l1 ellipsis selectable" title={a.chemin || ""}>{a.chemin ? short(a.chemin, 80) : "—"}</div><div className="l2 selectable">{a.message}</div></td>
-                  <td>{a.chemin && <button className="btn ghost sm" onClick={() => void sx.reveal(a.chemin!)}>Voir le fichier</button>}</td>
+                  <td>{a.chemin && <button className="btn ghost sm" onClick={() => void reveal(a.chemin!)} title="Ouvrir l'emplacement du fichier">{a.action || "Ouvrir le dossier"}</button>}</td>
                 </tr>
               ))}
               {!anoms.length && <tr><td colSpan={4} className="muted" style={{ textAlign: "center", padding: 20 }}>Aucune anomalie.</td></tr>}

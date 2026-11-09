@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { call, plural, type Demande } from "../api";
+import { call, plural, sx, type Demande } from "../api";
 import { useApp, useShortcuts } from "../state";
 import { Badge, Chip, Icon, Seg, useDialogs, useToast } from "../components/ui";
 import { DemandeDialog, STATUT_AIDE, STATUT_TONE } from "./DemandeDialog";
@@ -18,6 +18,7 @@ export function DemandesPage() {
   const [rows, setRows] = useState<Demande[]>([]);
   const [all, setAll] = useState<Demande[]>([]);
   const [open, setOpen] = useState<number | null>(null);
+  const [q, setQ] = useState("");
 
   const load = useCallback(async () => {
     const statuts = FILTRES.find((f) => f[0] === filtre)![2];
@@ -36,6 +37,8 @@ export function DemandesPage() {
   };
   useShortcuts({ "ctrl+n": () => void create() }, app.page === "demandes" && !open);
 
+  const needle = q.trim().toLowerCase();
+  const shown = needle ? rows.filter((d) => [d.numero, d.matricule, d.nom, d.demandeur, d.motif].map((x) => x || "").join(" ").toLowerCase().includes(needle)) : rows;
   const count = (st: string[]) => all.filter((d) => st.includes(d.statut)).length;
   const today = new Date().toISOString().slice(0, 10);
   return (
@@ -52,14 +55,15 @@ export function DemandesPage() {
         ))}
       </div>
       <section className="card grow">
-        <div className="row"><Seg value={filtre} options={FILTRES.map((f) => [f[0], f[1]] as [string, string])} onChange={setFiltre} label="Filtre" /><span className="grow" />
+        <div className="row"><Seg value={filtre} options={FILTRES.map((f) => [f[0], f[1]] as [string, string])} onChange={setFiltre} label="Filtre" />
+          <input className="field grow" style={{ maxWidth: 360 }} placeholder="Filtrer : numéro, matricule, nom, demandeur…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Filtrer les demandes" data-testid="demandes-filter" /><span className="grow" />
           <span className="muted small">Double-clic : ouvrir · « Au guichet » : la rendre active pour y ajouter des relevés</span></div>
         <div className="table-wrap">
           <table className="grid">
             <colgroup><col style={{ width: 130 }} /><col style={{ width: 120 }} /><col /><col /><col style={{ width: 70 }} /><col style={{ width: 200 }} /><col style={{ width: 130 }} /><col style={{ width: 110 }} /></colgroup>
             <thead><tr><th>N° de demande</th><th>Reçue le</th><th>Étudiant</th><th>Demandeur · motif</th><th>Relevés</th><th>Statut</th><th>Prochaine étape</th><th /></tr></thead>
             <tbody>
-              {rows.map((d) => (
+              {shown.map((d) => (
                 <tr key={d.id} onDoubleClick={() => setOpen(d.id)}>
                   <td className="mono small">{d.numero}</td>
                   <td className="small">{(d.creee_le || "").slice(0, 16).replaceAll("-", "/")}</td>
@@ -71,14 +75,15 @@ export function DemandesPage() {
                   <td><div className="row" style={{ gap: 4 }}>
                     <button className="btn ghost sm" onClick={() => setOpen(d.id)}>Ouvrir</button>
                     {["EN COURS", "PRÊTE", "IMPRIMÉE"].includes(d.statut) && <button className="btn ghost sm" title="Rendre active au guichet" onClick={() => { app.setActiveDemande(d.id); app.go("guichet"); }}>Au guichet</button>}
+                    {d.dossier && <button className="btn ghost sm icon" title="Ouvrir le dossier préparé (bordereau, relevés numérotés, A_IMPRIMER_TOUT)" aria-label="Ouvrir le dossier" onClick={() => void sx.reveal(d.dossier!)}><Icon name="folder" size={14} /></button>}
                   </div></td>
                 </tr>
               ))}
-              {!rows.length && <tr><td colSpan={8} className="muted" style={{ textAlign: "center", padding: 24 }}>Aucune demande {FILTRES.find((f) => f[0] === filtre)![1].toLowerCase()}.</td></tr>}
+              {!shown.length && <tr><td colSpan={8} className="muted" style={{ textAlign: "center", padding: 24 }}>{needle && rows.length ? `Aucune demande ne correspond à « ${q.trim()} ».` : `Aucune demande ${FILTRES.find((f) => f[0] === filtre)![1].toLowerCase()}. Au guichet, « Ajouter » (Ctrl+D) ouvre une demande pour l'étudiant affiché.`}</td></tr>}
             </tbody>
           </table>
         </div>
-        <div className="muted tiny">{plural(rows.length, "demande")}</div>
+        <div className="muted tiny">{plural(shown.length, "demande")}{needle ? ` sur ${rows.length}` : ""}</div>
       </section>
       {open && <DemandeDialog did={open} onClose={() => { setOpen(null); app.bumpDemandes(); void load(); }} />}
     </>

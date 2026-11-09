@@ -6,7 +6,7 @@ import {
 import { useApp, useShortcuts } from "../state";
 import { Alert, Badge, Chip, Icon, Seg, Switch, dateFr, highlight, play, useDebounced, useDialogs, useToast } from "../components/ui";
 import { PdfView, forget } from "../components/PdfView";
-import { DemandeDialog } from "./DemandeDialog";
+import { DemandeDialog, STATUT_AIDE, STATUT_TONE } from "./DemandeDialog";
 import { CursusDialog } from "./CursusDialog";
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -33,7 +33,7 @@ export function Guichet() {
 
   // ---------------------------------------------------------------- recherche
   const [query, setQuery] = useState("");
-  const [tolerant, setTolerant] = useState(false);
+  const [tolerant, setTolerant] = useState(true);      // comme la 1.x : tolérance aux fautes par défaut
   const [filiere, setFiliere] = useState<string | null>(null);
   const [view, setView] = useState<"releve" | "groupe">("releve");
   const [res, setRes] = useState<SearchResult | null>(null);
@@ -80,7 +80,7 @@ export function Guichet() {
     if (!id) { setDetail(null); return; }
     const t = window.setTimeout(async () => {          // ↓ maintenu : on ne charge que là où l'on s'arrête
       try {
-        const d = await call<ReleveDetail>("releve", { releve_id: id });
+        const d = await call<ReleveDetail>("releve", { releve_id: id, consult: true });   // CONSULTATION au journal
         if (my !== detailSeq.current) return;
         setDetail(d);
         if (d.needs_render) {
@@ -139,6 +139,7 @@ export function Guichet() {
     if (c.kind === "visual") {
       const i = await ask({ title: "Contrôle visuel", text: c.message || "", choices: [`C'est bien ${c.nom || c.matricule} : continuer`],
         details: "Comparez le nom et le matricule sur l'aperçu avant de confirmer. Votre confirmation est inscrite au journal." });
+      if (i !== 0) void call("visual_refused", { releve_id: current.id, message: c.message || "" }).catch(() => undefined);
       return { ok: i === 0, visual: i === 0 };
     }
     toast(c.message || "Délivrance bloquée.", { tone: "red", ms: 20000 });
@@ -245,6 +246,16 @@ export function Guichet() {
     "ctrl+f": () => inputRef.current?.select(), "f2": () => inputRef.current?.select(),
   }, active && !cursusFor && !demandeOpen);
   useEffect(() => { if (active) inputRef.current?.focus(); }, [active]);
+  // Échap / Ctrl+F depuis un autre écran : retour au guichet, recherche sélectionnée (nouvel étudiant)
+  useEffect(() => { if (app.searchFocus) window.setTimeout(() => inputRef.current?.select(), 0); }, [app.searchFocus]);
+  // chiffres du jour tenus à jour (impressions des autres fenêtres, indexation), comme la 1.x (10 s)
+  useEffect(() => {
+    if (!active) return;
+    const t = window.setInterval(() => app.refreshStats(), 10000);
+    return () => window.clearInterval(t);
+  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
+  // fin d'indexation : la recherche affichée est relancée (nouveaux relevés, pages exactes)
+  useEffect(() => { if (app.indexing.last?.type === "exit" && app.info) void runSearch(query); }, [app.indexing.last]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const onInputKey = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowDown") { e.preventDefault(); move(1); }
@@ -252,7 +263,10 @@ export function Guichet() {
     else if (e.key === "PageDown") { e.preventDefault(); move(8); }
     else if (e.key === "PageUp") { e.preventDefault(); move(-8); }
     else if (e.key === "Escape") { setQuery(""); }
+    else if (e.key === "Enter") { e.preventDefault(); void runSearch(query); }     // sans attendre la fin de la frappe
   };
+  const [jump, setJump] = useState(0);
+  useEffect(() => setJump(0), [current?.id]);
 
   const counts = res?.counts || {};
   const total = res?.results.length || 0;
@@ -271,8 +285,10 @@ export function Guichet() {
           <Icon name="search" size={22} color="#475569" />
           <input ref={inputRef} value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={onInputKey}
             placeholder="Matricule, nom, prénom ou année…" aria-label="Recherche" data-testid="search" spellCheck={false} autoFocus />
+          {res?.norm && query.trim() && <Badge text={`Recherché : ${res.norm}`} tone="blue" title="Matricule normalisé (tirets, espaces, minuscules ignorés)" />}
           {searching && <span className="spinner" style={{ color: "#94A3B8" }} />}
-          <span className="hint">Échap</span>
+          {query && <button className="btn ghost sm icon" aria-label="Effacer la recherche" title="Effacer (Échap)" onClick={() => { setQuery(""); inputRef.current?.focus(); }} data-testid="search-clear"><Icon name="x" size={14} /></button>}
+          <span className="hint" title="Échap ou Ctrl+F : nouvelle recherche, depuis n'importe quel écran">Échap</span>
         </div>
         <div className="row wrap" style={{ gap: 8 }}>
           <span className="eyebrow">Filière</span>
@@ -310,18 +326,20 @@ export function Guichet() {
 
         <section className="col" style={{ flex: "43 1 0", minWidth: 420, gap: 10 }}>
           <Recap rel={rel} detail={detail && current && detail.releve.id === current.id ? detail : null} compact={app.compact}
-            onReveal={() => rel && void sx.reveal(rel.chemin)} />
+            onReveal={() => rel && void sx.reveal(rel.chemin).then((found) => toast(found ? "Dossier source ouvert (fichier surligné). Les originaux restent en lecture seule."
+              : "Fichier original introuvable à son emplacement indexé (déplacé ou renommé ?) : dossier le plus proche ouvert. Lancez la vérification d'intégrité (Indexation).", { tone: found ? "green" : "amber", sound: false }))} />
           <div className="card grow" style={{ gap: 8 }}>
             <div className="row">
               {rel && rel.nb_pages > 1 && Array.from({ length: rel.nb_pages }, (_, i) => rel.numero_page + i).map((p) => (
-                <span key={p} className="badge t-gray">Page {p}</span>
+                <button key={p} className={`badge ${jump === p ? "t-blue" : "t-gray"}`} style={{ border: "none", cursor: "pointer" }} title={`Aller à la page ${p}`}
+                  onClick={() => setJump(p)} data-testid={`page-${p}`}>Page {p}</button>
               ))}
               {rel && rel.nb_pages === 1 && <span className="badge t-gray">Page {rel.numero_page}</span>}
               <span className="grow" />
               <Switch checked={duplicata} onChange={setDuplicata} label="Duplicata" title="Timbre « Duplicata conforme » horodaté et journalisé · l'original reste intact" />
             </div>
             <PdfView file={detail && current && detail.releve.id === current.id ? detail.preview_pdf : null} first={rel?.numero_page || 1}
-              last={rel?.page_fin || 1} version={`${rel?.id}-${version}`} message={message} stamp={duplicata} />
+              last={rel?.page_fin || 1} version={`${rel?.id}-${version}`} message={message} stamp={duplicata} jumpTo={jump || undefined} />
           </div>
           <div className="card" style={{ flex: "none", flexDirection: "row", gap: 8, padding: app.compact ? "10px 12px" : 14 }}>
             <button className="btn primary grow" disabled={!current || !!busy} onClick={() => void doPrint()} data-testid="print">
@@ -344,13 +362,17 @@ export function Guichet() {
 }
 
 // ------------------------------------------------------------------ en-tête et chiffres
+export function greeting(h = new Date().getHours()) {
+  return h < 12 ? "Bonjour" : h < 18 ? "Bon après-midi" : "Bonsoir";
+}
+
 function Header() {
   const { info, stats, compact, openSettings, settings } = useApp();
   return (
     <header className="header">
       <div className="titles">
-        {!compact && <div className="eyebrow">{dateFr()}</div>}
-        <h1 className="h1">Bonjour, {settings?.operateur || info?.operateur || "…"}</h1>
+        {!compact && <div className="eyebrow">{dateFr()} · Guichet d'exploitation</div>}
+        <h1 className="h1">{greeting()}, {settings?.operateur || info?.operateur || "…"}</h1>
       </div>
       {compact && stats && (
         <span className="muted small" title={`Indexation : ${stats.derniere_indexation || "jamais"}`}>
@@ -358,7 +380,7 @@ function Header() {
         </span>
       )}
       <Badge text="Sources en lecture seule" tone="green" big dot />
-      <button className="btn ghost" onClick={openSettings} title="Réglages du poste : opérateur, imprimante, chemins" data-testid="settings">
+      <button className="btn ghost" onClick={() => openSettings()} title="Réglages du poste : opérateur, imprimante, chemins" data-testid="settings">
         <Icon name="sliders" />Poste {settings?.poste || ""}
       </button>
     </header>
@@ -367,9 +389,11 @@ function Header() {
 
 function StatsRow() {
   const { stats, indexing } = useApp();
+  const ev = indexing.last;
+  const prog = indexing.running && ev?.type === "progress" && ev.total ? { done: ev.done as number, total: ev.total as number } : null;
   const items: [string, any, string, string][] = [
     ["shield", "green", "Base d'index", stats ? `${stats.releves.toLocaleString("fr-FR")} relevés · ${stats.etudiants.toLocaleString("fr-FR")} étudiants` : "—"],
-    ["database", "blue", "Indexation", indexing.running ? "En cours…" : stats?.derniere_indexation ? `Dernière passe : ${stats.derniere_indexation}` : "Jamais lancée"],
+    ["database", "blue", "Indexation", prog ? `${Math.floor((prog.done * 100) / prog.total)} % · ${prog.done} / ${prog.total} fichiers` : indexing.running ? "En cours…" : stats?.derniere_indexation ? `Dernière passe : ${stats.derniere_indexation}` : "Jamais lancée"],
     ["printer", "violet", "Imprimés aujourd'hui", stats ? `${stats.imprimes} relevés · ${stats.duplicatas} duplicata(s)` : "—"],
     ["alert", "amber", "Anomalies à revoir", stats ? `${stats.anomalies} fichier(s)` : "—"],
   ];
@@ -378,7 +402,8 @@ function StatsRow() {
       {items.map(([icon, tone, label, value]) => (
         <div key={label} className="card kpi" style={{ flexDirection: "row", padding: 14 }}>
           <Chip icon={icon} tone={tone} />
-          <div className="grow"><div className="eyebrow">{label}</div><div className="h3 ellipsis" title={value}>{value}</div></div>
+          <div className="grow" style={{ minWidth: 0 }}><div className="eyebrow">{label}</div><div className="h3 ellipsis" title={value}>{value}</div>
+            {label === "Indexation" && prog && <div className="progress" style={{ marginTop: 6, height: 6 }}><div style={{ width: `${(prog.done * 100) / prog.total}%` }} /></div>}</div>
         </div>
       ))}
     </div>
@@ -399,6 +424,7 @@ function DemandeBar({ active, list, onPick, onAdd, onOpen, onNew, canAdd }: {
             : compact ? "Demande en cours : aucune" : "Aucune — une demande réunit les relevés demandés par une même personne"}
         </div>
       </div>
+      {active && <Badge text={STATUT_AIDE[active.statut] || active.statut} tone={STATUT_TONE[active.statut] || "gray"} title={`Demandeur : ${active.demandeur || "—"} · matricule ${active.matricule || "—"}`} />}
       <select className="field" style={{ width: compact ? 190 : 230 }} value={active?.id ?? ""} onChange={(e) => onPick(e.target.value ? Number(e.target.value) : null)} aria-label="Demande active" data-testid="demande-picker">
         <option value="">— aucune —</option>
         {list.map((d) => <option key={d.id} value={d.id}>{d.numero} · {d.nom || d.matricule || "?"} ({d.n})</option>)}
@@ -434,7 +460,7 @@ function ResultsTable({ rows, sel, onSel, q, inDemande }: { rows: Releve[]; sel:
                 </td>
                 <td className="cell2"><div className="l1 ellipsis">{r.niveau_num > 0 && r.niveau_num < 100 ? `N${r.niveau_num}` : (r.niveau || "?").replace("Master ", "M")}{r.sem_label ? ` · ${r.sem_label}` : ""}</div>
                   <div className="l2">{FIL_SHORT[r.filiere_code || ""] || r.filiere || "?"}</div></td>
-                <td className="cell2"><div className="l1">{r.annee_academique || "?"}</div><div className="l2">{r.moyenne ? `Moy. ${r.moyenne}` : ""}{r.grade ? ` · ${r.grade}` : ""}</div></td>
+                <td className="cell2"><div className="l1">{r.annee_academique || "?"}</div><div className="l2">{ligne2(r)}</div></td>
                 <td><Badge text={r.statut || "—"} tone={statutTone(r.statut)} dot /></td>
                 <td className="muted">{r.nb_pages > 1 ? `${r.numero_page}–${r.page_fin}` : r.numero_page}</td>
               </tr>
@@ -444,6 +470,14 @@ function ResultsTable({ rows, sel, onSel, q, inDemande }: { rows: Releve[]; sel:
       </table>
     </div>
   );
+}
+
+/** Seconde ligne de la colonne Année (1.x) : rattrapage, sinon moyenne · grade, sinon session ; rien d'inventé. */
+export function ligne2(r: Releve) {
+  if ((r.session || "").toLowerCase().startsWith("rattrap")) return "Session de rattrapage";
+  if (r.moyenne) return `Moy. ${r.moyenne}${r.grade ? ` · ${r.grade}` : ""}`;
+  if (r.session) return `Session ${r.session.toLowerCase()}`;
+  return "";
 }
 
 function GroupedView({ rows, current, onPick }: { rows: Releve[]; current: Releve | null; onPick: (id: number) => void }) {
@@ -501,19 +535,29 @@ function Recap({ rel, detail, compact, onReveal }: { rel: Releve | null; detail:
   if (!rel) return (
     <div className="card" style={{ flex: "none" }}><div className="eyebrow">Contrôle avant impression</div><h2 className="h2">Aucun relevé sélectionné</h2></div>
   );
-  const sem = rel.semestre ? rel.sem_label + (rel.annuel ? " (annuel)" : "") : "?";
+  let sem = rel.semestre ? rel.sem_label + (rel.annuel ? " (annuel)" : "") : "?";
+  if (rel.credits != null) sem += ` · ${rel.credits}/30 crédits`;
+  if ((rel.session || "").toLowerCase().startsWith("rattrap")) sem += " · rattrapage";
   const pages = rel.pages_label + (rel.nb_pages > 1 ? " liées" : "");
+  const bits: string[] = [];
+  if (rel.moyenne) bits.push(`Moyenne ${rel.moyenne}/20`);
+  if (rel.grade) bits.push(`grade ${rel.grade}${rel.mgp ? ` (MGP ${rel.mgp})` : ""}`);
+  if (rel.decision_deduite) bits.push(`décision déduite : ${rel.decision}`);
+  else if (rel.decision) bits.push(`décision : « ${rel.decision} »`);
+  if (rel.date_connue) bits.push(`né(e) le ${rel.date_connue}${rel.lieu_naissance ? ` à ${rel.lieu_naissance}` : ""}`);
+  else if (rel.date_naissance) bits.push("date de naissance non renseignée sur le relevé");
+  const nom = `${(rel.nom || rel.nom_complet).toUpperCase()} ${rel.prenom || ""}`.trim();
   return (
     <div className="card" style={{ flex: "none", maxHeight: "45%", overflow: "auto" }} data-testid="recap">
       <div className="row" style={{ alignItems: "flex-start" }}>
         <div className="grow" style={{ minWidth: 0 }}>
           {!compact && <div className="eyebrow">Contrôle avant impression</div>}
-          <h2 className="h2 ellipsis selectable" title={rel.nom_complet} style={{ fontSize: compact ? 16 : 19 }}>{rel.nom_complet}</h2>
-          <div className="muted small ellipsis">{rel.moyenne ? `Moyenne ${rel.moyenne}/20` : "Moyenne non lue"}{rel.decision ? ` · décision « ${rel.decision} »` : ""}{rel.date_naissance ? ` · né(e) le ${rel.date_naissance}` : ""}</div>
+          <h2 className="h2 ellipsis selectable" title={rel.nom_complet} style={{ fontSize: compact ? 16 : 19 }}>{nom}</h2>
+          <div className="muted small ellipsis selectable" title={bits.join(" · ")} data-testid="recap-details">{bits.join(" · ") || "Moyenne non lue"}</div>
         </div>
         <div className="col" style={{ alignItems: "flex-end", gap: 4 }}>
-          <Badge text={rel.statut || "—"} tone={statutTone(rel.statut)} big dot />
-          <button className="btn link tiny" onClick={onReveal} title="Ouvrir l'emplacement du fichier original (lecture seule)">Fichier original</button>
+          <Badge text={rel.statut || "Décision non lue"} tone={statutTone(rel.statut)} big dot />
+          <button className="btn link tiny" onClick={onReveal} title={`Ouvrir l'emplacement du fichier original (lecture seule) : ${rel.chemin}`} data-testid="recap-reveal">Fichier original</button>
         </div>
       </div>
       {compact ? (
@@ -528,6 +572,7 @@ function Recap({ rel, detail, compact, onReveal }: { rel: Releve | null; detail:
         </div>
       )}
       {(detail?.alerts || []).map((a, i) => <Alert key={i} text={a.text} tone={a.tone} />)}
+      {!compact && <div className="muted tiny ellipsis selectable" title={rel.chemin} data-testid="recap-source">Source : {rel.chemin} · {rel.type_fichier}</div>}
     </div>
   );
 }

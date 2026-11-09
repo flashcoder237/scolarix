@@ -53,8 +53,25 @@ class Engine:
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="travail")
         self.indexer: subprocess.Popen | None = None
         self._indexer_lock = threading.Lock()
+        self._stopping = False
+        self._run_gen = 0
         self.data_dir = data_dir()
         self.methods = self._methods()
+        threading.Thread(target=self._housekeeping, name="menage", daemon=True).start()
+
+    def _housekeeping(self) -> None:
+        """Au démarrage, comme la 1.x : PDF temporaires d'une session interrompue, instances de Word orphelines,
+        exports plus anciens que la durée de conservation (Réglages > Exports)."""
+        from core import exports, pdf_tools
+        for name, fn in (("fichiers temporaires", lambda: pdf_tools.purge_temp(max_age=3600)),
+                         ("Word orphelins", _kill_orphan_words),
+                         ("conservation des exports", lambda: exports.purge_old(self.settings))):
+            try:
+                n = fn()
+                if n:
+                    log.info("ménage au démarrage (%s) : %s élément(s)", name, n)
+            except Exception:
+                log.exception("ménage au démarrage (%s)", name)
 
     # ------------------------------------------------------------------ envoi
     def send(self, msg: dict) -> None:
@@ -71,7 +88,9 @@ class Engine:
                  "demande_get", "demande_create", "demande_update", "demande_add", "demande_remove",
                  "demande_reorder", "demande_prepare", "demande_files_to_print", "demande_printed", "demande_mark",
                  "years", "extraction", "extraction_export", "journal", "anomalies", "verify_identify",
-                 "verify_compare", "verify_report", "settings_get", "settings_save", "rules_defaults", "rules_test"]
+                 "verify_compare", "verify_report", "settings_get", "settings_save", "rules_defaults", "rules_test",
+                 "visual_refused", "demande_add_cursus", "journal_export", "suggest_path", "exports_dir",
+                 "check_integrity", "verify_print_prepare", "verify_printed"]
         table = {n: getattr(s, n) for n in names}
         table.update({"index_start": self.index_start, "index_stop": self.index_stop,
                       "index_reset": self.index_reset, "index_impact": s.index_impact,
@@ -118,7 +137,7 @@ class Engine:
             save_settings(self.settings)
             program = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(ROOT / "main.py")]
             args = program + ["--index", "--json", "--stdin-control", "--source", source,
-                              "--db", str(self.settings.resolved_db_path()),
+                              "--db", str(self.service.db_path),
                               "--full" if (full or not self.settings.differential) else "--only-new"]
             if not self.settings.ocr_enabled:
                 args.append("--no-ocr")
@@ -132,6 +151,8 @@ class Engine:
                                             stderr=errlog, env=env,
                                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             errlog.close()
+            self._stopping = False
+            self._run_gen += 1
             threading.Thread(target=self._relay_index, args=(self.indexer,), daemon=True).start()
         return {"running": True}
 
@@ -150,23 +171,40 @@ class Engine:
             self.send({"event": "index", "data": ev})
         code = proc.wait()
         log.info("indexation terminée (code %s)", code)
-        self.send({"event": "index", "data": {"type": "exit", "code": code}})
+        data = {"type": "exit", "code": code, "stopped": bool(self._stopping)}
+        if code not in (0, None) and not self._stopping:
+            data["error"] = _last_error_line(self.data_dir / "logs" / "indexation.log")
+        self.send({"event": "index", "data": data})
 
     def index_stop(self, force: bool = False) -> dict:
         proc = self.indexer
         if not proc or proc.poll() is not None:
             return {"running": False}
+        self._stopping = True
         if force:
             proc.kill()
-            from core.extractors import kill_orphan_words
-            kill_orphan_words()
+            _kill_orphan_words()
         else:
             try:
                 proc.stdin.write(b"stop\n")
                 proc.stdin.flush()
             except OSError:
                 proc.kill()
+            # comme la 1.x : sans fin propre au bout d'une minute, l'arrêt est forcé (Word compris)
+            gen = self._run_gen
+            timer = threading.Timer(self.FORCE_STOP_AFTER, self._force_stop, args=(proc, gen))
+            timer.daemon = True
+            timer.start()
         return {"running": True, "stopping": True}
+
+    FORCE_STOP_AFTER = 60.0
+
+    def _force_stop(self, proc: subprocess.Popen, gen: int) -> None:
+        if gen != self._run_gen or proc.poll() is not None:
+            return      # indexation déjà finie, ou une nouvelle a été lancée entre-temps
+        log.warning("arrêt propre trop long : indexation arrêtée de force")
+        proc.kill()
+        _kill_orphan_words()
 
     def index_status(self) -> dict:
         return {"running": bool(self.indexer and self.indexer.poll() is None)}
@@ -186,6 +224,32 @@ class Engine:
                 self.previews.close()
             except Exception:
                 pass
+            try:
+                from core.pdf_tools import purge_temp
+                purge_temp()          # PDF temporaires de cette session (données personnelles)
+            except Exception:
+                pass
+
+
+def _kill_orphan_words() -> int:
+    from core.extractors import kill_orphan_words
+    return kill_orphan_words()
+
+
+def _last_error_line(path: Path) -> str | None:
+    """Dernière ligne utile du journal du robot (cause d'un arrêt anormal, montrée à l'agent)."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 8000))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        line = line.strip()
+        if line and not line.startswith("=====") and not line.startswith(("File ", "Traceback")):
+            return line[:200]
+    return None
 
 
 def _json_default(o):

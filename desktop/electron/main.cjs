@@ -42,6 +42,8 @@ const PRELOAD = path.join(__dirname, "preload.cjs");
 let win = null;
 let engine = null;
 let settingsCache = {};
+let indexingRunning = false;       // robot d'indexation au travail (confirmation à la fermeture, comme la 1.x)
+let closeConfirmed = false;
 
 function sendToUi(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
@@ -69,7 +71,29 @@ function createWindow() {
   win.on("unresponsive", () => log.error("interface sans réponse (fenêtre « ne répond pas »)"));
   win.on("responsive", () => log.warn("interface de nouveau réactive"));
   win.webContents.on("console-message", (_e, level, message) => { if (level >= 2) log.warn(`console : ${message}`); });
+  win.on("close", (e) => {
+    if (!indexingRunning || closeConfirmed) return;
+    const r = dialog.showMessageBoxSync(win, {
+      type: "question", buttons: ["Arrêter et quitter", "Continuer l'indexation"], defaultId: 1, cancelId: 1,
+      title: "Indexation en cours", message: "Le robot d'indexation travaille encore. L'arrêter et quitter ?",
+      detail: "Une indexation différentielle reprendra là où il s'est arrêté.",
+    });
+    if (r !== 0) { e.preventDefault(); return; }
+    closeConfirmed = true;
+  });
   win.on("closed", () => { win = null; });
+}
+
+// Fichier introuvable (déplacé, renommé) : on ouvre le dossier existant le plus proche plutôt que rien.
+function nearestExisting(file) {
+  let p = path.resolve(String(file || ""));
+  for (let i = 0; i < 64; i++) {
+    if (fs.existsSync(p)) return p;
+    const up = path.dirname(p);
+    if (up === p) break;
+    p = up;
+  }
+  return os.homedir();
 }
 
 // ---------------------------------------------------------------- impression orchestrée
@@ -99,6 +123,17 @@ async function printCursus({ matricule, releve_ids, cover, duplicata }) {
   return { ...out, how, stats: res.stats };
 }
 
+async function printVerified({ releve_id }) {
+  const prep = await engine.call("verify_print_prepare", { releve_id });
+  try {
+    const how = await printFile(prep.file, prep.duplex);
+    return await engine.call("verify_printed", { releve_id, how, file: prep.file });
+  } catch (err) {
+    fs.promises.unlink(prep.file).catch(() => {});
+    throw err;
+  }
+}
+
 async function printDemande({ did, with_bordereau }) {
   const res = await engine.call("demande_files_to_print", { did, with_bordereau: !!with_bordereau });
   const hows = [];
@@ -121,11 +156,13 @@ function registerIpc() {
     const result = await engine.call(method, params || {});
     if (method === "settings_get" || method === "settings_save") settingsCache = result;
     if (method === "info") settingsCache = result.settings;
+    if (method === "index_start" && result && result.running) indexingRunning = true;
     return result;
   });
   handle("print:releve", printReleve);
   handle("print:cursus", printCursus);
   handle("print:demande", printDemande);
+  handle("print:verified", printVerified);
   handle("print:file", ({ file }) => printFile(file, false));
   handle("printers", async () => (win ? (await win.webContents.getPrintersAsync()).map((p) => ({ name: p.name, isDefault: p.isDefault })) : []));
   handle("pdf:read", async (file) => {
@@ -134,7 +171,19 @@ function registerIpc() {
     const data = await fs.promises.readFile(file);
     return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   });
-  handle("shell:reveal", (file) => { shell.showItemInFolder(file); return true; });
+  handle("shell:reveal", async (file) => {
+    if (typeof file === "string" && fs.existsSync(file)) { shell.showItemInFolder(file); return true; }
+    await shell.openPath(nearestExisting(file));
+    return false;
+  });
+  handle("image:read", async (file) => {
+    // Document soumis à la vérification (photo, scan) : lecture seule, images seulement.
+    const ext = path.extname(String(file || "")).toLowerCase();
+    const mime = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp" }[ext];
+    if (!mime) throw new Error("Aperçu impossible pour ce format d'image (TIFF) : la comparaison du contenu reste faite.");
+    const data = await fs.promises.readFile(file);
+    return `data:${mime};base64,${data.toString("base64")}`;
+  });
   handle("shell:open", (file) => shell.openPath(file));
   handle("dialog:file", async (opts) => {
     const r = await dialog.showOpenDialog(win, { properties: ["openFile"], ...opts });
@@ -163,8 +212,14 @@ app.on("second-instance", () => {
 app.whenReady().then(async () => {
   log.info(`Scolarix ${app.getVersion()} — démarrage (${process.platform}, Electron ${process.versions.electron})`);
   engine = new Engine(app, log);
-  engine.on("event", (msg) => sendToUi("engine:event", msg));
-  engine.on("status", (st) => sendToUi("engine:status", st));
+  engine.on("event", (msg) => {
+    if (msg.event === "index") indexingRunning = msg.data.type !== "exit";
+    sendToUi("engine:event", msg);
+  });
+  engine.on("status", (st) => {
+    if (st.state !== "ready") indexingRunning = false;      // moteur relancé : son robot est arrêté avec lui
+    sendToUi("engine:status", st);
+  });
   registerIpc();
   createWindow();
   engine.start();

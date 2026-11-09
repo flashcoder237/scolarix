@@ -289,11 +289,51 @@ async function search(q) {
     await shot("aucun_resultat");
   });
 
+  await scenario("Parité 1.x : matricule normalisé affiché, fiche détaillée, Échap depuis un autre écran", async () => {
+    await search("18 m 042");
+    await page.getByText("Recherché : 18M042").waitFor({ timeout: 10000 });
+    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.getByTestId("recap-details").waitFor({ timeout: 10000 });
+    const src = await page.getByTestId("recap-reveal").getAttribute("title");     // 768 px : chemin source en infobulle
+    if (!/archives/.test(src || "")) throw new Error(`chemin source absent : ${src}`);
+    await page.keyboard.press("Control+4");
+    await page.getByRole("heading", { name: "Extraction et journal" }).waitFor();
+    await page.locator("body").click({ position: { x: 700, y: 20 } });
+    await page.keyboard.press("Escape");
+    await page.locator('[data-page="guichet"]').waitFor({ state: "visible" });
+    await page.waitForFunction(() => document.activeElement?.getAttribute("data-testid") === "search", null, { timeout: 5000 });
+  });
+
+  await scenario("Demande : « Ajouter tout le cursus validé »", async () => {
+    await search("18M042");
+    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.keyboard.press("Control+n");
+    await page.getByRole("dialog", { name: "Nouvelle demande" }).waitFor();
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(400);
+    await page.keyboard.press("Control+d");
+    await waitToast(/Ajouté à la demande/);
+    await page.getByText("Voir / préparer").click();
+    await page.getByTestId("demande-cursus").click();
+    await waitToast(/ajoutés? \(cursus/);
+    const n = await page.locator('[role="dialog"] table.grid tbody tr').count();
+    if (n < 3) throw new Error(`cursus validé : ${n} relevé(s) dans la demande`);
+    await shot("demande_cursus");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+  });
+
   await scenario("Écran Demandes (Ctrl+2)", async () => {
     await page.keyboard.press("Control+2");
     await page.getByRole("heading", { name: "Demandes de relevés" }).waitFor();
     await page.waitForTimeout(400);
     await shot("demandes");
+    await page.getByText("Toutes", { exact: true }).click();
+    await page.getByTestId("demandes-filter").fill("kouame");
+    await page.waitForTimeout(300);
+    const rows = await page.locator('[data-page="demandes"] table.grid tbody tr').allInnerTexts();
+    if (!rows.length || rows.some((r) => !/KOUAME/i.test(r))) throw new Error(`filtre : ${rows.join(" / ")}`);
+    await page.getByTestId("demandes-filter").fill("");
   });
 
   await scenario("Extraction Décanat et journal du jour (Ctrl+4)", async () => {
@@ -302,7 +342,15 @@ async function search(q) {
     await page.waitForTimeout(800);
     const rows = await page.locator("table.grid").last().locator("tbody tr").count();
     if (rows < 3) throw new Error(`journal du jour : ${rows} ligne(s)`);
+    if (!/CONSULTATION/.test(await page.locator("table.grid").last().innerText())) throw new Error("consultations absentes du journal");
     await shot("extraction");
+    const dest = join(work, "journal_e2e.csv");
+    rmSync(dest, { force: true });
+    await electronApp.evaluate(({ dialog }, file) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath: file }); }, dest);
+    await page.getByTestId("journal-period").selectOption("");
+    await page.getByTestId("journal-export").click();
+    await waitToast(/Journal exporté/);
+    if (!existsSync(dest)) throw new Error("journal CSV non écrit");
   });
 
   await scenario("Vérification : original retrouvé tout seul (Ctrl+5)", async () => {
@@ -319,7 +367,12 @@ async function search(q) {
     const mat = await page.getByTestId("verify-mat").inputValue();
     if (!/conforme/i.test(v) || !mat) throw new Error(`verdict « ${v} », matricule « ${mat} »`);
     await page.locator('[data-page="verification"] [data-testid="viewer"] canvas').first().waitFor({ timeout: 30000 });
+    await page.locator('[data-testid="verify-submitted"] canvas').first().waitFor({ timeout: 30000 });
     await shot("verification");
+    const before = printedCount();
+    await page.getByTestId("verify-print").click();
+    await waitToast(/timbre « Vérifié »/, 60000);
+    await waitPrinted(before + 1);
   });
 
   await scenario("Indexation (Ctrl+3) : relance différentielle", async () => {
@@ -327,6 +380,9 @@ async function search(q) {
     await page.getByTestId("index-start").click();
     await page.getByText("TERMINÉ").first().waitFor({ timeout: 120000 });
     await shot("indexation");
+    await page.getByTestId("index-kpis").getByText("Fichiers en échec").waitFor();
+    await page.getByTestId("index-integrity").click();
+    await waitToast(/Intégrité vérifiée/);
   });
 
   await scenario("Vider l'index puis tout réindexer (journal et registre conservés)", async () => {
@@ -385,8 +441,17 @@ async function search(q) {
 
   await scenario("Réglages : ouverture et enregistrement", async () => {
     await page.getByTestId("settings").click();
-    await page.getByRole("dialog", { name: "Réglages" }).waitFor();
+    const dlg = page.getByRole("dialog", { name: "Réglages" });
+    await dlg.waitFor();
+    await page.getByTestId("set-tesseract").waitFor();
     await shot("reglages");
+    await dlg.getByRole("radio", { name: "Indexation" }).click();
+    await page.getByTestId("exclusion-pattern").click();
+    await page.getByRole("dialog", { name: "Motif à exclure" }).locator("input").fill("*BROUILLON*");
+    await page.keyboard.press("Enter");
+    await page.getByTestId("exclusions").getByText("*BROUILLON*").click();
+    await page.getByTestId("exclusion-remove").click();
+    if (await page.getByTestId("exclusions").getByText("*BROUILLON*").count()) throw new Error("motif non retiré");
     await page.getByTestId("settings-save").click();
     await waitToast(/Réglages enregistrés/);
   });

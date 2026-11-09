@@ -15,10 +15,11 @@ from datetime import datetime
 from pathlib import Path
 
 from . import alerts, demandes, exports, pdf_tools, verification
-from .config import APP_NAME, APP_VERSION, DEFAULT_TEXT_RULES, UI_SCALES, Settings, save_settings
+from .config import (APP_NAME, APP_VERSION, DEFAULT_TEXT_RULES, UI_SCALES, Settings, config_path, is_network_path,
+                     save_settings)
 from .database import Database, Releve, missing_periods
 from .guard import PrintBlocked, VisualCheckRequired, check_before_print
-from .normalize import norm_text
+from .normalize import looks_like_matricule, norm_matricule, norm_text
 from .text_rules import RuleError, apply_text, compile_rules
 
 RELEVE_PROPS = ("nb_pages", "pages_label", "preview_pdf", "is_success", "periode", "sem_label", "annuel", "is_word",
@@ -47,8 +48,13 @@ class Service:
         self.s = settings
         self.previews = previews
         self._local = threading.local()
-        self._db_factory = db_factory or (lambda: Database(self.s.resolved_db_path(),
-                                                            cache_dir=self.s.resolved_cache_dir()))
+        # Base et cache fixés au démarrage : un nouveau chemin choisi dans les Réglages s'applique au redémarrage
+        # (sinon les fils de travail ouvriraient des bases différentes au milieu d'une session).
+        self.db_path = settings.resolved_db_path()
+        self.cache_dir = settings.resolved_cache_dir()
+        self._db_factory = db_factory or (lambda: Database(self.db_path, cache_dir=self.cache_dir))
+        self._consulted: set[int] = set()
+        self._consulted_lock = threading.Lock()
 
     # ------------------------------------------------------------------ socle
     @property
@@ -77,9 +83,17 @@ class Service:
 
     # ------------------------------------------------------------------ accueil
     def info(self) -> dict:
+        import os
+        from .indexer import default_workers
+        try:
+            exports_dir = str(self.s.exports_root_dir())
+        except OSError:
+            exports_dir = ""
         return {"app": APP_NAME, "version": APP_VERSION, "operateur": self.s.operateur, "poste": self.s.poste,
                 "rules_active": self.rules_active, "ui_scales": list(UI_SCALES), "stats": self.stats(),
-                "settings": self.settings_get()}
+                "settings": self.settings_get(), "config_path": str(config_path()), "db_path": str(self.db_path),
+                "cache_dir": str(self.cache_dir), "exports_dir": exports_dir, "cpu_count": os.cpu_count() or 0,
+                "default_workers": default_workers()}
 
     def stats(self) -> dict:
         db = self.db
@@ -91,7 +105,7 @@ class Service:
         anomalies = db.conn.execute(
             "SELECT COUNT(*) FROM anomalies WHERE niveau IN ('ERREUR','AVERTISSEMENT')").fetchone()[0]
         return {"releves": st["releves"], "etudiants": st["etudiants"], "fichiers": st["fichiers"],
-                "pages": st["pages"], "echecs": st["echecs"], "formats": st["formats"], "annees": st["annees"],
+                "pages": st["pages"], "echecs": st["echecs"], "multi_pages": st.get("multi_pages", 0), "formats": st["formats"], "annees": st["annees"],
                 "imprimes": counts.get("IMPRESSION", 0) + counts.get("DUPLICATA", 0),
                 "duplicatas": counts.get("DUPLICATA", 0), "anomalies": anomalies,
                 "derniere_indexation": db.get_meta("derniere_indexation")}
@@ -113,8 +127,11 @@ class Service:
         counts: dict[str, int] = {}
         for r in rels:
             counts[r.filiere_code or "?"] = counts.get(r.filiere_code or "?", 0) + 1
+        mat = norm_matricule(q) if q and looks_like_matricule(q) else ""
         return {"q": q, "results": out, "counts": counts, "ms": round((time.perf_counter() - t0) * 1000),
-                "students": len({r.matricule for r in rels})}
+                "students": len({r.matricule for r in rels}),
+                # « 18 m 042 » recherché comme « 18M042 » : affiché à l'agent, comme dans la 1.x
+                "norm": mat if mat and mat != q.upper() else ""}
 
     def groups(self, releve_ids: list[int]) -> list[dict]:
         """Vue « groupée par étudiant » : tout le dossier de chaque étudiant trouvé, périodes manquantes."""
@@ -136,13 +153,24 @@ class Service:
         return out
 
     # ------------------------------------------------------------------ relevé
-    def releve(self, releve_id: int) -> dict:
+    def releve(self, releve_id: int, consult: bool = False) -> dict:
         rel = self._get(releve_id)
+        if consult:
+            self._consultation(rel)
         siblings = self.db.level_siblings(rel)
         needs = bool(self.previews is not None and self.previews.needs_render(rel))
         return {"releve": releve_dict(rel), "siblings": [releve_dict(s) for s in siblings],
                 "alerts": [{"text": t, "tone": tone} for t, tone in alerts.compute(rel, siblings, self.rules_active)],
                 "needs_render": needs, "preview_pdf": None if needs else rel.preview_pdf}
+
+    def _consultation(self, rel: Releve) -> None:
+        """Traçabilité « qui a consulté quoi » : une ligne CONSULTATION par relevé affiché au guichet et par
+        session (comme la 1.x), pas une par passage de la flèche ↓."""
+        with self._consulted_lock:
+            if rel.id in self._consulted:
+                return
+            self._consulted.add(rel.id)
+        self._log("CONSULTATION", rel, f"{rel.periode} · {rel.annee_academique} · {rel.statut or '?'} · {rel.pages_label}")
 
     def preview(self, releve_id: int) -> dict:
         """Aperçu Word produit au besoin (long : Word ou LibreOffice). Renvoie le relevé à jour."""
@@ -167,6 +195,12 @@ class Service:
             self._log("IMPRESSION BLOQUÉE", rel, str(exc)[:300])
             return {"ok": False, "kind": "blocked", "message": str(exc)}
         return {"ok": True}
+
+    def visual_refused(self, releve_id: int, message: str = "") -> dict:
+        """L'agent n'a pas confirmé le contrôle visuel : la délivrance n'a pas eu lieu, c'est tracé."""
+        rel = self._get(releve_id)
+        self._log("IMPRESSION BLOQUÉE", rel, (message or "Contrôle visuel non confirmé par l'agent")[:300])
+        return {}
 
     def _guarded(self, releve_id: int, visually_checked: bool) -> Releve:
         res = self.check(releve_id, visually_checked)
@@ -292,6 +326,11 @@ class Service:
     def demande_update(self, did: int, fields: dict) -> dict:
         allowed = {k: v for k, v in (fields or {}).items() if k in ("demandeur", "motif", "duplicata", "nom",
                                                                      "matricule", "telephone")}
+        d = self.db.demande(int(did))
+        if d is None:
+            raise ServiceError("Demande introuvable.")
+        if "duplicata" in allowed and bool(allowed["duplicata"]) != bool(d["duplicata"]) and d["statut"] == "PRÊTE":
+            allowed["statut"] = "EN COURS"      # le timbre change : le dossier préparé est à refaire
         if allowed:
             self.db.update_demande(int(did), **allowed)
         return self._demande(did)
@@ -308,6 +347,21 @@ class Service:
             self.db.update_demande(int(did), matricule=rel.matricule, nom=rel.nom_complet)
         res = self._demande(did)
         res["added"] = bool(added)
+        return res
+
+    def demande_add_cursus(self, did: int) -> dict:
+        """« Ajouter tout le cursus validé » : le dernier relevé validé de chaque semestre de l'étudiant."""
+        d = self.db.demande(int(did))
+        if d is None:
+            raise ServiceError("Demande introuvable.")
+        if d["statut"] not in demandes.OUVERTES:
+            raise ServiceError(f"La demande {d['numero']} est {d['statut'].lower()} : ouvrez-en une nouvelle.")
+        if not d["matricule"]:
+            raise ServiceError("Ajoutez d'abord un relevé de l'étudiant.")
+        n = sum(bool(self.db.add_demande_item(int(did), r.id))
+                for r in pdf_tools.select_for_cursus(self.db.cursus(d["matricule"])))
+        res = self._demande(did)
+        res["added_count"] = n
         return res
 
     def demande_remove(self, did: int, releve_id: int) -> dict:
@@ -395,6 +449,38 @@ class Service:
     def journal(self, matricule: str | None = None, since: str | None = None, limit: int = 1000) -> list[dict]:
         return [_row(r) for r in self.db.journal(matricule or None, since or None, int(limit))]
 
+    def journal_export(self, path: str, matricule: str | None = None, since: str | None = None) -> dict:
+        """« Exporter le journal (CSV) » : les lignes affichées (mêmes filtres)."""
+        from . import exporter
+        if not path:
+            path = str(exports.dest_for(self.s, exports.JOURNAL, "Journal.csv"))
+        rows = self.db.journal(matricule or None, since or None, 100000)
+        exporter.export_journal_csv(rows, path)
+        return {"path": str(path), "name": Path(path).name, "count": len(rows)}
+
+    SUGGEST = {"extraction": exports.EXTRACTIONS, "journal": exports.JOURNAL}
+
+    def suggest_path(self, nature: str, filename: str) -> str:
+        """Chemin proposé dans la boîte « Enregistrer sous » : le dossier des exports du mois, nom horodaté."""
+        if nature not in self.SUGGEST:
+            raise ServiceError(f"Nature d'export inconnue : {nature}")
+        return str(exports.dest_for(self.s, self.SUGGEST[nature], Path(filename).name))
+
+    def exports_dir(self) -> str:
+        """« Ouvrir le dossier des exports »."""
+        try:
+            return str(self.s.exports_root_dir())
+        except OSError as exc:
+            raise ServiceError(f"Dossier des exports inaccessible : {exc}") from exc
+
+    def check_integrity(self) -> dict:
+        """Vérification d'intégrité : fichiers indexés déplacés, renommés ou supprimés (liens orphelins)."""
+        missing = [r["chemin"] for r in self.db.orphan_files()]
+        for chemin in missing:
+            self.db.add_anomaly("AVERTISSEMENT", chemin, "Lien orphelin : fichier déplacé, renommé ou supprimé.",
+                                "Relocaliser")
+        return {"orphelins": len(missing), "fichiers": missing[:50]}
+
     def anomalies(self, niveau: str | None = None) -> list[dict]:
         return [_row(r) for r in self.db.anomalies(niveau or None, 500)]
 
@@ -451,7 +537,14 @@ class Service:
         return {"delivered": delivered, "ident": ident, "matricule": mat,
                 "releves": [releve_dict(r) for r in rels], "best": target.id if target else None}
 
-    def verify_compare(self, path: str, releve_id: int) -> dict:
+    def verify_compare(self, path: str, releve_id: int, demandeur: str = "", reference: str = "") -> dict:
+        """Comparaison champ par champ, journalisée (VERIFICATION) comme dans la 1.x."""
+        res, _rows, orig = self._verify_compare(path, releve_id)
+        bad = res["total"] - res["conformes"]
+        self._log("VERIFICATION", orig, f"{demandeur or 'demandeur ?'} · réf. {reference or '?'} · {bad} divergence(s)")
+        return res
+
+    def _verify_compare(self, path: str, releve_id: int) -> tuple[dict, list, Releve]:
         from .extractors import pdf_pages_text
         orig = self._get(releve_id)
         if self.previews is not None and self.previews.needs_render(orig):
@@ -460,14 +553,13 @@ class Service:
         pages = pdf_pages_text(Path(orig.preview_pdf)) if orig.preview_pdf else []
         orig_text = "\n".join(p.text for p in pages[orig.numero_page - 1:orig.page_fin])
         rows = verification.compare(sub_text, orig_text, orig)
-        self._last_verif = (rows, orig)
-        return {"original": releve_dict(orig), "rows": [dict(dataclasses.asdict(r), conforme=r.conforme) for r in rows],
-                "conformes": sum(1 for r in rows if r.conforme), "total": len(rows)}
+        res = {"original": releve_dict(orig), "rows": [dict(dataclasses.asdict(r), conforme=r.conforme) for r in rows],
+               "conformes": sum(1 for r in rows if r.conforme), "total": len(rows)}
+        return res, rows, orig
 
     def verify_report(self, path: str, releve_id: int, demandeur: str = "", reference: str = "") -> dict:
         """Rapport de vérification (PDF) pour l'organisme qui a soumis le document."""
-        res = self.verify_compare(path, releve_id)
-        rows, orig = self._last_verif
+        res, rows, orig = self._verify_compare(path, releve_id)
         dest = exports.dest_for(self.s, exports.VERIFICATIONS, f"Verification_{orig.matricule}.pdf")
         verification.report_pdf(rows, orig, dest, demandeur, reference, self.s.operateur)
         bad = res["total"] - res["conformes"]
@@ -475,11 +567,31 @@ class Service:
                                         f" · rapport {dest}")
         return {"path": str(dest), "name": dest.name}
 
+    def verify_print_prepare(self, releve_id: int) -> dict:
+        """« Imprimer l'original (timbre « Vérifié ») » : pages de l'original contrôlées, timbre apposé."""
+        orig = self._get(releve_id)
+        if self.previews is not None and self.previews.needs_render(orig):
+            orig = self.previews.ensure(orig)
+        if not orig.preview_pdf:
+            raise ServiceError("Aucun original sélectionné.")
+        check_before_print(orig)
+        tmp = pdf_tools.extract_pages(orig.preview_pdf, orig.numero_page, orig.page_fin,
+                                      stamp=pdf_tools.stamp_text("VÉRIFIÉ"))
+        return {"file": str(tmp), "pages_label": orig.pages_label,
+                "duplex": bool(self.s.duplex and orig.nb_pages > 1)}
+
+    def verify_printed(self, releve_id: int, how: str = "", file: str | None = None) -> dict:
+        orig = self._get(releve_id)
+        self._log("IMPRESSION", orig, f"Original vérifié · {orig.pages_label}" + (f" · {how}" if how else ""))
+        _unlink_temp(file)
+        return {"stats": self.stats()}
+
     # ------------------------------------------------------------------ réglages
     PUBLIC = ("operateur", "poste", "source_root", "exports_root", "exports_retention_days", "printer_name",
               "print_command", "duplex", "fuzzy_threshold", "max_results", "ocr_enabled", "differential",
               "index_workers", "exclusions", "text_rules_enabled", "text_rules", "ui_sounds", "ui_animations",
-              "ui_scale", "delivery_ref_stamp", "docx_convert_at_index")
+              "ui_scale", "delivery_ref_stamp", "docx_convert_at_index", "ocr_preprocess", "word_com_enabled",
+              "tesseract_cmd", "soffice_cmd", "db_path", "cache_dir")
 
     def settings_get(self) -> dict:
         return {k: getattr(self.s, k) for k in self.PUBLIC if hasattr(self.s, k)}
@@ -487,6 +599,13 @@ class Service:
     def settings_save(self, values: dict) -> dict:
         if "text_rules" in (values or {}):
             self._check_rules(values["text_rules"])
+        db_path = str((values or {}).get("db_path") or "").strip()
+        if db_path and is_network_path(db_path):
+            raise ServiceError("La base d'index doit rester sur le disque local du poste (pas sur un partage réseau : "
+                               "risque de corruption avec plusieurs guichets).")
+        for key in ("db_path", "cache_dir", "tesseract_cmd", "soffice_cmd", "print_command", "exports_root"):
+            if isinstance((values or {}).get(key), str):
+                values[key] = values[key].strip()
         for k, v in (values or {}).items():
             if k in self.PUBLIC and hasattr(self.s, k):
                 setattr(self.s, k, v)

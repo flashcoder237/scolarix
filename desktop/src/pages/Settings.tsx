@@ -1,21 +1,22 @@
 import { useEffect, useState } from "react";
 import { call, sx, type Settings, type TextRule } from "../api";
-import { useApp } from "../state";
+import { useApp, type SettingsTab } from "../state";
 import { Icon, Modal, Seg, Switch, useDebounced, useDialogs, useToast } from "../components/ui";
 
-type Tab = "poste" | "indexation" | "exports" | "corrections";
+type Tab = SettingsTab;
 
 export function SettingsDialog() {
   const app = useApp();
   const toast = useToast();
-  const [tab, setTab] = useState<Tab>("poste");
+  const [tab, setTab] = useState<Tab>(app.settingsTab || "poste");
   const [v, setV] = useState<Settings | null>(app.settings);
   const [printers, setPrinters] = useState<{ name: string; isDefault: boolean }[]>([]);
   const [logs, setLogs] = useState("");
+  const [version, setVersion] = useState("");
 
   useEffect(() => {
     void sx.printers().then(setPrinters).catch(() => undefined);
-    void sx.appInfo().then((i) => setLogs(i.logs)).catch(() => undefined);
+    void sx.appInfo().then((i) => { setLogs(i.logs); setVersion(i.version); }).catch(() => undefined);
     void call<Settings>("settings_get").then(setV).catch(() => undefined);
   }, []);
   if (!v) return null;
@@ -23,13 +24,18 @@ export function SettingsDialog() {
 
   const save = async () => {
     try {
+      const before = app.settings;
       const s = await app.saveSettings(v);
       if (s.ui_scale) await sx.setZoom(s.ui_scale / 100);
-      toast("Réglages enregistrés.");
+      const moved = !!before && (s.db_path !== before.db_path || s.cache_dir !== before.cache_dir);
+      if (moved) toast("Réglages enregistrés. La nouvelle base d'index ou le nouveau cache d'aperçu s'appliquent au redémarrage de Scolarix.",
+        { tone: "blue", ms: 30000, action: { label: "Redémarrer maintenant", run: () => void sx.relaunch() } });
+      else toast("Réglages enregistrés.");
       app.closeSettings();
     } catch (e) {
       const msg = (e as Error).message || String(e);
       if (/Corrections Word/.test(msg)) setTab("corrections");      // règle invalide : on montre où elle est
+      if (/base d'index/.test(msg)) setTab("poste");
       toast(`Enregistrement impossible : ${msg}`, { tone: "red", ms: 10000 });
     }
   };
@@ -70,6 +76,16 @@ export function SettingsDialog() {
             <Switch blue checked={v.ui_sounds} onChange={(x) => set("ui_sounds", x)} label="Sons discrets" />
             <Switch blue checked={v.ui_animations} onChange={(x) => set("ui_animations", x)} label="Petites animations" />
           </div>
+          <div className="eyebrow">Outils et fichiers du poste (laisser vide = détection automatique)</div>
+          <PathField label="Tesseract (OCR)" value={v.tesseract_cmd} placeholder="C:\Program Files\Tesseract-OCR\tesseract.exe" onChange={(x) => set("tesseract_cmd", x)}
+            pick={() => sx.pickFile({ title: "Programme Tesseract", defaultPath: v.tesseract_cmd || undefined })} testid="set-tesseract" />
+          <PathField label="LibreOffice (soffice)" value={v.soffice_cmd} placeholder="C:\Program Files\LibreOffice\program\soffice.exe" onChange={(x) => set("soffice_cmd", x)}
+            pick={() => sx.pickFile({ title: "Programme LibreOffice (soffice)", defaultPath: v.soffice_cmd || undefined })} />
+          <PathField label="Base d'index (sur le disque local du poste ; changement au redémarrage)" value={v.db_path} placeholder={app.info?.db_path || ""} onChange={(x) => set("db_path", x)}
+            pick={() => sx.saveFile({ title: "Base d'index", defaultPath: v.db_path || app.info?.db_path, filters: [{ name: "SQLite", extensions: ["db"] }] })} testid="set-db" />
+          <PathField label="Cache d'aperçu (changement au redémarrage)" value={v.cache_dir} placeholder={app.info?.cache_dir || ""} onChange={(x) => set("cache_dir", x)}
+            pick={() => sx.pickFolder({ title: "Cache d'aperçu", defaultPath: v.cache_dir || app.info?.cache_dir })} />
+          <div className="muted small">Fichier de configuration : <span className="mono selectable">{app.info?.config_path || "—"}</span> · Scolarix <span className="mono" data-testid="settings-version">{version}</span></div>
           <div className="soft row"><Icon name="info" /><span className="grow small">Journal des incidents (à transmettre à la Cellule informatique en cas de problème) : <span className="mono selectable">{logs}</span></span>
             <button className="btn ghost sm" onClick={() => logs && void sx.openPath(logs)}>Ouvrir</button></div>
         </>}
@@ -77,26 +93,72 @@ export function SettingsDialog() {
           <label className="lbl">Dossier racine des archives<div className="row">
             <input className="field grow" value={v.source_root} onChange={(e) => set("source_root", e.target.value)} />
             <button className="btn ghost" onClick={async () => { const d = await sx.pickFolder({ defaultPath: v.source_root || undefined }); if (d) set("source_root", d); }}>Parcourir…</button></div></label>
-          <label className="lbl">Exclusions (un dossier ou un motif par ligne : sous-dossiers à ne pas indexer)
-            <textarea className="field mono" rows={6} value={(v.exclusions || []).join("\n")} onChange={(e) => set("exclusions", e.target.value.split("\n").map((x) => x.trim()).filter(Boolean))} /></label>
+          <div className="lbl">Dossiers et motifs exclus</div>
+          <Exclusions items={v.exclusions || []} root={v.source_root} onChange={(x) => set("exclusions", x)} />
           <div className="row wrap" style={{ gap: 18 }}>
-            <label className="lbl">Processus d'indexation (0 = automatique)<input className="field" type="number" min={0} max={16} value={v.index_workers} onChange={(e) => set("index_workers", Number(e.target.value))} /></label>
+            <label className="lbl">Processus d'indexation (0 = automatique : {app.info?.default_workers ?? "?"})<input className="field" type="number" min={0} max={16} value={v.index_workers} onChange={(e) => set("index_workers", Number(e.target.value))} /></label>
             <Switch blue checked={v.ocr_enabled} onChange={(x) => set("ocr_enabled", x)} label="OCR des scans (Tesseract)" />
+            <Switch blue checked={v.ocr_preprocess} onChange={(x) => set("ocr_preprocess", x)} label="Deskew + contraste Otsu avant l'OCR" />
+            <Switch blue checked={v.word_com_enabled} onChange={(x) => set("word_com_enabled", x)} label="Passerelle COM Word (.doc 97-2003)" />
             <Switch blue checked={v.differential} onChange={(x) => set("differential", x)} label="Indexation différentielle" />
             <Switch blue checked={v.docx_convert_at_index} onChange={(x) => set("docx_convert_at_index", x)} label="Produire les aperçus Word pendant l'indexation" />
           </div>
+          <div className="muted small">{app.info?.cpu_count || "?"} cœurs détectés. Chaque processus lit ses fichiers et, pour les .doc, pilote sa propre instance de Word : au-delà de 4, le gain est faible et la mémoire augmente. Sur un partage réseau lent, 2 à 3 processus suffisent souvent.</div>
         </>}
         {tab === "exports" && <>
           <label className="lbl">Dossier des exports (Relevés, Duplicatas, Cursus, Demandes, Extractions, Vérifications)<div className="row">
-            <input className="field grow" value={v.exports_root} onChange={(e) => set("exports_root", e.target.value)} placeholder="Documents\Exports Scolarix" />
+            <input className="field grow" value={v.exports_root} onChange={(e) => set("exports_root", e.target.value)} placeholder={app.info?.exports_dir || "Documents\\Exports Scolarix"} />
             <button className="btn ghost" onClick={async () => { const d = await sx.pickFolder({ defaultPath: v.exports_root || undefined }); if (d) set("exports_root", d); }}>Parcourir…</button></div></label>
           <label className="lbl">Conservation des copies recopiables (jours, 0 = toujours)<input className="field" type="number" min={0} value={v.exports_retention_days} onChange={(e) => set("exports_retention_days", Number(e.target.value))} /></label>
-          <div className="muted small">Le registre des délivrances et les extractions ne sont jamais purgés.</div>
+          <div className="muted small">Le registre des délivrances et les extractions ne sont jamais purgés. Classement par nature de demande puis par mois (Releves\2026\11\…) ; un fichier n'est jamais écrasé (date et heure dans le nom). Un dossier partagé du service réunit les exports de tous les guichets : réservez-en l'accès au personnel habilité.</div>
+          <div className="row"><button className="btn secondary" onClick={async () => {
+            try {
+              const dir = v.exports_root && v.exports_root !== app.settings?.exports_root ? v.exports_root : await call<string>("exports_dir");
+              const err = await sx.openPath(dir);
+              if (err) toast(`Dossier inaccessible : ${err}`, { tone: "red" });
+            } catch (e) { toast(`Dossier inaccessible : ${(e as Error).message}`, { tone: "red" }); }
+          }} data-testid="open-exports">
+            <Icon name="folder" />Ouvrir le dossier des exports</button></div>
         </>}
         {tab === "corrections" && <Corrections enabled={v.text_rules_enabled} rules={rules} onEnabled={(x) => set("text_rules_enabled", x)} onRules={(r) => set("text_rules", r)} />}
       </div>
       <div className="foot"><button className="btn ghost" onClick={app.closeSettings}>Annuler</button><button className="btn primary" onClick={() => void save()} data-testid="settings-save">Enregistrer</button></div>
     </Modal>
+  );
+}
+
+function PathField({ label, value, placeholder, onChange, pick, testid }: {
+  label: string; value: string; placeholder?: string; onChange: (v: string) => void; pick: () => Promise<string | null>; testid?: string;
+}) {
+  return (
+    <label className="lbl">{label}<div className="row">
+      <input className="field grow mono" value={value || ""} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} data-testid={testid} />
+      <button className="btn ghost" onClick={async (e) => { e.preventDefault(); const p = await pick(); if (p) onChange(p); }}>Parcourir…</button></div></label>
+  );
+}
+
+// ------------------------------------------------------------------ exclusions de l'indexation (1.x : ExclusionsEditor)
+function Exclusions({ items, root, onChange }: { items: string[]; root: string; onChange: (x: string[]) => void }) {
+  const { prompt } = useDialogs();
+  const [sel, setSel] = useState<number | null>(null);
+  const add = (x: string | null) => { const t = (x || "").trim(); if (t && !items.includes(t)) onChange([...items, t]); };
+  return (
+    <div className="col" style={{ gap: 6 }} data-testid="exclusions">
+      <div className="table-wrap" style={{ maxHeight: 160, minHeight: 60, border: "1px solid var(--line)" }}>
+        <table className="grid"><tbody>
+          {items.map((x, i) => (
+            <tr key={x} className={sel === i ? "sel" : ""} onClick={() => setSel(i)}><td className="mono small selectable">{x}</td></tr>
+          ))}
+          {!items.length && <tr><td className="muted small" style={{ textAlign: "center", padding: 14 }}>Aucun dossier ni motif exclu.</td></tr>}
+        </tbody></table>
+      </div>
+      <div className="row wrap">
+        <button className="btn secondary sm" onClick={async () => add(await sx.pickFolder({ title: "Sous-dossier à exclure", defaultPath: root || undefined }))}>Ajouter un sous-dossier…</button>
+        <button className="btn secondary sm" onClick={async () => add(await prompt("Motif à exclure", "Nom ou motif (ex. *DIPLOME*, Brouillons, *.tmp) :"))} data-testid="exclusion-pattern">Ajouter un motif…</button>
+        <button className="btn ghost sm" disabled={sel === null || sel >= items.length} onClick={() => { onChange(items.filter((_, k) => k !== sel)); setSel(null); }} data-testid="exclusion-remove">Retirer</button>
+      </div>
+      <div className="muted small">Un dossier exclu est ignoré avec tout son contenu. Un motif (* = n'importe quel texte) s'applique au nom des dossiers ET des fichiers, sans tenir compte des majuscules ni des accents : « *DIPLOME* », « Brouillons », « *attestation* ». Les fichiers déjà indexés qui deviennent exclus sont retirés de l'index à la prochaine indexation (jamais du disque).</div>
+    </div>
   );
 }
 
