@@ -186,6 +186,7 @@ interface Bridge {
   saveFile(opts?: { title?: string; defaultPath?: string; filters?: { name: string; extensions: string[] }[] }): Promise<string | null>;
   appInfo(): Promise<{ version: string; logs: string; platform: string; e2e: boolean }>;
   setZoom(factor: number): Promise<boolean>;
+  setFullScreen?(on: boolean): Promise<boolean>;
   log(level: string, text: string): Promise<boolean>;
   relaunch(): Promise<boolean>;
   onEngineEvent(cb: (msg: { event: string; data: any }) => void): () => void;

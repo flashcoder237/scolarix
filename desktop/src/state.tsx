@@ -108,7 +108,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
 // ------------------------------------------------------------------ raccourcis clavier
 // Chaque page déclare ses raccourcis quand elle est affichée ; ils sont prioritaires sur ceux de l'application.
-type Handler = (e: KeyboardEvent) => void;
+// Un raccourci qui renvoie false laisse passer la touche (au raccourci suivant, puis au comportement normal).
+type Handler = (e: KeyboardEvent) => void | boolean;
 const registry: { id: number; map: Record<string, Handler> }[] = [];
 let seq = 0;
 
@@ -131,7 +132,7 @@ export function useShortcuts(map: Record<string, Handler>, active = true) {
   useEffect(() => {
     if (!active) return;
     const entry = { id: ++seq, map: {} as Record<string, Handler> };
-    for (const k of Object.keys(ref.current)) entry.map[k] = (e) => ref.current[k]?.(e);
+    for (const k of Object.keys(ref.current)) entry.map[k] = (e) => ref.current[k]?.(e) ?? undefined;
     registry.push(entry);
     return () => { const i = registry.indexOf(entry); if (i >= 0) registry.splice(i, 1); };
   }, [active, Object.keys(map).join("|")]);
@@ -143,7 +144,11 @@ export function installShortcutListener() {
     const name = keyName(e);
     for (let i = registry.length - 1; i >= 0; i--) {
       const h = registry[i].map[name];
-      if (h) { e.preventDefault(); h(e); return; }
+      if (h) {
+        if (h(e) === false) continue;
+        e.preventDefault();
+        return;
+      }
     }
   });
 }

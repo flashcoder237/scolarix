@@ -44,16 +44,14 @@ function Rail() {
         <button key={p.id} className={`nav${page === p.id ? " active" : ""}`} onClick={() => go(p.id)}
           aria-current={page === p.id ? "page" : undefined} title={`${p.label} (Ctrl+${i + 1})`} data-testid={`nav-${p.id}`}>
           <Icon name={p.icon} size={21} />
-          {p.label}
-          <span className="kbd">Ctrl+{i + 1}</span>
+          <span className="lbl">{p.label}</span>
           {p.id === "indexation" && !!stats?.anomalies && <span className="count" title="Anomalies à revoir">{stats.anomalies}</span>}
         </button>
       ))}
       <div className="spacer" />
       <button className={`nav${settingsOpen ? " active" : ""}`} onClick={() => openSettings()} title="Réglages du poste : imprimante, dossiers, corrections Word (Ctrl+,)" data-testid="nav-reglages">
         <Icon name="sliders" size={21} />
-        Réglages
-        <span className="kbd">Ctrl+,</span>
+        <span className="lbl">Réglages</span>
       </button>
       <div className="avatar" title={`Opérateur : ${settings?.operateur || info?.operateur || "?"} · poste ${settings?.poste || info?.poste || "?"}`} data-testid="avatar">
         {initials(settings?.operateur || info?.operateur)}

@@ -122,6 +122,32 @@ export function Modal({ children, onClose, width = 560, label }: { children: Rea
   );
 }
 
+/** Menu léger ancré sous un bouton (pastille Demande, chiffres du jour, détails de la fiche).
+ *  Échap ou un clic ailleurs le ferme ; il passe avant le mode focus et la recherche, après les fenêtres modales. */
+export function Popover({ open, onClose, children, align = "right", width = 300, label, testid }: {
+  open: boolean; onClose: () => void; children: ReactNode; align?: "left" | "right"; width?: number; label: string; testid?: string;
+}) {
+  const box = useRef<HTMLDivElement>(null);
+  const close = useRef(onClose);
+  close.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const k = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || document.querySelector(".overlay")) return;
+      e.stopPropagation();
+      e.preventDefault();
+      close.current();
+    };
+    // le bouton d'ancrage (même parent) bascule lui-même : il ne compte pas comme « ailleurs »
+    const m = (e: MouseEvent) => { if (!box.current?.parentElement?.contains(e.target as Node)) close.current(); };
+    window.addEventListener("keydown", k, true);
+    window.addEventListener("mousedown", m, true);
+    return () => { window.removeEventListener("keydown", k, true); window.removeEventListener("mousedown", m, true); };
+  }, [open]);
+  if (!open) return null;
+  return <div ref={box} className={`popover ${align}`} role="dialog" aria-label={label} style={{ width }} data-testid={testid}>{children}</div>;
+}
+
 // Questions : « ask » (boutons explicites) et « prompt » (saisie), sous forme de promesses.
 type Dialog =
   | { kind: "ask"; title: string; text: string; details?: string; choices: string[]; danger?: boolean; resolve: (i: number) => void }

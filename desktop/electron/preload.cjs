@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld("scolarix", {
   saveFile: (opts) => invoke("dialog:save", opts),
   appInfo: () => invoke("app:info"),
   setZoom: (factor) => invoke("app:zoom", factor),
+  setFullScreen: (on) => invoke("app:fullscreen", on),
   log: (level, text) => invoke("app:log", level, text),
   relaunch: () => invoke("app:relaunch"),
   onEngineEvent: (cb) => {
