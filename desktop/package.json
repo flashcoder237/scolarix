@@ -14,18 +14,16 @@
     "e2e": "node e2e/run.mjs",
     "dist": "vite build && electron-builder --win --x64"
   },
-  "dependencies": {
-    "pdfjs-dist": "6.5.438",
-    "react": "19.3.1",
-    "react-dom": "19.3.1"
-  },
   "devDependencies": {
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.3.0",
     "electron": "44.10.2",
     "electron-builder": "26.18.0",
+    "pdfjs-dist": "6.5.438",
     "playwright-core": "1.65.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
     "typescript": "5.9.3",
     "vite": "8.3.7"
   },
@@ -67,7 +65,6 @@
       ],
       "icon": "build/icon.ico",
       "artifactName": "Scolarix_Setup_${version}.${ext}",
-      "publisherName": "FMSP - Cellule Informatique (Scolarix)",
       "signtoolOptions": {
         "publisherName": "FMSP - Cellule Informatique (Scolarix)",
         "signingHashAlgorithms": [
@@ -92,5 +89,6 @@
       "uninstallerIcon": "build/icon.ico",
       "deleteAppDataOnUninstall": false
     }
-  }
+  },
+  "dependencies": {}
 }
