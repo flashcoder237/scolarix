@@ -313,3 +313,30 @@ def test_word_absent_message_clair():
     from core.extractors import WORD_MISSING, _word_error
     assert _word_error(Exception(-2147221005, "Invalid class string", None, None)) == WORD_MISSING
     assert _word_error(RuntimeError("autre chose")).startswith("Word COM : ")
+
+
+def test_enregistrements_simultanes_des_reglages(tmp_path, monkeypatch):
+    """Moteur 2.0 : plusieurs enregistrements en même temps (taille d'interface + Réglages) ne s'écrasent pas
+    sur un fichier temporaire commun (PermissionError constatée sous Windows) et laissent un config.json valide."""
+    import json
+    import threading
+    from core import config
+    monkeypatch.setenv("FMSP_DATA_DIR", str(tmp_path))
+    errors = []
+
+    def save(i):
+        try:
+            s = config.Settings(operateur=f"Agent {i}", ui_scale=100 + i % 3 * 10)
+            for _ in range(20):
+                config.save_settings(s)
+        except Exception as exc:   # pragma: no cover - c'est l'échec recherché
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert json.loads(config.config_path().read_text(encoding="utf-8"))["operateur"].startswith("Agent ")
+    assert not list(config.config_path().parent.glob("config.json.*.tmp"))

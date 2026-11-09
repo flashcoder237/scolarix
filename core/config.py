@@ -12,6 +12,9 @@ import json
 import os
 import platform
 import socket
+import threading
+import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -154,12 +157,35 @@ def _upgrade_rules(s: "Settings") -> None:
             rule["sauf_si"] = d["sauf_si"]
 
 
+_SAVE_LOCK = threading.Lock()
+
+
 def save_settings(s: Settings) -> None:
-    """Écriture atomique : le robot relit ce fichier à son démarrage, il ne doit jamais le trouver tronqué."""
+    """Écriture atomique : le robot relit ce fichier à son démarrage, il ne doit jamais le trouver tronqué.
+
+    Le moteur de la 2.0 traite plusieurs demandes à la fois : deux enregistrements simultanés (taille de
+    l'interface + Réglages) écrivaient le MÊME fichier temporaire « config.json.<pid>.tmp » et Windows refusait
+    le second (PermissionError constatée au guichet). Verrou + nom temporaire unique + nouvelles tentatives
+    (antivirus, indexation Windows qui ouvre brièvement config.json)."""
     path = config_path()
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(asdict(s), indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    data = json.dumps(asdict(s), indent=2, ensure_ascii=False)
+    with _SAVE_LOCK:
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            tmp.write_text(data, encoding="utf-8")
+            for attempt in range(25):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except PermissionError:
+                    if attempt == 24:
+                        raise
+                    time.sleep(0.2)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def is_network_path(path: str) -> bool:

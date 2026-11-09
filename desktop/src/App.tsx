@@ -77,7 +77,10 @@ function Shell() {
     const next = step === 0 ? 100 : scales[Math.max(0, Math.min(scales.length - 1, k + step))];
     if (next === cur) { toast(`Taille de l'interface déjà ${step > 0 ? "maximale" : step < 0 ? "minimale" : "normale"} (${cur} %).`, { tone: "blue", ms: 3000, sound: false }); return; }
     await sx.setZoom(next / 100);              // immédiat : pas besoin de redémarrer
-    await app.saveSettings({ ui_scale: next });
+    try { await app.saveSettings({ ui_scale: next }); } catch (e) {
+      toast(`Taille appliquée, mais non mémorisée : ${(e as Error).message || e}`, { tone: "amber", ms: 6000 });
+      return;
+    }
     toast(`Taille de l'interface : ${next} %`, { tone: "blue", ms: 2500, sound: false });
   };
   const nav: Record<string, () => void> = {};
