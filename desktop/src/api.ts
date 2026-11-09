@@ -37,6 +37,10 @@ export interface Releve {
   annuel: boolean;
   is_word: boolean;
   ocr_confiance: number | null;
+  mgp: string | null;
+  lieu_naissance: string | null;
+  decision_deduite: boolean;
+  date_connue: string | null;
   selected?: boolean;
 }
 
@@ -56,12 +60,16 @@ export interface SearchResult {
   counts: Record<string, number>;
   ms: number;
   students: number;
+  norm: string;              // matricule normalisé recherché (« 18 m 042 » → « 18M042 »), sinon vide
 }
 
 export interface Stats {
   releves: number;
   etudiants: number;
   fichiers: number;
+  pages: number;
+  echecs: number;
+  multi_pages: number;
   imprimes: number;
   duplicatas: number;
   anomalies: number;
@@ -92,6 +100,12 @@ export interface Settings {
   ui_scale: number;
   delivery_ref_stamp: boolean;
   docx_convert_at_index: boolean;
+  ocr_preprocess: boolean;
+  word_com_enabled: boolean;
+  tesseract_cmd: string;
+  soffice_cmd: string;
+  db_path: string;
+  cache_dir: string;
 }
 
 export interface TextRule {
@@ -117,6 +131,12 @@ export interface Info {
   ui_scales: number[];
   stats: Stats;
   settings: Settings;
+  config_path: string;
+  db_path: string;           // base réellement ouverte (un nouveau chemin s'applique au redémarrage)
+  cache_dir: string;
+  exports_dir: string;
+  cpu_count: number;
+  default_workers: number;
 }
 
 export interface Demande {
@@ -131,6 +151,8 @@ export interface Demande {
   duplicata: number;
   statut: string;
   dossier: string | null;
+  operateur?: string | null;
+  poste?: string | null;
   n: number;
 }
 
@@ -150,6 +172,8 @@ interface Bridge {
   printReleve(p: { releve_id: number; duplicata: boolean; visually_checked?: boolean }): Promise<{ ref: string; how: string; pages_label: string; stats: Stats }>;
   printCursus(p: { matricule: string; releve_ids: number[]; cover: boolean; duplicata: boolean; op?: string }): Promise<{ ref: string; how: string; pages: number; missing: string[]; stats: Stats }>;
   printDemande(p: { did: number; with_bordereau: boolean; op?: string }): Promise<DemandeFull & { stats: Stats }>;
+  printVerified(p: { releve_id: number }): Promise<{ stats: Stats }>;
+  readImage(file: string): Promise<string>;
   printFile(file: string): Promise<string>;
   printers(): Promise<{ name: string; isDefault: boolean }[]>;
   readPdf(file: string): Promise<Uint8Array>;

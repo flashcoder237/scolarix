@@ -1,4 +1,4 @@
-import { Component, useEffect, type ReactNode } from "react";
+import { Component, useEffect, useState, type ReactNode } from "react";
 import { sx } from "./api";
 import { AppProvider, PAGES, installShortcutListener, useApp, useShortcuts, type PageId } from "./state";
 import { DialogHost, Icon, ToastHost, configureSounds, useToast } from "./components/ui";
@@ -28,8 +28,15 @@ class Boundary extends Component<{ children: ReactNode; name: string }, { error:
   }
 }
 
+function initials(name: string | undefined) {
+  const parts = (name || "?").replace(/[._]/g, " ").split(/\s+/).filter(Boolean);
+  return parts.slice(0, 2).map((p) => p[0]).join("").toUpperCase() || "?";
+}
+
 function Rail() {
-  const { page, go, stats, openSettings, settingsOpen } = useApp();
+  const { page, go, stats, openSettings, settingsOpen, settings, info } = useApp();
+  const [version, setVersion] = useState("");
+  useEffect(() => { void sx.appInfo().then((i) => setVersion(i.version)).catch(() => undefined); }, []);
   return (
     <nav className="rail" aria-label="Navigation">
       <img className="logo" src="./scolarix_symbole.svg" alt="Scolarix" />
@@ -43,11 +50,15 @@ function Rail() {
         </button>
       ))}
       <div className="spacer" />
-      <button className={`nav${settingsOpen ? " active" : ""}`} onClick={openSettings} title="Réglages du poste : imprimante, dossiers, corrections Word (Ctrl+,)" data-testid="nav-reglages">
+      <button className={`nav${settingsOpen ? " active" : ""}`} onClick={() => openSettings()} title="Réglages du poste : imprimante, dossiers, corrections Word (Ctrl+,)" data-testid="nav-reglages">
         <Icon name="sliders" size={21} />
         Réglages
         <span className="kbd">Ctrl+,</span>
       </button>
+      <div className="avatar" title={`Opérateur : ${settings?.operateur || info?.operateur || "?"} · poste ${settings?.poste || info?.poste || "?"}`} data-testid="avatar">
+        {initials(settings?.operateur || info?.operateur)}
+      </div>
+      <div className="version" data-testid="version" title="Version de Scolarix">v{version}</div>
     </nav>
   );
 }
@@ -85,7 +96,8 @@ function Shell() {
   };
   const nav: Record<string, () => void> = {};
   PAGES.forEach((p, i) => { nav[`ctrl+${i + 1}`] = () => app.go(p.id as PageId); });
-  useShortcuts({ ...nav, "ctrl+,": () => app.openSettings(), "ctrl+plus": () => void zoom(1), "ctrl+shift+plus": () => void zoom(1), "ctrl+minus": () => void zoom(-1), "ctrl+0": () => void zoom(0) });
+  // Échap / Ctrl+F : nouvel étudiant, depuis n'importe quel écran (comme la 1.x)
+  useShortcuts({ ...nav, "escape": () => app.focusSearch(), "ctrl+f": () => app.focusSearch(), "ctrl+,": () => app.openSettings(), "ctrl+plus": () => void zoom(1), "ctrl+shift+plus": () => void zoom(1), "ctrl+minus": () => void zoom(-1), "ctrl+0": () => void zoom(0) });
 
   const body: Record<PageId, ReactNode> = {
     guichet: <Guichet />, demandes: <DemandesPage />, indexation: <Indexation />, extraction: <Extraction />, verification: <Verification />,

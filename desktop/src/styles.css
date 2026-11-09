@@ -75,9 +75,14 @@ input, textarea, select, button { font: inherit; color: inherit; }
 .nav .count { position: absolute; top: 4px; right: 10px; background: var(--blue); color: #fff; font-size: 10px;
   min-width: 18px; height: 18px; border-radius: 9px; display: grid; place-items: center; padding: 0 4px; }
 .rail .spacer { flex: 1; }
+.rail .avatar { width: 42px; height: 42px; border-radius: 14px; background: var(--blue-soft); color: var(--blue);
+  display: grid; place-items: center; font-weight: 800; font-size: 13px; margin-top: 6px; flex: none; }
+.rail .version { font: 600 9.5px var(--mono); color: var(--faint); }
+.compact .rail .avatar { width: 34px; height: 34px; border-radius: 11px; font-size: 11.5px; margin-top: 2px; }
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--gap); }
 .page { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--gap); }
 .page.scroll { overflow: auto; padding-right: 4px; }
+.page.scroll > * { flex-shrink: 0; }      /* écran qui défile : les cartes gardent leur hauteur */
 
 .header { display: flex; align-items: flex-end; gap: 14px; flex: none; }
 .header .titles { flex: 1; min-width: 0; }
@@ -243,6 +248,7 @@ body:has(.overlay) .toasts { top: 16px; bottom: auto; flex-direction: column-rev
 .kpi { display: flex; align-items: center; gap: 12px; }
 .kpi .v { font: 700 18px var(--display); }
 .stats-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; flex: none; }
+.stats-grid.five { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .progress { height: 12px; background: #E8EDF4; border-radius: 7px; overflow: hidden; }
 .progress > div { height: 100%; background: var(--blue); border-radius: 7px; transition: width .3s; }
 .steps { display: flex; gap: 8px; align-items: center; }

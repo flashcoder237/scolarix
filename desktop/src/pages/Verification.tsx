@@ -18,16 +18,20 @@ export function Verification() {
   const [busy, setBusy] = useState("");
   const [demandeur, setDemandeur] = useState("");
   const [reference, setReference] = useState("");
+  const [image, setImage] = useState<string | null>(null);
+  const [imageErr, setImageErr] = useState("");
+  const [printing, setPrinting] = useState(false);
 
   const compare = async (p: string, id: number) => {
     setBusy("Comparaison…");
-    try { setCmp(await call<Cmp>("verify_compare", { path: p, releve_id: id })); } catch (e) { toast(`Lecture impossible : ${errMsg(e)}`, { tone: "red" }); } finally { setBusy(""); }
+    try { setCmp(await call<Cmp>("verify_compare", { path: p, releve_id: id, demandeur, reference })); } catch (e) { toast(`Lecture impossible : ${errMsg(e)}`, { tone: "red" }); } finally { setBusy(""); }
   };
 
   const load = async () => {
     const p = await sx.pickFile({ title: "Document soumis", filters: [{ name: "Documents", extensions: ["pdf", "png", "jpg", "jpeg", "tif", "tiff"] }] });
     if (!p) return;
-    setPath(p); setCmp(null); setIdent(null);
+    setPath(p); setCmp(null); setIdent(null); setImage(null); setImageErr("");
+    if (!p.toLowerCase().endsWith(".pdf")) void sx.readImage(p).then(setImage).catch((e) => setImageErr(errMsg(e)));
     setBusy("Lecture du document soumis…");
     try {
       const r = await call<Ident>("verify_identify", { path: p });
@@ -42,10 +46,11 @@ export function Verification() {
   };
 
   const findOriginal = async () => {
-    const r = await call<{ results: Releve[] }>("search", { q: mat });
-    const list = r.results.filter((x) => x.matricule === r.results[0]?.matricule);
+    if (!mat.trim()) return;
+    // matricule exact (tous les relevés de l'étudiant), comme la 1.x : pas de recherche approchée ici
+    const list = await call<{ releves: Releve[] }>("cursus_info", { matricule: mat.trim() }).then((r) => r.releves).catch(() => [] as Releve[]);
     setRels(list);
-    if (!list.length) { toast("Aucun relevé pour ce matricule.", { tone: "amber" }); return; }
+    if (!list.length) { setOrig(null); setCmp(null); toast("Aucun relevé indexé pour ce matricule : document probablement non authentique ou matricule erroné.", { tone: "red" }); return; }
     const id = list[list.length - 1].id;
     setOrig(id);
     if (path) await compare(path, id);
@@ -57,6 +62,15 @@ export function Verification() {
       const r = await call<{ path: string; name: string }>("verify_report", { path, releve_id: orig, demandeur, reference });
       toast(`Rapport généré : ${r.name}`, { ms: 12000, action: { label: "Ouvrir le dossier", run: () => void sx.reveal(r.path) } });
     } catch (e) { toast(errMsg(e), { tone: "red" }); }
+  };
+
+  const printOriginal = async () => {
+    if (!orig) { toast("Aucun original sélectionné.", { tone: "amber" }); return; }
+    setPrinting(true);
+    try {
+      await sx.printVerified({ releve_id: orig });
+      toast("Original envoyé à l'imprimante avec le timbre « Vérifié ».");
+    } catch (e) { toast(`Impression impossible : ${errMsg(e)}`, { tone: "red" }); } finally { setPrinting(false); }
   };
 
   const bad = cmp ? cmp.total - cmp.conformes : 0;
@@ -79,6 +93,10 @@ export function Verification() {
               {rels.map((r) => <option key={r.id} value={r.id}>{r.periode} · {r.annee_academique} · {r.statut || "?"}</option>)}
             </select></label>
         </div>
+        <div className="row wrap">
+          <label className="lbl grow">Organisme demandeur<input className="field" placeholder="Ambassade, Ordre, université étrangère…" value={demandeur} onChange={(e) => setDemandeur(e.target.value)} data-testid="verify-demandeur" /></label>
+          <label className="lbl">Référence<input className="field" placeholder="N° de courrier / référence" value={reference} onChange={(e) => setReference(e.target.value)} /></label>
+        </div>
         {ident?.delivered && <div className="alert t-green"><Icon name="check" size={16} />Registre : document délivré par le guichet, réf. {ident.delivered.reference}.</div>}
       </section>
       {cmp && (
@@ -88,30 +106,36 @@ export function Verification() {
             <div className="small">{cmp.conformes}/{cmp.total} éléments identiques · original : {o?.periode} · {o?.annee_academique}</div></div>
         </section>
       )}
-      <div className="row" style={{ alignItems: "stretch", gap: 14, minHeight: 420 }}>
-        <section className="card" style={{ flex: 1 }}>
-          <h2 className="h3">Comparaison champ par champ</h2>
-          <div className="table-wrap">
-            <table className="grid">
-              <colgroup><col style={{ width: 150 }} /><col /><col /><col style={{ width: 90 }} /></colgroup>
-              <thead><tr><th>Champ</th><th>Document soumis</th><th>Original</th><th /></tr></thead>
-              <tbody>{(cmp?.rows || []).map((r, i) => (
-                <tr key={i}><td className="small">{r.champ}</td><td className="selectable small">{r.soumis || "—"}</td><td className="selectable small">{r.original || "—"}</td>
-                  <td><Badge text={r.conforme ? "OK" : "DIFFÉRENT"} tone={r.conforme ? "green" : "red"} /></td></tr>
-              ))}</tbody>
-            </table>
-          </div>
-          <div className="row wrap">
-            <input className="field grow" placeholder="Demandeur (organisme)" value={demandeur} onChange={(e) => setDemandeur(e.target.value)} />
-            <input className="field" placeholder="Sa référence" value={reference} onChange={(e) => setReference(e.target.value)} />
-            <button className="btn secondary" disabled={!cmp} onClick={() => void report()}><Icon name="doc" />Rapport PDF</button>
-          </div>
+      <div className="row" style={{ alignItems: "stretch", gap: 14, minHeight: 460 }}>
+        <section className="card" style={{ flex: 1 }} data-testid="verify-submitted">
+          <div className="row"><h2 className="h3 grow">Document soumis</h2><Badge text={!path ? "NON CHARGÉ" : busy ? "LECTURE…" : "LU"} tone={!path ? "gray" : busy ? "blue" : "green"} /></div>
+          {path && path.toLowerCase().endsWith(".pdf") ? <PdfView file={path} first={1} last={20} version={path} />
+            : image ? <div className="viewer" style={{ overflow: "auto" }}><img src={image} alt="Document soumis" style={{ width: "100%", display: "block" }} /></div>
+            : <div className="viewer"><div className="msg">{imageErr || (path ? "Chargement…" : "Aucun document soumis.")}</div></div>}
         </section>
         <section className="card" style={{ flex: 1 }}>
           <div className="row"><h2 className="h3 grow">Original indexé</h2>{o && <Badge text={o.statut || "—"} tone={statutTone(o.statut)} />}</div>
           <PdfView file={o?.preview_pdf || null} first={o?.numero_page || 1} last={o?.page_fin || 1} version={String(o?.id)} />
         </section>
       </div>
+      <section className="card" style={{ flex: "none" }}>
+        <h2 className="h3">Comparaison champ par champ</h2>
+        <div className="table-wrap">
+          <table className="grid">
+            <colgroup><col style={{ width: 150 }} /><col /><col /><col style={{ width: 90 }} /></colgroup>
+            <thead><tr><th>Champ</th><th>Document soumis</th><th>Original</th><th /></tr></thead>
+            <tbody>{(cmp?.rows || []).map((r, i) => (
+              <tr key={i} style={r.conforme ? undefined : { background: "#FFF6F6" }}><td className="small">{r.champ}</td><td className="selectable small">{r.soumis || "—"}</td><td className="selectable small">{r.original || "—"}</td>
+                <td><Badge text={r.conforme ? "OK" : "DIFFÉRENT"} tone={r.conforme ? "green" : "red"} /></td></tr>
+            ))}</tbody>
+          </table>
+        </div>
+        <div className="row wrap">
+          <button className="btn primary" disabled={!cmp} onClick={() => void report()} data-testid="verify-report"><Icon name="doc" />Générer le rapport de vérification (PDF)</button>
+          <button className="btn secondary" disabled={!orig || printing} onClick={() => void printOriginal()} data-testid="verify-print">
+            {printing ? <span className="spinner" /> : <Icon name="printer" />}Imprimer l'original (timbre « Vérifié »)</button>
+        </div>
+      </section>
     </div>
   );
 }

@@ -25,10 +25,15 @@ interface AppState {
   compact: boolean;
   engine: { state: string; message?: string };
   indexing: { running: boolean; last: any };
-  openSettings: () => void;
+  openSettings: (tab?: SettingsTab) => void;
   settingsOpen: boolean;
+  settingsTab: SettingsTab;
   closeSettings: () => void;
+  searchFocus: number;                 // change quand Échap / Ctrl+F demande la recherche (depuis tout écran)
+  focusSearch: () => void;
 }
+
+export type SettingsTab = "poste" | "indexation" | "exports" | "corrections";
 
 const Ctx = createContext<AppState>(null as unknown as AppState);
 export const useApp = () => useContext(Ctx);
@@ -44,6 +49,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [engine, setEngine] = useState<{ state: string; message?: string }>({ state: "starting" });
   const [indexing, setIndexing] = useState<{ running: boolean; last: any }>({ running: false, last: null });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("poste");
+  const [searchFocus, setSearchFocus] = useState(0);
   const loaded = useRef(false);
 
   const load = useCallback(async () => {
@@ -90,7 +97,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider value={{
       info, settings, stats, page, go: setPage, refreshStats, saveSettings, activeDemande, setActiveDemande,
       demandeVersion, bumpDemandes: () => setDemandeVersion((v) => v + 1), compact, engine, indexing,
-      openSettings: () => setSettingsOpen(true), settingsOpen, closeSettings: () => setSettingsOpen(false),
+      openSettings: (tab: SettingsTab = "poste") => { setSettingsTab(tab); setSettingsOpen(true); }, settingsOpen, settingsTab,
+      closeSettings: () => setSettingsOpen(false),
+      searchFocus, focusSearch: () => { setPage("guichet"); setSearchFocus((n) => n + 1); },
     }}>
       {children}
     </Ctx.Provider>

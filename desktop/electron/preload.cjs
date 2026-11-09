@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld("scolarix", {
   printReleve: (p) => invoke("print:releve", p),
   printCursus: (p) => invoke("print:cursus", p),
   printDemande: (p) => invoke("print:demande", p),
+  printVerified: (p) => invoke("print:verified", p),
+  readImage: (file) => invoke("image:read", file),
   printFile: (file) => invoke("print:file", { file }),
   printers: () => invoke("printers"),
   readPdf: (file) => invoke("pdf:read", file),

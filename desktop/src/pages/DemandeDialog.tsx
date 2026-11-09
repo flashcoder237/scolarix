@@ -88,6 +88,14 @@ export function DemandeDialog({ did, onClose }: { did: number; onClose: () => vo
     setD(await call<DemandeFull>("demande_mark", { did, statut: "ANNULÉE" }));
   };
 
+  const addCursus = async () => {
+    try {
+      const r = await call<DemandeFull & { added_count: number }>("demande_add_cursus", { did });
+      setD(r);
+      toast(`${plural(r.added_count, "relevé ajouté", "relevés ajoutés")} (cursus : dernier relevé validé de chaque semestre).`, { tone: r.added_count ? "green" : "blue" });
+    } catch (e) { toast(errMsg(e), { tone: "amber" }); }
+  };
+
   const move = async (idx: number, step: number) => {
     const ids = d.items.map((it) => it.item.releve_id);
     const j = idx + step;
@@ -103,7 +111,7 @@ export function DemandeDialog({ did, onClose }: { did: number; onClose: () => vo
         <Chip icon="folder" tone="violet" size={44} />
         <div className="grow">
           <h2 className="h2">Demande {d.demande.numero} · {d.demande.nom || "—"} ({d.demande.matricule || "—"})</h2>
-          <div className="muted small">Reçue le {(d.demande.creee_le || "").slice(0, 16).replaceAll("-", "/")} · {d.demande.dossier ? `dossier : ${d.demande.dossier}` : "dossier pas encore préparé"}</div>
+          <div className="muted small">Reçue le {(d.demande.creee_le || "").slice(0, 16).replaceAll("-", "/")}{d.demande.operateur ? ` par ${d.demande.operateur}` : ""} · {d.demande.dossier ? `dossier : ${d.demande.dossier}` : "dossier pas encore préparé"}</div>
         </div>
         <Badge text={`${st} — ${STATUT_AIDE[st] || ""}`} tone={STATUT_TONE[st] || "gray"} big />
         <button className="btn ghost icon" onClick={onClose} aria-label="Fermer"><Icon name="x" /></button>
@@ -153,7 +161,11 @@ export function DemandeDialog({ did, onClose }: { did: number; onClose: () => vo
           </tbody>
         </table>
       </div>
-      <div className="muted small">{plural(d.items.length, "relevé")} · {pages} page(s) à imprimer · {NEXT[st]}</div>
+      <div className="row">
+        <span className="muted small grow">{plural(d.items.length, "relevé")} · {pages} page(s) à imprimer · {NEXT[st]}</span>
+        <button className="btn secondary sm" disabled={!editable || !d.demande.matricule || !!busy} onClick={() => void addCursus()} data-testid="demande-cursus"
+          title={d.demande.matricule ? "Ajoute le dernier relevé validé de chaque semestre de l'étudiant" : "Ajoutez d'abord un relevé de l'étudiant"}><Icon name="layers" size={14} />Ajouter tout le cursus validé</button>
+      </div>
       {busy && (
         <div className="row small" role="status" data-testid="demande-progress">
           <span className="spinner" />
