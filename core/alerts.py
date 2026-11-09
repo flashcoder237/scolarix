@@ -7,6 +7,11 @@ from pathlib import Path
 from .database import Releve
 
 
+def _sources(doublons: list[dict], limit: int = 3) -> str:
+    parts = [f"{Path(d['chemin']).name} ({d['pages_label'].lower()})" for d in doublons[:limit]]
+    return ", ".join(parts) + (f" et {len(doublons) - limit} autre(s)" if len(doublons) > limit else "")
+
+
 def compute(rel: Releve, siblings: list[Releve], rules_active: bool) -> list[tuple[str, str]]:
     """[(message, ton)] — ton : red, amber, blue, green."""
     out = []
@@ -31,7 +36,7 @@ def compute(rel: Releve, siblings: list[Releve], rules_active: bool) -> list[tup
     elif not rel.statut:
         out.append(("Décision du jury non lue automatiquement : contrôlez-la sur l'aperçu.", "amber"))
     if rel.nb_pages > 1:
-        pages = " et ".join(str(p) for p in range(rel.numero_page, rel.page_fin + 1))
+        pages =" et ".join(str(p) for p in range(rel.numero_page, rel.page_fin + 1))
         out.append((f"Ce relevé comporte {rel.nb_pages} pages ({pages}) : elles partent ensemble en recto-verso.", "amber"))
     if rel.score < 100:
         out.append((f"Résultat approché ({rel.score} %) : le nom indexé est « {rel.nom_complet} ». "
@@ -59,4 +64,16 @@ def compute(rel: Releve, siblings: list[Releve], rules_active: bool) -> list[tup
         out.append(("Aperçu indisponible : fichier source introuvable.", "blue"))
     if not out:
         out.append(("Document prêt — aucune anomalie détectée.", "green"))
-    return out
+    # Doublons d'archive regroupés : information, pas une anomalie du relevé retenu (sauf notes différentes)
+    extra: list[tuple[str, str]] = []
+    doublons = getattr(rel, "doublons", None) or []
+    if doublons:
+        differents = [d for d in doublons if d.get("meme_contenu") is False]
+        if differents:
+            extra.append((f"Ce relevé existe dans {len(doublons) + 1} fichiers dont {len(differents)} aux notes "
+                          f"différentes (version corrigée « UPDATE » ?) : seul celui-ci est proposé ; autres "
+                          f"exemplaires : {_sources(doublons)}. Vérifiez qu'il s'agit de la bonne version.", "amber"))
+        else:
+            extra.append((f"Même relevé dans {len(doublons) + 1} fichiers (compilation, fichier individuel, copie) : "
+                          f"il n'est proposé et imprimé qu'une fois. Autres exemplaires : {_sources(doublons)}.", "blue"))
+    return out + extra

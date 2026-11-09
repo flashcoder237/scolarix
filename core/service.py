@@ -18,7 +18,7 @@ from . import alerts, demandes, exports, pdf_tools, verification
 from .config import APP_NAME, APP_VERSION, DEFAULT_TEXT_RULES, UI_SCALES, Settings, save_settings
 from .database import Database, Releve, missing_periods
 from .guard import PrintBlocked, VisualCheckRequired, check_before_print
-from .normalize import norm_text
+from .normalize import best_display_name, norm_text
 from .text_rules import RuleError, apply_text, compile_rules
 
 RELEVE_PROPS = ("nb_pages", "pages_label", "preview_pdf", "is_success", "periode", "sem_label", "annuel", "is_word",
@@ -35,6 +35,25 @@ def releve_dict(rel: Releve | None) -> dict | None:
     d = dataclasses.asdict(rel)
     for p in RELEVE_PROPS:
         d[p] = getattr(rel, p)
+    return d
+
+
+def page_span_label(rel: Releve) -> str:
+    """Colonne « Pages » du cursus : le nombre de pages DU RELEVÉ, suivi de sa place dans le fichier
+    quand c'est une compilation (« 1 (p. 41) », « 2 (p. 41–42) ») ; jamais la seule position (« 41 »),
+    qui se lisait comme 41 pages."""
+    n = rel.nb_pages
+    if rel.numero_page <= 1 and rel.page_fin <= max(1, n):
+        return str(n)
+    where = f"p. {rel.numero_page}–{rel.page_fin}" if n > 1 else f"p. {rel.numero_page}"
+    return f"{n} ({where})"
+
+
+def cursus_releve_dict(rel: Releve, **extra) -> dict:
+    d = releve_dict(rel)
+    d["pages_fichier"] = d["pages_label"]          # « Page 41 » : position dans le fichier (traçabilité)
+    d["pages_label"] = page_span_label(rel)
+    d.update(extra)
     return d
 
 
@@ -130,7 +149,8 @@ class Service:
             missing = missing_periods(dossier)
             n_ok = sum(1 for r in dossier if r.is_success)
             latest = max(dossier, key=lambda r: (r.annee_academique or "", r.niveau_num, r.semestre or 0))
-            out.append({"matricule": mat, "nom": latest.nom_complet, "found": [releve_dict(r) for r in found],
+            nom = best_display_name([r.nom_complet for r in dossier]) or latest.nom_complet
+            out.append({"matricule": mat, "nom": nom, "found": [releve_dict(r) for r in found],
                         "missing": missing, "valides": n_ok, "total": len(dossier),
                         "tone": "red" if missing else ("green" if n_ok == len(dossier) else "amber")})
         return out
@@ -221,18 +241,23 @@ class Service:
         rels = self.db.cursus(matricule)
         if not rels:
             raise ServiceError("Aucun relevé pour ce matricule.")
+        # Un relevé présent en plusieurs exemplaires (compilation + fichier individuel, « UPDATE »…) n'y figure
+        # qu'une fois (Database.cursus) ; les autres exemplaires sont décrits dans « doublons ».
         default = {r.id for r in pdf_tools.select_for_cursus(rels)}
         corr = self.db.correlated_matricules(matricule)
-        return {"matricule": rels[0].matricule, "nom": rels[0].nom_complet,
-                "releves": [dict(releve_dict(r), selected=r.id in default) for r in rels],
+        return {"matricule": rels[0].matricule,
+                "nom": best_display_name([r.nom_complet for r in rels]) or rels[0].nom_complet,
+                "releves": [cursus_releve_dict(r, selected=r.id in default) for r in rels],
                 "missing": missing_periods(rels), "correlated": corr,
-                "correlated_releves": [releve_dict(r) for c in corr for r in self.db.cursus(c["matricule"])]}
+                "correlated_releves": [cursus_releve_dict(r) for c in corr for r in self.db.cursus(c["matricule"])],
+                "sans_matricule": [cursus_releve_dict(r) for r in self.db.releves_sans_matricule(matricule)]}
 
     def cursus_build(self, matricule: str, releve_ids: list[int], cover: bool = True, duplicata: bool = False,
                      mode: str = "export") -> dict:
         rels = [r for r in (self.db.get(int(i)) for i in releve_ids) if r]
         if not rels:
             raise ServiceError("Cochez au moins un relevé.")
+        rels = self.db.collapse(rels)      # deux exemplaires du même relevé cochés : fusionné une seule fois
         rels.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",
                                  1 if (r.session or "").lower().startswith("rattrap") else 0))
         base = self.db.cursus(matricule) or rels
@@ -308,6 +333,8 @@ class Service:
             self.db.update_demande(int(did), matricule=rel.matricule, nom=rel.nom_complet)
         res = self._demande(did)
         res["added"] = bool(added)
+        if not added and rel.doublons:
+            res["doublon"] = True       # un autre exemplaire du même relevé est déjà dans la demande
         return res
 
     def demande_remove(self, did: int, releve_id: int) -> dict:

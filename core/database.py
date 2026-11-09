@@ -20,7 +20,7 @@ from typing import Iterable
 
 from rapidfuzz import fuzz, process
 
-from .normalize import looks_like_matricule, norm_matricule, norm_text
+from .normalize import looks_like_matricule, name_key, norm_matricule, norm_text
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS fichiers (
     cache_pdf       TEXT,                      -- PDF d'aperçu (Word converti) ; NULL si la source est un PDF
     statut          TEXT DEFAULT 'OK',         -- OK, ERREUR
     message         TEXT,
-    date_indexation TEXT DEFAULT (datetime('now','localtime'))
+    date_indexation TEXT DEFAULT (datetime('now','localtime')),
+    version_analyse TEXT                       -- core.parsing.PARSER_VERSION au moment de la lecture
 );
 
 CREATE TABLE IF NOT EXISTS etudiants_releves (
@@ -72,7 +73,8 @@ CREATE TABLE IF NOT EXISTS etudiants_releves (
     page_fin         INTEGER NOT NULL DEFAULT 1,
     ocr_confiance    REAL,
     extrait          TEXT,
-    date_indexation  TEXT DEFAULT (datetime('now','localtime'))
+    date_indexation  TEXT DEFAULT (datetime('now','localtime')),
+    empreinte        TEXT                      -- empreinte du contenu (notes) : détection des doublons d'archive
 );
 
 CREATE INDEX IF NOT EXISTS idx_releves_matricule ON etudiants_releves(matricule);
@@ -171,8 +173,11 @@ RELEVE_COLUMNS = (
     "r.statut, r.moyenne, r.numero_page, r.page_fin, r.ocr_confiance, r.extrait, "
     "r.semestre, r.decision, r.credits, r.grade, r.mgp, r.lieu_naissance, r.semestre_fin, r.cycle, r.option_filiere, "
     "r.page_verifiee, f.chemin, f.type_fichier, f.cache_pdf, f.statut AS fichier_statut, "
-    "f.taille AS fichier_taille, f.mtime AS fichier_mtime"
+    "f.taille AS fichier_taille, f.mtime AS fichier_mtime, r.empreinte, f.nb_pages AS fichier_nb_pages"
 )
+
+# Fichier « corrigé » : « Relevé X UPDATE.docx », « … MAJ », « … corrigé » — préféré à l'original.
+_UPDATE_RE = re.compile(r"(?i)(?:^|[^A-Za-z])(?:UPDATE[DS]?|MAJ|MISE\s*A\s*JOUR|CORRIG[EÉ]E?S?|RECTIFI[EÉ]E?S?)(?:[^A-Za-z]|$)")
 
 
 @dataclass
@@ -214,8 +219,13 @@ class Releve:
     page_verifiee: int = 0      # Word : page confirmée sur le PDF rendu (matricule retrouvé)
     fichier_taille: int | None = None   # signature du fichier source au moment de l'indexation
     fichier_mtime: float | None = None
+    empreinte: str | None = None        # empreinte du contenu (core.parsing.content_fingerprint)
+    fichier_nb_pages: int | None = None  # pages du FICHIER (compilation) — pas celles du relevé (nb_pages)
     score: int = 100            # 100 = correspondance exacte ; < 100 = résultat approché
     flags: list[str] = field(default_factory=list)
+    # Autres exemplaires du MÊME relevé (compilation + fichier individuel, « X » et « X UPDATE »…) :
+    # regroupés sous celui-ci, jamais proposés ni imprimés deux fois ; gardés pour la traçabilité.
+    doublons: list[dict] = field(default_factory=list)
 
     @property
     def nb_pages(self) -> int:
@@ -337,6 +347,65 @@ def missing_periods(rels: list) -> list[str]:
     return [f"Niveau {n}" for n in range(1, max(nums) + 1) if n not in nums]
 
 
+def _reuse_ids(old_rows, releves: list[dict]) -> list[int | None]:
+    """Identifiants à conserver quand un fichier inchangé est relu : même matricule à la même page, à défaut
+    le k-ième relevé de ce matricule dans le fichier (si le fichier en compte autant qu'avant)."""
+    by_pos: dict[tuple, list[int]] = {}
+    by_mat: dict[str, list[int]] = {}
+    for row in old_rows:
+        by_pos.setdefault((row["matricule"], row["numero_page"]), []).append(row["id"])
+        by_mat.setdefault(row["matricule"], []).append(row["id"])
+    new_count: dict[str, int] = {}
+    for r in releves:
+        new_count[r["matricule"]] = new_count.get(r["matricule"], 0) + 1
+    used: set[int] = set()
+    out: list[int | None] = []
+    seen: dict[str, int] = {}
+    for r in releves:
+        mat = r["matricule"]
+        k = seen.get(mat, 0)
+        seen[mat] = k + 1
+        cand = [i for i in by_pos.get((mat, r["numero_page"]), []) if i not in used]
+        if not cand and len(by_mat.get(mat, [])) == new_count[mat]:
+            cand = [by_mat[mat][k]] if by_mat[mat][k] not in used else []
+        out.append(cand[0] if cand else None)
+        if cand:
+            used.add(cand[0])
+    return out
+
+
+def _dup_rank(m) -> tuple:
+    present = m["fstatut"] != "ERREUR" and _exists_cached(m["chemin"])
+    complete = sum(1 for k in ("semestre", "annee_academique", "statut") if m[k])
+    return (0 if present else 1, 0 if _UPDATE_RE.search(Path(m["chemin"]).stem) else 1, -complete,
+            -(m["mtime"] or 0), m["nb_pages"] or 0, m["id"])
+
+
+def _period(r) -> tuple:
+    return (r["niveau"], r["semestre"] or 0, r["semestre_fin"] or r["semestre"] or 0)
+
+
+def _same_releve(a, b) -> str | None:
+    """Deux lignes d'index désignent-elles le MÊME relevé (même matricule) ? « contenu » : mêmes notes ;
+    « décision » : même période, année, session, moyenne et décision. None sinon."""
+    same_period = _period(a) == _period(b)
+    if a["empreinte"] and a["empreinte"] == b["empreinte"] and (same_period or not a["semestre"] or not b["semestre"]):
+        return "contenu"
+    if not same_period or not a["annee_academique"] or a["annee_academique"] != b["annee_academique"]:
+        return None
+    if (a["session"] or "") != (b["session"] or ""):
+        return None
+    moy = a["moyenne"]
+    if not moy or moy != b["moyenne"] or re.fullmatch(r"0+(?:,0+)?", moy):
+        return None
+    if (a["statut"] or "") != (b["statut"] or "") or (a["decision"] or "") != (b["decision"] or ""):
+        return None
+    if a["empreinte"] and b["empreinte"] and a["empreinte"] != b["empreinte"] \
+            and not (_UPDATE_RE.search(Path(a["chemin"]).stem) or _UPDATE_RE.search(Path(b["chemin"]).stem)):
+        return None        # notes différentes sans version corrigée identifiée : c'est à l'agent de trancher
+    return "décision"
+
+
 CASE_INSENSITIVE_FS = os.name == "nt"
 
 
@@ -410,9 +479,13 @@ class Database:
             for col, decl in (("semestre", "INTEGER"), ("decision", "VARCHAR(80)"), ("credits", "INTEGER"),
                               ("grade", "VARCHAR(4)"), ("mgp", "VARCHAR(6)"), ("lieu_naissance", "VARCHAR(80)"),
                               ("semestre_fin", "INTEGER"), ("cycle", "VARCHAR(20)"), ("option_filiere", "VARCHAR(60)"),
-                              ("page_verifiee", "INTEGER DEFAULT 0")):
+                              ("page_verifiee", "INTEGER DEFAULT 0"), ("empreinte", "TEXT")):
                 if col not in cols:  # base créée par une version précédente
                     self.conn.execute(f"ALTER TABLE etudiants_releves ADD COLUMN {col} {decl}")
+            fcols = {r[1] for r in self.conn.execute("PRAGMA table_info(fichiers)")}
+            if "version_analyse" not in fcols:
+                # NULL = analysé par une version antérieure : relu à la prochaine indexation différentielle
+                self.conn.execute("ALTER TABLE fichiers ADD COLUMN version_analyse TEXT")
             row = self.conn.execute("SELECT valeur FROM meta WHERE cle='fts_mode'").fetchone()
             if row:
                 self.fts_mode = row[0]
@@ -441,24 +514,28 @@ class Database:
     def file_state(self, chemin: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
 
-    def file_signatures(self, with_status: bool = False) -> dict:
-        """{chemin: (taille, mtime[, statut])} de tous les fichiers indexés (une seule requête pour le différentiel)."""
-        rows = self.conn.execute("SELECT chemin, taille, mtime, statut FROM fichiers")
-        if with_status:
-            return {r[0]: (r[1], r[2], r[3]) for r in rows}
-        return {r[0]: (r[1], r[2]) for r in rows}
+    def file_signatures(self, with_status: bool = False, with_version: bool = False) -> dict:
+        """{chemin: (taille, mtime[, statut][, version d'analyse])} de tous les fichiers indexés
+        (une seule requête pour le différentiel)."""
+        rows = self.conn.execute("SELECT chemin, taille, mtime, statut, version_analyse FROM fichiers")
+        out = {}
+        for r in rows:
+            sig = (r[1], r[2]) + ((r[3],) if with_status else ()) + ((r[4],) if with_version else ())
+            out[r[0]] = sig
+        return out
 
     def store_result(self, chemin: str, type_fichier: str, taille: int, mtime: float, nb_pages: int,
                      cache_pdf: str | None, statut: str, message: str | None, releves: Iterable[dict],
-                     anomalies: Iterable[tuple]) -> int:
-        """Enregistre un fichier, ses relevés et (si fournies) ses anomalies dans une seule transaction."""
+                     anomalies: Iterable[tuple], version: str | None = None) -> int:
+        """Enregistre un fichier, ses relevés et (si fournies) ses anomalies dans une seule transaction.
+        ``version`` : version de l'analyse (core.parsing.PARSER_VERSION) qui a produit ces relevés."""
         with self._lock:
             cur = self.conn.cursor()
             # IMMEDIATE : le verrou d'écriture est pris d'emblée (busy_timeout respecté si le guichet écrit au même moment)
             cur.execute("BEGIN IMMEDIATE")
             try:
                 fid = self._save_file_tx(cur, chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut,
-                                         message, releves)
+                                         message, releves, version)
                 if anomalies is not None:
                     cur.execute("DELETE FROM anomalies WHERE chemin=?", (chemin,))
                     cur.executemany("INSERT INTO anomalies(niveau, chemin, message, action) VALUES (?,?,?,?)",
@@ -505,11 +582,13 @@ class Database:
         return self.store_result(chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message, releves, None)
 
     def _save_file_tx(self, cur, chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message,
-              releves) -> int:
-        old = cur.execute("SELECT id, chemin FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
+              releves, version=None) -> int:
+        releves = list(releves)
+        old = cur.execute("SELECT id, chemin, taille, mtime FROM fichiers WHERE chemin=?", (chemin,)).fetchone()
         if old is None and CASE_INSENSITIVE_FS:
             # Windows : même fichier saisi avec une autre casse (\\srv\archives vs \\SRV\Archives) -> même ligne
-            old = cur.execute("SELECT id, chemin FROM fichiers WHERE lower(chemin)=lower(?)", (chemin,)).fetchone()
+            old = cur.execute("SELECT id, chemin, taille, mtime FROM fichiers WHERE lower(chemin)=lower(?)",
+                              (chemin,)).fetchone()
             if old:
                 cur.execute("UPDATE fichiers SET chemin=? WHERE id=?", (chemin, old["id"]))
         if old and statut != "OK":
@@ -519,36 +598,43 @@ class Database:
             cur.execute("UPDATE fichiers SET statut=?, message=?, mtime=NULL, "
                         "date_indexation=datetime('now','localtime') WHERE id=?", (statut, message, old["id"]))
             return old["id"]
+        keep_ids: list[int | None] = [None] * len(releves)
         if old:
+            if old["taille"] == taille and old["mtime"] is not None and abs(old["mtime"] - mtime) < 1:
+                # Fichier INCHANGÉ relu (nouvelle version de l'analyse) : chaque relevé garde son identifiant,
+                # pour que les demandes en cours et le journal continuent de le désigner.
+                keep_ids = _reuse_ids(cur.execute("SELECT id, matricule, numero_page FROM etudiants_releves "
+                                                  "WHERE fichier_id=? ORDER BY numero_page, id",
+                                                  (old["id"],)).fetchall(), releves)
             cur.execute("DELETE FROM etudiants_releves WHERE fichier_id=?", (old["id"],))
             cur.execute(
                 "UPDATE fichiers SET type_fichier=?, taille=?, mtime=?, nb_pages=?, cache_pdf=?, statut=?, "
-                "message=?, date_indexation=datetime('now','localtime') WHERE id=?",
-                (type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message, old["id"]),
+                "message=?, version_analyse=?, date_indexation=datetime('now','localtime') WHERE id=?",
+                (type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message, version, old["id"]),
             )
             fid = old["id"]
         else:
             cur.execute(
-                "INSERT INTO fichiers(chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message),
+                "INSERT INTO fichiers(chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message, "
+                "version_analyse) VALUES (?,?,?,?,?,?,?,?,?)",
+                (chemin, type_fichier, taille, mtime, nb_pages, cache_pdf, statut, message, version),
             )
             fid = cur.lastrowid
-        for r in releves:
+        for r, keep_id in zip(releves, keep_ids):
             cur.execute(
-                "INSERT INTO etudiants_releves(fichier_id, matricule, matricule_brut, nom, prenom, nom_complet, "
+                "INSERT INTO etudiants_releves(id, fichier_id, matricule, matricule_brut, nom, prenom, nom_complet, "
                 "nom_norm, date_naissance, filiere, filiere_code, niveau, niveau_num, annee_academique, session, "
                 "statut, moyenne, numero_page, page_fin, ocr_confiance, extrait, semestre, decision, credits, grade, mgp, "
-                "lieu_naissance, semestre_fin, cycle, option_filiere, page_verifiee) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (fid, r["matricule"], r.get("matricule_brut"), r.get("nom"), r.get("prenom"),
+                "lieu_naissance, semestre_fin, cycle, option_filiere, page_verifiee, empreinte) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (keep_id, fid, r["matricule"], r.get("matricule_brut"), r.get("nom"), r.get("prenom"),
                  r["nom_complet"], norm_text(r["nom_complet"]), r.get("date_naissance"), r.get("filiere"),
                  r.get("filiere_code"), r.get("niveau"), r.get("niveau_num", 0), r.get("annee_academique"),
                  r.get("session"), r.get("statut"), r.get("moyenne"), r["numero_page"], r["page_fin"],
                  r.get("ocr_confiance"), r.get("extrait"), r.get("semestre"), r.get("decision"),
                  r.get("credits"), r.get("grade"), r.get("mgp"), r.get("lieu_naissance"),
                  r.get("semestre_fin", r.get("semestre")), r.get("cycle"), r.get("option_filiere"),
-                 1 if r.get("page_verifiee") else 0),
+                 1 if r.get("page_verifiee") else 0, r.get("empreinte")),
             )
         return fid
 
@@ -707,12 +793,30 @@ class Database:
             self.conn.commit()
 
     def demande_items(self, did: int) -> list[tuple[sqlite3.Row, Releve | None]]:
+        """Éléments de la demande. Un autre exemplaire d'un relevé déjà présent (ajouté avant le regroupement
+        des doublons) n'est ni montré ni préparé : il serait imprimé deux fois."""
         rows = self.conn.execute("SELECT * FROM demande_items WHERE demande_id=? ORDER BY ordre, id",
                                  (did,)).fetchall()
-        return [(row, self.get(row["releve_id"])) for row in rows]
+        out, seen = [], set()
+        for row in rows:
+            rel = self.get(row["releve_id"])
+            if rel is not None:
+                ids = {rel.id} | {d["id"] for d in rel.doublons}
+                if ids & seen:
+                    continue
+                seen |= ids
+            out.append((row, rel))
+        return out
 
     def add_demande_item(self, did: int, releve_id: int) -> bool:
-        """Ajoute un relevé à la demande (une seule fois). Toute modification renvoie la demande « EN COURS »."""
+        """Ajoute un relevé à la demande (une seule fois, tous exemplaires confondus). Toute modification
+        renvoie la demande « EN COURS »."""
+        rel = self.get(releve_id)
+        if rel is not None and rel.doublons:
+            present = {row[0] for row in self.conn.execute("SELECT releve_id FROM demande_items WHERE demande_id=?",
+                                                            (did,))}
+            if present & {d["id"] for d in rel.doublons}:
+                return False        # un autre exemplaire du même relevé est déjà dans la demande
         with self._lock:
             n = self.conn.execute("SELECT IFNULL(MAX(ordre), 0) + 1 FROM demande_items WHERE demande_id=?",
                                   (did,)).fetchone()[0]
@@ -782,7 +886,107 @@ class Database:
 
     def get(self, releve_id: int) -> Releve | None:
         res = self._select("r.id = ?", [releve_id])
-        return res[0] if res else None
+        if not res:
+            return None
+        groups, info = self._dup_groups([res[0].matricule])
+        self._attach_doublons(res[0], groups, info)
+        return res[0]
+
+    # ------------------------------------------------------------ doublons d'archive
+    _DUP_SQL = ("SELECT r.id, r.matricule, r.niveau, r.semestre, r.semestre_fin, r.annee_academique, r.session, "
+                "r.statut, r.decision, r.moyenne, r.empreinte, r.numero_page, r.page_fin, f.chemin, f.mtime, "
+                "f.nb_pages, f.statut AS fstatut, f.type_fichier FROM etudiants_releves r "
+                "JOIN fichiers f ON f.id = r.fichier_id WHERE r.matricule IN ({ph})")
+
+    def _dup_groups(self, matricules: Iterable[str]) -> tuple[dict[int, list[int]], dict[int, dict]]:
+        """Regroupe les exemplaires d'un même relevé (compilation Word + fichier individuel extrait, « X » et
+        « X UPDATE », copie dans un autre dossier…). Renvoie ({id: ids du groupe, exemplaire retenu en tête},
+        {id: description de l'exemplaire}) ; seuls les relevés qui ont au moins un double y figurent.
+
+        Exemplaire retenu : fichier présent et lisible, puis version corrigée (« UPDATE »), puis lecture la plus
+        complète (semestre, année, décision), puis fichier le plus récent, puis fichier individuel (le moins de
+        pages), puis le plus ancien dans l'index. Les matricules illisibles ne sont jamais regroupés."""
+        mats = sorted({m for m in matricules if m and not m.startswith("ILLISIBLE")})
+        rows = []
+        for k in range(0, len(mats), 500):
+            chunk = mats[k:k + 500]
+            rows += self.conn.execute(self._DUP_SQL.format(ph=",".join("?" * len(chunk))), chunk).fetchall()
+        by_mat: dict[str, list] = {}
+        for row in rows:
+            by_mat.setdefault(row["matricule"], []).append(row)
+        groups: dict[int, list[int]] = {}
+        info: dict[int, dict] = {}
+        for mrows in by_mat.values():
+            if len(mrows) < 2:
+                continue
+            parent = {r["id"]: r["id"] for r in mrows}
+
+            def find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+            how: dict[tuple, str] = {}
+            for i, a in enumerate(mrows):
+                for b in mrows[i + 1:]:
+                    why = _same_releve(a, b)
+                    if why:
+                        parent[find(a["id"])] = find(b["id"])
+                        how[(a["id"], b["id"])] = how[(b["id"], a["id"])] = why
+            clusters: dict[int, list] = {}
+            for r in mrows:
+                clusters.setdefault(find(r["id"]), []).append(r)
+            for members in clusters.values():
+                if len(members) < 2:
+                    continue
+                members.sort(key=_dup_rank)
+                ids = [m["id"] for m in members]
+                head = members[0]
+                for m in members:
+                    groups[m["id"]] = ids
+                    pages = (f"Pages {m['numero_page']}–{m['page_fin']}" if m["page_fin"] > m["numero_page"]
+                             else f"Page {m['numero_page']}")
+                    info[m["id"]] = {
+                        "id": m["id"], "chemin": m["chemin"], "pages_label": pages, "type_fichier": m["type_fichier"],
+                        "annee_academique": m["annee_academique"], "fichier_pages": m["nb_pages"],
+                        "meme_contenu": (m["empreinte"] == head["empreinte"]
+                                         if m["empreinte"] and head["empreinte"] else None),
+                        "version_corrigee": bool(_UPDATE_RE.search(Path(m["chemin"]).stem)),
+                        "lien": "même relevé" if m is head else how.get((m["id"], head["id"]), "même relevé")}
+        return groups, info
+
+    @staticmethod
+    def _attach_doublons(rel: Releve, groups: dict, info: dict) -> None:
+        ids = groups.get(rel.id) or []
+        rel.doublons = [info[i] for i in ids if i != rel.id]
+
+    def collapse(self, rels: list[Releve], groups: tuple | None = None) -> list[Releve]:
+        """Un seul exemplaire par relevé : l'exemplaire retenu remplace ses doubles, à la place du premier
+        d'entre eux dans la liste ; les autres sont décrits dans ``doublons``."""
+        groups, info = groups or self._dup_groups({r.matricule for r in rels})
+        if not groups:
+            return rels
+        by_id = {r.id: r for r in rels}
+        missing = [g[0] for r in rels if (g := groups.get(r.id)) and g[0] not in by_id]
+        if missing:
+            ph = ",".join("?" * len(set(missing)))
+            for r in self._select(f"r.id IN ({ph})", sorted(set(missing))):
+                by_id[r.id] = r
+        listed = {r.id for r in rels}
+        out, seen = [], set()
+        for r in rels:
+            g = groups.get(r.id)
+            if not g:
+                out.append(r)
+                continue
+            if g[0] in seen:
+                continue
+            seen.add(g[0])
+            head = by_id[g[0]]
+            head.score = max(head.score if head.id in listed else 0, r.score)
+            self._attach_doublons(head, groups, info)
+            out.append(head)
+        return out
 
     def count_releves(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM etudiants_releves").fetchone()[0]
@@ -906,7 +1110,7 @@ class Database:
                         r.score = scores[r.nom_norm]
                         results[r.id] = r
 
-        out = list(results.values())
+        out = self.collapse(list(results.values()))
         out.sort(key=_result_order(out, words))
         self._flag(out)
         return out[:limit]
@@ -914,13 +1118,19 @@ class Database:
     def _flag(self, rels: list[Releve]) -> None:
         """Ajoute les drapeaux visuels : rattrapage, 2 pages, doublon de niveau, scan, score flou."""
         keys: dict[tuple, int] = {}
-        mats = {r.matricule for r in rels}
+        mats = sorted({r.matricule for r in rels})
         if mats:
-            ph = ",".join("?" * len(mats))
-            for row in self.conn.execute(
-                    f"SELECT matricule, niveau, IFNULL(semestre, 0) sem, COUNT(*) c FROM etudiants_releves "
-                    f"WHERE matricule IN ({ph}) GROUP BY matricule, niveau, IFNULL(semestre, 0)", list(mats)):
-                keys[(row["matricule"], row["niveau"], row["sem"])] = row["c"]
+            groups, _info = self._dup_groups(mats)
+            for k in range(0, len(mats), 500):
+                chunk = mats[k:k + 500]
+                for row in self.conn.execute(
+                        f"SELECT id, matricule, niveau, IFNULL(semestre, 0) sem FROM etudiants_releves "
+                        f"WHERE matricule IN ({','.join('?' * len(chunk))})", chunk):
+                    g = groups.get(row["id"])
+                    if g and g[0] != row["id"]:
+                        continue        # double d'un relevé déjà compté : « 2 RELEVÉS S1 » serait faux
+                    key = (row["matricule"], row["niveau"], row["sem"])
+                    keys[key] = keys.get(key, 0) + 1
         for r in rels:
             r.flags = []
             if r.score < 100:
@@ -932,6 +1142,8 @@ class Database:
             n_same = keys.get((r.matricule, r.niveau, r.semestre or 0), 1)
             if n_same > 1:
                 r.flags.append(f"{n_same} RELEVÉS S{r.semestre}" if r.semestre else "DOUBLON NIVEAU")
+            if r.doublons:
+                r.flags.append(f"{len(r.doublons) + 1} EXEMPLAIRES")
             if r.type_fichier == "PDF_SCAN":
                 r.flags.append("SCAN OCR")
             if r.matricule.startswith("ILLISIBLE"):
@@ -944,12 +1156,15 @@ class Database:
     def level_siblings(self, rel: Releve) -> list[Releve]:
         """Autres relevés du même matricule pour le même niveau ET le même semestre
         (session normale / rattrapage, redoublement, doublon d'archive)."""
-        return self._select("r.matricule = ? AND r.niveau IS ? AND IFNULL(r.semestre, 0) = ? AND r.id <> ?",
+        rels = self._select("r.matricule = ? AND r.niveau IS ? AND IFNULL(r.semestre, 0) = ? AND r.id <> ?",
                             [rel.matricule, rel.niveau, rel.semestre or 0, rel.id])
+        groups = self._dup_groups([rel.matricule])
+        same = set(groups[0].get(rel.id) or [])
+        return self.collapse([r for r in rels if r.id not in same], groups)
 
     # ------------------------------------------------------------ cursus
     def cursus(self, matricule: str) -> list[Releve]:
-        rels = self._select("r.matricule = ?", [norm_matricule(matricule)])
+        rels = self.collapse(self._select("r.matricule = ?", [norm_matricule(matricule)]))
         rels.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",
                                  1 if (r.session or "").lower().startswith("rattrap") else 0))
         self._flag(rels)
@@ -963,7 +1178,8 @@ class Database:
             chunk = mats[k:k + 500]
             for r in self._select(f"r.matricule IN ({','.join('?' * len(chunk))})", chunk):
                 out.setdefault(r.matricule, []).append(r)
-        return out
+        groups = self._dup_groups(mats)
+        return {m: self.collapse(rels, groups) for m, rels in out.items()}
 
     def correlated_matricules(self, matricule: str) -> list[dict]:
         """Autres matricules portés par la même personne (même nom complet, et même date de naissance si connue)."""
@@ -973,17 +1189,35 @@ class Database:
         dob = next((r.date_naissance for r in base if r.date_naissance), None)
         # comparaison sans espaces : les noms collés de certains fichiers désignent la même personne
         names = {r.nom_norm.replace(" ", "") for r in base}
+        # « ILLISIBLE-P42… » n'est pas un matricule : jamais proposé comme « autre matricule de la même personne »
+        # (voir releves_sans_matricule).
         rows = self.conn.execute(
             f"SELECT matricule, MIN(filiere) filiere, COUNT(*) n, MAX(date_naissance) dob FROM etudiants_releves "
             f"WHERE replace(nom_norm, ' ', '') IN ({','.join('?' * len(names))}) AND matricule <> ? "
-            f"GROUP BY matricule", (*names, base[0].matricule)).fetchall()
+            f"AND matricule NOT LIKE 'ILLISIBLE%' GROUP BY matricule", (*names, base[0].matricule)).fetchall()
         out = []
+        dossiers = self.dossiers([row["matricule"] for row in rows]) if rows else {}
         for row in rows:
             if dob and row["dob"] and row["dob"] != dob:
                 continue
-            out.append({"matricule": row["matricule"], "filiere": row["filiere"], "n": row["n"],
+            out.append({"matricule": row["matricule"], "filiere": row["filiere"],
+                        "n": len(dossiers.get(row["matricule"]) or []) or row["n"],
                         "meme_naissance": bool(dob and row["dob"] == dob)})
         return out
+
+    def releves_sans_matricule(self, matricule: str) -> list[Releve]:
+        """Relevés au matricule illisible portant le nom (espaces ignorés) de cet étudiant, et sa date de
+        naissance si elle est connue des deux côtés : à identifier à l'écran, jamais fusionnés d'office."""
+        base = self._select("r.matricule = ?", [norm_matricule(matricule)])
+        if not base:
+            return []
+        dob = next((r.date_naissance for r in base if r.date_naissance), None)
+        names = sorted({name_key(r.nom_norm) for r in base if name_key(r.nom_norm)})
+        if not names:
+            return []
+        rels = self._select(f"r.matricule LIKE 'ILLISIBLE%' AND replace(r.nom_norm, ' ', '') IN "
+                            f"({','.join('?' * len(names))})", names)
+        return [r for r in rels if not (dob and r.date_naissance and r.date_naissance != dob)]
 
     # --------------------------------------------------------- statistiques
     def stats(self) -> dict:
@@ -1016,8 +1250,8 @@ class Database:
         if year_to:
             where.append("CAST(substr(r.annee_academique, 1, 4) AS INTEGER) <= ?")
             args.append(year_to)
-        rels = self._select(" AND ".join(where), args,
-                            order="r.annee_academique, r.nom_norm, r.niveau_num, r.semestre")
+        rels = self.collapse(self._select(" AND ".join(where), args,
+                                          order="r.annee_academique, r.nom_norm, r.niveau_num, r.semestre"))
         if dernier_niveau:
             # D'abord le DERNIER relevé de chaque étudiant (tous statuts confondus), ensuite le filtre de statut :
             # un étudiant qui a validé au redoublement n'apparaît pas parmi les « non validés ».

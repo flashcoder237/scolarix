@@ -59,6 +59,33 @@ def norm_text(text: str | None) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def name_key(name: str | None) -> str:
+    """Clé d'identité d'un nom, insensible aux accents, à la casse, aux tirets ET aux espaces : les fichiers
+    collent parfois deux mots (« MARIE CLAIRENOM » / « MARIE CLAIRE NOM ») — c'est la même personne."""
+    return norm_text(name).replace(" ", "")
+
+
+def same_person_name(a: str | None, b: str | None) -> bool:
+    """Même nom à des espaces manquants près (« AMINA BELLEMBOA » = « AMINA BELLE MBOA »)."""
+    ka, kb = name_key(a), name_key(b)
+    return bool(ka) and ka == kb
+
+
+def best_display_name(names) -> str:
+    """Nom à afficher pour un étudiant dont les relevés écrivent le nom de plusieurs façons : la forme la
+    plus fréquente (espaces ignorés), écrite avec le plus de mots (les espaces manquants sont des erreurs de
+    saisie, jamais l'inverse)."""
+    names = [n for n in names if n and n.strip() and not n.startswith("(")]
+    if not names:
+        return ""
+    counts: dict[str, int] = {}
+    for n in names:
+        counts[name_key(n)] = counts.get(name_key(n), 0) + 1
+    key = max(counts, key=lambda k: (counts[k], len(k)))
+    variants = [n for n in names if name_key(n) == key]
+    return max(variants, key=lambda n: (len(n.split()), variants.count(n)))
+
+
 def norm_matricule(text: str | None) -> str:
     """'19-m/042' -> '19M042'. Renvoie la saisie compactée même si ce n'est pas un matricule."""
     if not text:
