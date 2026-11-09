@@ -611,7 +611,8 @@ function Empty({ query, total, tolerant, onAll, onTolerant }: { query: string; t
 
 // ------------------------------------------------------------------ fiche condensée (au-dessus de la page)
 function shortAlert(t: string) {
-  const cut = t.split(/(?<=[^.]{12,})(?:\. | : | \(autres)/)[0];
+  // libellé court de la puce (texte complet en infobulle et au clic) : jusqu'au premier « . », « : » ou « — »
+  const cut = t.split(/(?<=[^.]{12,})(?:\. | : | — | \(autres)/)[0];
   return cut.length > 90 ? cut.slice(0, 88) + "…" : cut;
 }
 

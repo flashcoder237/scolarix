@@ -161,8 +161,10 @@ export function PdfView({ file, first, last, version = "", message, stamp = fals
     return () => ro.disconnect();
   }, []);
 
-  // autre relevé : retour au mode par défaut, en haut de la page
-  useEffect(() => { setFit(defaultFit); box.current?.scrollTo({ top: 0, left: 0 }); }, [file, first]); // eslint-disable-line react-hooks/exhaustive-deps
+  // autre relevé : en haut de la page ; le mode choisi (Auto, Page…) est gardé, un zoom manuel est oublié
+  const lastFit = useRef<FitMode>(defaultFit);
+  if (fit !== "libre") lastFit.current = fit;
+  useEffect(() => { setFit(lastFit.current); box.current?.scrollTo({ top: 0, left: 0 }); }, [file, first]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const scale = useMemo(() => computeScale(fit, manual, size.w, size.h, dims), [fit, manual, size, dims]);
   const scaleRef = useRef(scale);

@@ -318,7 +318,7 @@ body:has(.overlay) .toasts { top: 16px; bottom: auto; flex-direction: column-rev
   padding: 5px 10px; min-width: 0; max-width: 330px; cursor: pointer; text-align: left; height: 42px; }
 .dchip.on { border-color: #DDD6FE; background: var(--violet-bg); color: var(--violet); }
 .dchip .dtxt { display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
-.dchip .eyebrow { color: inherit; font-size: 9.5px; }
+.dchip .eyebrow { color: inherit; font-size: 9.5px; white-space: nowrap; }
 .dchip .dn { font-weight: 700; font-size: 12.5px; color: var(--ink); }
 .statsbtn { height: 42px; }
 .compact .dchip, .compact .statsbtn { height: 38px; }
@@ -397,13 +397,17 @@ body:has(.overlay) .toasts { top: 16px; bottom: auto; flex-direction: column-rev
 .fside .minimap { width: 52px; align-self: center; }
 
 /* ------------------------------------------------------------- largeurs réduites (1366, 1536 à 125 %) */
-@media (max-width: 1500px) {
-  .gx-body { grid-template-columns: 312px minmax(0, 1fr); }
+@media (max-width: 1700px) {
   .fseg .lg { display: none; }
   .fseg .sh { display: inline; }
   .opt-wide { display: none !important; }
+  .topbar .omni { flex-basis: 400px; }
+  .dchip { max-width: 260px; height: 38px; }
+}
+@media (max-width: 1500px) {
+  .gx-body { grid-template-columns: 312px minmax(0, 1fr); }
   .topbar .omni { flex-basis: 360px; }
-  .dchip { max-width: 240px; height: 38px; }
+  .dchip { max-width: 240px; }
   .dock { width: 142px; }
   .dock .btn.sm .kbd, .dock .zone .kbd { display: none; }
   .dock .lbl { letter-spacing: .03em; font-size: 9.5px; white-space: nowrap; }
