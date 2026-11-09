@@ -11,6 +11,8 @@ const readline = require("node:readline");
 const { EventEmitter } = require("node:events");
 
 // Délais maximaux (ms). Les aperçus Word d'un recueil de 100 pages peuvent prendre plusieurs minutes.
+// Cursus et demandes lancés avec « op » : délai d'inactivité (relancé à chaque fichier Word converti),
+// chaque conversion étant de toute façon limitée côté moteur (Word arrêté au-delà de 120 s).
 const TIMEOUTS = {
   default: 60_000,
   preview: 300_000,
@@ -90,6 +92,10 @@ class Engine extends EventEmitter {
       return;
     }
     if (msg.event) {
+      if (msg.event === "progress" && msg.data && msg.data.op) {
+        // opération qui avance (un fichier Word converti) : son délai repart de zéro
+        for (const [, p] of this.pending) if (p.op && p.op === msg.data.op && p.arm) p.arm();
+      }
       if (msg.event === "ready") {
         this.restarts = 0;
         resolveReady(msg.data);
@@ -160,15 +166,22 @@ class Engine extends EventEmitter {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       const ms = TIMEOUTS[method] || TIMEOUTS.default;
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        this.log.warn(`${method} : délai de ${ms / 1000} s dépassé`);
-        reject(Object.assign(new Error(`Opération trop longue (${Math.round(ms / 1000)} s) : réessayez. Si le problème `
-          + "persiste, le fichier source est peut-être sur un partage réseau lent ou endommagé."), { kind: "timeout" }));
-      }, ms);
-      this.pending.set(id, { resolve, reject, timer, method });
+      const entry = { resolve, reject, timer: null, method, op: (params && params.op) || null };
+      // Avec « op », le délai est un délai d'INACTIVITÉ : chaque événement de progression le relance.
+      entry.arm = () => {
+        clearTimeout(entry.timer);
+        entry.timer = setTimeout(() => {
+          this.pending.delete(id);
+          this.log.warn(`${method} : délai de ${ms / 1000} s dépassé`);
+          if (entry.op) this._write({ id: `cancel-${id}`, method: "cancel", params: { op: entry.op } });
+          reject(Object.assign(new Error(`Opération trop longue (${Math.round(ms / 1000)} s) : réessayez. Si le problème `
+            + "persiste, le fichier source est peut-être sur un partage réseau lent ou endommagé."), { kind: "timeout" }));
+        }, ms);
+      };
+      entry.arm();
+      this.pending.set(id, entry);
       if (!this._write({ id, method, params })) {
-        clearTimeout(timer);
+        clearTimeout(entry.timer);
         this.pending.delete(id);
         reject(Object.assign(new Error("Moteur indisponible (redémarrage en cours) : réessayez dans un instant."), { kind: "engine" }));
       }

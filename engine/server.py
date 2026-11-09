@@ -4,12 +4,15 @@ Protocole : une ligne JSON par message, en UTF-8.
     entrée  {"id": 7, "method": "search", "params": {"q": "18M042"}}
     sortie  {"id": 7, "result": {...}}            ou  {"id": 7, "error": {"message": "...", "kind": "user"}}
     sortie  {"event": "index", "data": {...}}      (progression de l'indexation, sans id)
+    sortie  {"event": "progress", "data": {"op": "...", "phase": "conversion", "i": 3, "n": 7, "message": "..."}}
+                                                   (progression d'un cursus / d'une demande lancé avec « op »)
 
 Pourquoi un processus séparé : l'interface ne fait jamais de travail lourd, donc ne se fige jamais ; et si le
 moteur plante ou se bloque, l'interface le relance au lieu de tomber avec lui.
 
 Chaque demande s'exécute dans un fil de travail (un aperçu Word de 30 s ne retarde pas une recherche).
-« ping » est traité tout de suite par la boucle de lecture : il prouve que le moteur est vivant.
+« ping » est traité tout de suite par la boucle de lecture : il prouve que le moteur est vivant. « cancel »
+aussi : l'annulation d'un cursus ne doit jamais attendre qu'un fil de travail se libère.
 Fin de l'entrée standard (Electron fermé ou planté) : arrêt propre, indexation et Word compris.
 
     python -m engine.server             (développement)
@@ -50,6 +53,7 @@ class Engine:
         db = Database(self.settings.resolved_db_path(), cache_dir=self.settings.resolved_cache_dir())
         self.previews = PreviewService(db, self.settings)
         self.service = Service(self.settings, self.previews)
+        self.service.emit = lambda event, data: self.send({"event": event, "data": data})
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="travail")
         self.indexer: subprocess.Popen | None = None
         self._indexer_lock = threading.Lock()
@@ -83,6 +87,12 @@ class Engine:
         mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
         if method == "ping":
             self.send({"id": mid, "result": "pong"})
+            return
+        if method == "cancel":
+            try:
+                self.send({"id": mid, "result": self.service.cancel(str(params.get("op", "")))})
+            except Exception as exc:
+                self.send({"id": mid, "error": {"message": f"Annulation impossible : {exc}", "kind": "internal"}})
             return
         fn = self.methods.get(method)
         if fn is None:

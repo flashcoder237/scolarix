@@ -99,7 +99,8 @@ def prepare(db: Database, settings: Settings, did: int, previews=None) -> Prepar
                 rel = previews.ensure(rel)
             check_before_print(rel)
         except Exception as exc:
-            reason = str(exc).split(" : ", 1)[-1][:160]
+            reason = re.sub(r"^Impression bloquée( pour [^:]+)?\s*:\s*", "", str(exc)).strip()[:160] \
+                or exc.__class__.__name__
             prep.bloques.append((rel, reason))
             db.set_item_result(item["id"], None, None, f"BLOQUÉ : {reason}")
             continue

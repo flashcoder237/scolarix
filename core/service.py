@@ -8,6 +8,7 @@ Une connexion SQLite par fil (threading.local) : plusieurs demandes simultanées
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import threading
 import time
@@ -17,6 +18,7 @@ from pathlib import Path
 from . import alerts, demandes, exports, pdf_tools, verification
 from .config import APP_NAME, APP_VERSION, DEFAULT_TEXT_RULES, UI_SCALES, Settings, save_settings
 from .database import Database, Releve, missing_periods
+from .extractors import ExtractionError
 from .guard import PrintBlocked, VisualCheckRequired, check_before_print
 from .normalize import norm_text
 from .text_rules import RuleError, apply_text, compile_rules
@@ -42,10 +44,25 @@ def _row(row) -> dict | None:
     return dict(row) if row is not None else None
 
 
+class _Prepared:
+    """Aperçus déjà préparés (un travail par fichier) présentés comme un PreviewService à core/demandes.py."""
+
+    def __init__(self, ready: dict[int, Releve], errors: dict[int, str]):
+        self.ready, self.errors = ready, errors
+
+    def ensure(self, rel: Releve) -> Releve:
+        if rel.id in self.errors:
+            raise ExtractionError(self.errors[rel.id])
+        return self.ready.get(rel.id, rel)
+
+
 class Service:
     def __init__(self, settings: Settings, previews=None, db_factory=None):
         self.s = settings
         self.previews = previews
+        self.emit = None                       # emit(événement, données) : progression vers l'interface (moteur)
+        self._ops: dict[str, threading.Event] = {}
+        self._ops_lock = threading.Lock()
         self._local = threading.local()
         self._db_factory = db_factory or (lambda: Database(self.s.resolved_db_path(),
                                                             cache_dir=self.s.resolved_cache_dir()))
@@ -74,6 +91,53 @@ class Service:
 
     def _trace(self, rel: Releve) -> str:
         return " · en-tête corrigé" if rel.is_word and self.rules_active else ""
+
+    # ------------------------------------------------------------------ opérations longues (progression, annulation)
+    def cancel(self, op: str) -> dict:
+        """Annulation coopérative d'une opération longue (cursus, demande) : vérifiée entre deux fichiers Word
+        et pendant chaque attente. Traitée immédiatement par le moteur (hors file des fils de travail)."""
+        with self._ops_lock:
+            ev = self._ops.setdefault(str(op), threading.Event())   # annulation arrivée avant le début : retenue
+        ev.set()
+        return {"cancelled": True}
+
+    @contextlib.contextmanager
+    def _operation(self, op: str | None):
+        if not op:
+            yield lambda: False
+            return
+        with self._ops_lock:
+            ev = self._ops.setdefault(str(op), threading.Event())
+        try:
+            yield ev.is_set
+        finally:
+            with self._ops_lock:
+                self._ops.pop(str(op), None)
+
+    def _progress(self, op: str | None, phase: str, i: int, n: int, message: str) -> None:
+        if op and self.emit is not None:
+            try:
+                self.emit("progress", {"op": op, "phase": phase, "i": i, "n": n, "message": message})
+            except Exception:
+                pass                           # la progression n'est jamais une raison d'échouer
+
+    def _prepare_word(self, rels: list[Releve], op: str | None, cancelled,
+                      what: str) -> tuple[dict[int, Releve], dict[int, str]]:
+        """Aperçus Word de plusieurs relevés : une conversion par FICHIER source, progression, annulation.
+        Renvoie ({id: relevé prêt}, {id: motif d'échec}) ; un fichier en échec n'arrête pas les autres."""
+        from .preview import PreviewCancelled
+        if self.previews is None:
+            return {r.id: r for r in rels}, {}
+
+        def progress(i: int, n: int, name: str) -> None:
+            self._progress(op, "conversion", i, n, f"Conversion {i}/{n} : {name}…")
+        try:
+            ready, errors = self.previews.ensure_many(rels, progress, cancelled)
+        except PreviewCancelled as exc:
+            raise ServiceError(f"{what} annulée : rien n'a été produit.") from exc
+        if cancelled():
+            raise ServiceError(f"{what} annulée : rien n'a été produit.")
+        return ready, errors
 
     # ------------------------------------------------------------------ accueil
     def info(self) -> dict:
@@ -148,7 +212,7 @@ class Service:
         """Aperçu Word produit au besoin (long : Word ou LibreOffice). Renvoie le relevé à jour."""
         rel = self._get(releve_id)
         if self.previews is not None and self.previews.needs_render(rel):
-            rel = self.previews.ensure(rel)
+            rel = self.previews.ensure(rel, interactive=True)   # remplace l'aperçu précédent encore en attente
         if not rel.preview_pdf or not Path(rel.preview_pdf).exists():
             raise ServiceError("Aperçu indisponible : fichier source introuvable ou conversion impossible.")
         return self.releve(rel.id)
@@ -229,33 +293,40 @@ class Service:
                 "correlated_releves": [releve_dict(r) for c in corr for r in self.db.cursus(c["matricule"])]}
 
     def cursus_build(self, matricule: str, releve_ids: list[int], cover: bool = True, duplicata: bool = False,
-                     mode: str = "export") -> dict:
+                     mode: str = "export", op: str | None = None) -> dict:
+        """Fusion du cursus. Les aperçus Word sont produits d'abord, UNE fois par fichier source (progression
+        « Conversion 3/7 : EM4 S1.docx… », annulable avec ``cancel(op)``) ; un relevé dont l'aperçu échoue est
+        écarté avec son motif, sans bloquer les autres. Le numéro de délivrance n'est réservé qu'ensuite."""
         rels = [r for r in (self.db.get(int(i)) for i in releve_ids) if r]
         if not rels:
             raise ServiceError("Cochez au moins un relevé.")
         rels.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",
                                  1 if (r.session or "").lower().startswith("rattrap") else 0))
-        base = self.db.cursus(matricule) or rels
-        nature = "CURSUS" if mode == "export" else "CURSUS IMPRIMÉ"
-        ref = self.db.new_delivery(nature, self.s.poste, self.s.operateur, base[0].matricule)
-        if mode == "export":
-            nom = (norm_text(base[0].nom or base[0].nom_complet).split() or ["ETUDIANT"])[0]
-            dest = exports.dest_for(self.s, exports.CURSUS, f"FMSP_{base[0].matricule}_{nom}_Cursus.pdf")
-        else:
-            dest = pdf_tools.temp_pdf("cursus_")
+        with self._operation(op) as cancelled:
+            ready, errors = self._prepare_word(rels, op, cancelled, "Fusion")
+            self._progress(op, "fusion", len(rels), len(rels), "Contrôle et fusion des relevés…")
+            base = self.db.cursus(matricule) or rels
+            nature = "CURSUS" if mode == "export" else "CURSUS IMPRIMÉ"
+            ref = self.db.new_delivery(nature, self.s.poste, self.s.operateur, base[0].matricule)
+            if mode == "export":
+                nom = (norm_text(base[0].nom or base[0].nom_complet).split() or ["ETUDIANT"])[0]
+                dest = exports.dest_for(self.s, exports.CURSUS, f"FMSP_{base[0].matricule}_{nom}_Cursus.pdf")
+            else:
+                dest = pdf_tools.temp_pdf("cursus_")
 
-        def prepare(rel):
-            if self.previews is not None:
-                rel = self.previews.ensure(rel)
-            check_before_print(rel)
-            return rel
-        try:
-            path, n, missing = pdf_tools.merge_releves(
-                rels, dest, cover=cover, stamp=pdf_tools.stamp_text() if duplicata else None, prepare=prepare,
-                absent=missing_periods(base),
-                footer=pdf_tools.footer_text(ref) if self.s.delivery_ref_stamp else None)
-        except ValueError as exc:
-            raise ServiceError(f"Échec de la fusion : {exc}") from exc
+            def prepare(rel):
+                if rel.id in errors:
+                    raise ExtractionError(errors[rel.id])
+                rel = ready.get(rel.id, rel)
+                check_before_print(rel)
+                return rel
+            try:
+                path, n, missing = pdf_tools.merge_releves(
+                    rels, dest, cover=cover, stamp=pdf_tools.stamp_text() if duplicata else None, prepare=prepare,
+                    absent=missing_periods(base),
+                    footer=pdf_tools.footer_text(ref) if self.s.delivery_ref_stamp else None)
+            except ValueError as exc:
+                raise ServiceError(f"Échec de la fusion : {exc}") from exc
         self.db.complete_delivery(ref, str(path) if mode == "export" else None, exports.sha256_file(path))
         if mode == "export":
             self._log("CURSUS", None, f"Réf. {ref} · {path} · {n} pages" + (" · DUPLICATA" if duplicata else "")
@@ -318,20 +389,28 @@ class Service:
         self.db.reorder_demande(int(did), [int(i) for i in releve_ids])
         return self._demande(did)
 
-    def demande_prepare(self, did: int) -> dict:
-        prep = demandes.prepare(self.db, self.s, int(did), self.previews)
+    def demande_prepare(self, did: int, op: str | None = None) -> dict:
+        """Dossier de la demande. Comme pour le cursus : aperçus Word d'abord, une fois par fichier source,
+        avec progression et annulation ; un relevé en échec est « bloqué » avec son motif."""
+        if self.db.demande(int(did)) is None:
+            raise ServiceError("Demande introuvable.")
+        rels = [rel for _item, rel in self.db.demande_items(int(did)) if rel]
+        with self._operation(op) as cancelled:
+            ready, errors = self._prepare_word(rels, op, cancelled, "Préparation de la demande")
+            self._progress(op, "fusion", len(rels), len(rels), "Contrôle et assemblage du dossier…")
+            prep = demandes.prepare(self.db, self.s, int(did), _Prepared(ready, errors))
         return {"dossier": str(prep.dossier), "a_imprimer": str(prep.a_imprimer) if prep.a_imprimer else None,
                 "bordereau": str(prep.bordereau), "pages": prep.pages,
                 "prets": [{"releve_id": r.id, "ref": ref, "pages": n} for r, ref, n in prep.prets],
                 "bloques": [{"releve_id": r.id if r else None, "periode": r.periode if r else "?", "motif": m}
                             for r, m in prep.bloques], **self._demande(did)}
 
-    def demande_files_to_print(self, did: int, with_bordereau: bool = True) -> dict:
+    def demande_files_to_print(self, did: int, with_bordereau: bool = True, op: str | None = None) -> dict:
         """Fichiers prêts de la demande ; refait le dossier s'il est absent ou périmé."""
         d = self.db.demande(int(did))
         folder = demandes.demande_folder(self.s, d) if d and d["dossier"] else None
         if not (d and d["statut"] in ("PRÊTE", "IMPRIMÉE") and folder and (folder / demandes.A_IMPRIMER).exists()):
-            prep = self.demande_prepare(did)
+            prep = self.demande_prepare(did, op)
             if not prep["a_imprimer"]:
                 raise ServiceError("Aucun relevé imprimable dans cette demande : " +
                                    "; ".join(f"{b['periode']} ({b['motif']})" for b in prep["bloques"]))

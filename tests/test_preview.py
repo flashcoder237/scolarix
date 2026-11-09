@@ -25,8 +25,8 @@ class FakeConverter:
     def __init__(self, settings=None, alter=None):
         self.alter = alter
 
-    def convert(self, src, dest, fmt="pdf"):
-        FakeConverter.calls.append((str(src), fmt))
+    def convert(self, src, dest, fmt="pdf", label=None):
+        FakeConverter.calls.append((str(src), fmt, label))
         assert fmt == "pdf"
         head = [p.text for p in Document(str(src)).sections[0].header.paragraphs]
         buf = io.BytesIO()
@@ -43,6 +43,9 @@ class FakeConverter:
         dest.write_bytes(buf.getvalue())
 
     def close(self):
+        pass
+
+    def kill(self):
         pass
 
 

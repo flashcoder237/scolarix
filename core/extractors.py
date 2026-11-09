@@ -11,12 +11,14 @@ Aucune fonction de ce module n'écrit dans le dossier source : les conversions v
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import platform
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +26,8 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .config import Settings
+
+_log = logging.getLogger("scolarix.word")
 
 MIN_TEXT_CHARS = 40          # en dessous, une page PDF est considérée comme scannée
 
@@ -438,12 +442,67 @@ def kill_orphan_words() -> int:
     return n
 
 
-class WordConverter:
-    """Convertit .doc/.docx en PDF. Réutilise une seule instance Word pendant toute l'indexation."""
+WORD_TIMEOUT = 120.0      # secondes : au-delà, une conversion Word est déclarée bloquée et SON Word arrêté
 
-    def __init__(self, settings: Settings):
+
+class WordTimeout(ExtractionError):
+    """Word n'a pas fini une conversion dans le délai (boîte de dialogue invisible, fichier énorme) : arrêté."""
+
+
+def _winword_pids() -> set[int] | None:
+    """PID des WINWORD.EXE vivants (Windows), None ailleurs ou si la liste est illisible."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, timeout=15,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception:
+        return None
+    pids = set()
+    for line in out.splitlines():
+        parts = [x.strip('"') for x in line.split('","')]
+        if len(parts) > 1 and parts[0].upper().startswith("WINWORD") and parts[1].isdigit():
+            pids.add(int(parts[1]))
+    return pids
+
+
+def _real_suffix(path: Path) -> str:
+    """Extension d'après la signature : un .doc 97-2003 nommé « .docx » fait afficher à Word une boîte
+    « contenu illisible / réparer ? » invisible qui bloque la conversion."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return path.suffix.lower() or ".docx"
+    if head.startswith(b"PK\x03\x04"):
+        return ".docx"
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        return ".doc"
+    return path.suffix.lower() or ".docx"
+
+
+_COM_THREADS = threading.local()
+
+
+def _com_init() -> None:
+    """CoInitialize une fois par fil (COM exige l'initialisation dans CHAQUE fil qui l'utilise)."""
+    if not getattr(_COM_THREADS, "ok", False):
+        import pythoncom  # type: ignore
+        pythoncom.CoInitialize()
+        _COM_THREADS.ok = True
+
+
+class WordConverter:
+    """Convertit .doc/.docx en PDF. Réutilise une seule instance Word (la SIENNE, jamais celle de l'utilisateur)
+    tant qu'elle répond ; chaque conversion a un délai maximal au-delà duquel ce Word-là est arrêté."""
+
+    def __init__(self, settings: Settings, timeout: float | None = None):
         self.settings = settings
         self._word = None
+        self._owner: int | None = None         # fil qui a créé l'objet Word (affinité COM)
+        self._timed_out = False
+        self.timeout = float(timeout or getattr(settings, "word_timeout", 0) or WORD_TIMEOUT)
         self._com_ok = settings.word_com_enabled and platform.system() == "Windows"
         self._soffice = settings.soffice_cmd or shutil.which("soffice") or shutil.which("libreoffice")
         if not self._soffice and platform.system() == "Windows":
@@ -474,58 +533,97 @@ class WordConverter:
     def close(self) -> None:
         """Fermeture normale (depuis le fil qui a créé Word) ; à défaut, arrêt du processus par son PID."""
         if self._word is not None:
-            try:
-                self._word.Quit(SaveChanges=0)
-            except Exception:
-                self.kill()
+            if self._owner == threading.get_ident():
+                try:
+                    self._word.Quit(SaveChanges=0)
+                except Exception:
+                    self.kill()
+            else:
+                self.kill()                    # jamais d'appel COM depuis un autre fil
             self._word = None
         if self.word_pid:
             unregister_word_pid(self.word_pid)
             self.word_pid = None
 
     def kill(self) -> None:
-        """Arrêt sans COM (utilisable depuis n'importe quel fil) : Word bloqué, processus parent disparu…"""
-        if self.word_pid:
-            kill_pid(self.word_pid)
-            unregister_word_pid(self.word_pid)
+        """Arrêt sans COM (utilisable depuis n'importe quel fil) : Word bloqué, processus parent disparu…
+        Seul le PID du Word lancé par Scolarix est visé : les fenêtres Word de l'utilisateur ne sont pas touchées."""
+        pid = self.word_pid
+        if pid:
+            name = _process_name(pid) if platform.system() == "Windows" else None
+            if name is None or "WINWORD" in name.upper():   # PID réutilisé par un autre programme : on n'y touche pas
+                kill_pid(pid)
+            unregister_word_pid(pid)
             self.word_pid = None
         self._word = None
+        self._owner = None
+
+    def _on_timeout(self) -> None:
+        self._timed_out = True
+        if self.word_pid:
+            _log.warning("Word bloqué depuis %.0f s : arrêt du processus WINWORD %s (lancé par Scolarix)",
+                         self.timeout, self.word_pid)
+        else:
+            _log.error("Word bloqué depuis %.0f s mais son PID est inconnu : il n'est pas arrêté "
+                       "(jamais un Word de l'utilisateur)", self.timeout)
+        self.kill()
 
     def _word_app(self):
+        if self._word is not None and self._owner != threading.get_ident():
+            self.kill()                        # objet créé dans un autre fil : inutilisable ici
         if self._word is None:
-            import pythoncom  # type: ignore
             import win32com.client  # type: ignore
-            pythoncom.CoInitialize()
-            word = win32com.client.DispatchEx("Word.Application")
-            try:
-                # Archives anciennes : macros (AutoOpen…) JAMAIS exécutées, pas de liens externes mis à jour
-                word.AutomationSecurity = 3          # msoAutomationSecurityForceDisable, avant tout Documents.Open
-            except Exception:
-                pass
-            word.Visible = False
-            word.DisplayAlerts = 0
-            try:
-                word.Options.UpdateLinksAtOpen = False
-                word.Options.CheckGrammarAsYouType = False
-                word.Options.CheckSpellingAsYouType = False
-            except Exception:
-                pass
+            _com_init()
+            before = _winword_pids()
+            word = win32com.client.DispatchEx("Word.Application")     # instance À NOUS, séparée de celle de l'agent
+            # Uniquement des propriétés de session : AUCUNE option persistante de l'utilisateur n'est modifiée
+            # (word.Options.* est enregistré dans le profil Word de l'utilisateur).
+            for prop, value in (("AutomationSecurity", 3),   # macros (AutoOpen…) jamais exécutées
+                                ("Visible", False), ("DisplayAlerts", 0), ("ScreenUpdating", False),
+                                ("FeatureInstall", 0)):     # jamais de « installer cette fonctionnalité ? »
+                try:
+                    setattr(word, prop, value)
+                except Exception:
+                    pass
             self._word = word
+            self._owner = threading.get_ident()
             self.word_pid = _word_process_id(word)
+            if not self.word_pid and before is not None:
+                new = (_winword_pids() or set()) - before
+                if len(new) == 1:              # un seul Word apparu pendant notre lancement : le nôtre
+                    self.word_pid = new.pop()
             if self.word_pid:
                 register_word_pid(self.word_pid)
+            else:
+                _log.warning("PID du Word lancé par Scolarix introuvable : arrêt forcé impossible en cas de blocage")
         return self._word
 
-    def convert(self, src: Path, dest: Path, fmt: str = "pdf") -> None:
-        """Convertit ``src`` en ``fmt`` (« pdf » ou « docx ») vers ``dest``. L'original n'est jamais modifié."""
+    def convert(self, src: Path, dest: Path, fmt: str = "pdf", label: str | None = None) -> None:
+        """Convertit ``src`` en ``fmt`` (« pdf » ou « docx ») vers ``dest``. L'original n'est jamais modifié.
+        ``label`` : nom affiché dans le journal (nom du fichier d'archive, pas la copie de travail)."""
+        import time
         dest.parent.mkdir(parents=True, exist_ok=True)
+        name = label or src.name
+        t0 = time.monotonic()
+        _log.info("conversion %s -> %s : début (%s)", name, fmt.upper(), self.backend())
+        try:
+            self._convert(src, dest, fmt)
+        except Exception as exc:
+            _log.warning("conversion %s -> %s : ÉCHEC après %.1f s : %s", name, fmt.upper(),
+                         time.monotonic() - t0, describe_error(exc))
+            raise
+        _log.info("conversion %s -> %s : terminée en %.1f s", name, fmt.upper(), time.monotonic() - t0)
+
+    def _convert(self, src: Path, dest: Path, fmt: str) -> None:
         errors = []
         if self._com_ok:
             for attempt in (1, 2):
                 try:
                     self._convert_com(src, dest, fmt)
                     return
-                except WordDied as exc:      # Word a planté : on le relance une fois
+                except WordTimeout:
+                    raise                    # jamais de 2e essai : il bloquerait de nouveau aussi longtemps
+                except WordDied as exc:      # Word a planté : on le relance une fois (instance neuve)
                     self.kill()
                     if attempt == 2:
                         errors.append(f"Word COM : {exc}")
@@ -548,43 +646,85 @@ class WordConverter:
                               else "Aucun convertisseur Word → PDF disponible : installez Microsoft Word ou LibreOffice.")
 
     def _convert_com(self, src: Path, dest: Path, fmt: str = "pdf") -> None:  # noqa: D401
-        word = self._word_app()
-        try:
-            # Mot de passe factice : un document protégé lève une erreur au lieu d'ouvrir une boîte de dialogue.
-            doc = word.Documents.Open(str(src.resolve()), ConfirmConversions=False, ReadOnly=True,
-                                      AddToRecentFiles=False, PasswordDocument="__fmsp__",
-                                      Visible=False, NoEncodingDialog=True)
-        except Exception as exc:
-            if _rpc_dead(exc):
-                raise WordDied(str(exc)) from exc
-            text = str(exc).lower()
-            if "password" in text or "mot de passe" in text:
-                raise ExtractionError("Fichier protégé par mot de passe : ignoré, indexation poursuivie.") from exc
-            raise ExtractionError(f"Word ne peut pas ouvrir le fichier (endommagé ?) : {exc}") from exc
-        try:
-            if fmt == "docx":
-                doc.SaveAs2(str(dest.resolve()), FileFormat=16, AddToRecentFiles=False)  # 16 = .docx
-            else:
-                doc.ExportAsFixedFormat(str(dest.resolve()), 17)  # 17 = wdExportFormatPDF
-        except Exception as exc:
-            if _rpc_dead(exc):
-                raise WordDied(str(exc)) from exc
-            raise
-        finally:
+        with tempfile.TemporaryDirectory(prefix="scolarix_word_", ignore_cleanup_errors=True) as tmp:
+            # Word n'ouvre qu'une COPIE au nom neutre : un original ouvert au même moment dans le Word de l'agent
+            # (verrou, « fichier en cours d'utilisation »), un partage réseau lent ou une extension trompeuse ne
+            # peuvent plus faire apparaître de boîte de dialogue invisible ; la liste « Récents » ne montre que
+            # « document.docx » du dossier temporaire.
+            work = Path(tmp) / ("document" + _real_suffix(src))
             try:
-                doc.Close(SaveChanges=0)
-            except Exception:
-                pass
+                shutil.copyfile(src, work)
+            except OSError as exc:
+                raise ExtractionError(f"Lecture du fichier impossible (verrouillé ou déplacé ?) : {exc}") from exc
+            out = Path(tmp) / f"sortie.{fmt}"
+            self._timed_out = False
+            word = self._word_app()
+            watchdog = threading.Timer(self.timeout, self._on_timeout)
+            watchdog.daemon = True
+            watchdog.start()
+            doc = None
+            try:
+                try:
+                    # Mots de passe factices : un document protégé lève une erreur au lieu d'ouvrir une boîte de dialogue.
+                    doc = word.Documents.Open(str(work), ConfirmConversions=False, ReadOnly=True,
+                                              AddToRecentFiles=False, PasswordDocument="__fmsp__",
+                                              PasswordTemplate="__fmsp__", Revert=False,
+                                              WritePasswordDocument="__fmsp__", WritePasswordTemplate="__fmsp__",
+                                              Format=0, Visible=False, OpenAndRepair=False, NoEncodingDialog=True)
+                except Exception as exc:
+                    if self._timed_out:
+                        raise self._timeout_error() from exc
+                    if _rpc_dead(exc):
+                        raise WordDied(str(exc)) from exc
+                    text = str(exc).lower()
+                    if "password" in text or "mot de passe" in text:
+                        raise ExtractionError("Fichier protégé par mot de passe : ignoré, indexation poursuivie.") from exc
+                    raise ExtractionError(f"Word ne peut pas ouvrir le fichier (endommagé ?) : {exc}") from exc
+                try:
+                    if fmt == "docx":
+                        doc.SaveAs2(str(out), FileFormat=16, AddToRecentFiles=False)  # 16 = .docx
+                    else:
+                        doc.ExportAsFixedFormat(OutputFileName=str(out), ExportFormat=17,  # 17 = PDF
+                                                OpenAfterExport=False, OptimizeFor=0, Range=0, Item=0,
+                                                IncludeDocProps=False, KeepIRM=True, CreateBookmarks=0,
+                                                DocStructureTags=False, BitmapMissingFonts=True,
+                                                UseISO19005_1=False)
+                except Exception as exc:
+                    if self._timed_out:
+                        raise self._timeout_error() from exc
+                    if _rpc_dead(exc):
+                        raise WordDied(str(exc)) from exc
+                    raise
+            finally:
+                watchdog.cancel()
+                if doc is not None and not self._timed_out:
+                    try:
+                        doc.Close(SaveChanges=0)
+                    except Exception:
+                        pass
+            if self._timed_out:
+                raise self._timeout_error()
+            if not out.exists():
+                raise ExtractionError("Word n'a produit aucun fichier (conversion interrompue).")
+            shutil.move(str(out), dest)
+
+    def _timeout_error(self) -> WordTimeout:
+        return WordTimeout(f"Word ne répondait plus après {self.timeout:.0f} s (boîte de dialogue cachée ?) : "
+                           "il a été arrêté.")
 
     def _convert_lo(self, src: Path, dest: Path, fmt: str = "pdf") -> None:
         with tempfile.TemporaryDirectory(prefix="fmsp_conv_") as tmp:
             # Copie temporaire : LibreOffice ne touche jamais l'original (règle de non-destruction).
-            tmp_src = Path(tmp) / ("source" + src.suffix.lower())
+            tmp_src = Path(tmp) / ("source" + _real_suffix(src))
             shutil.copy2(src, tmp_src)
             cmd = [self._soffice, f"-env:UserInstallation={self._lo_profile.as_uri()}", "--headless",
                    "--norestore", "--convert-to", fmt, "--outdir", tmp, str(tmp_src)]
-            proc = subprocess.run(cmd, capture_output=True, timeout=180,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            try:
+                proc = subprocess.run(cmd, capture_output=True, timeout=max(self.timeout, 60),
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except subprocess.TimeoutExpired as exc:
+                raise WordTimeout(f"LibreOffice ne répondait plus après {max(self.timeout, 60):.0f} s : "
+                                  "il a été arrêté.") from exc
             produced = Path(tmp) / f"source.{fmt}"
             if tmp_src.suffix.lower() == f".{fmt}":   # .docx -> .docx : LibreOffice écrirait sur la copie
                 produced = tmp_src

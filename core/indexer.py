@@ -44,7 +44,7 @@ from .database import Database
 from .extractors import (MIN_TEXT_CHARS, ExtractionError, PageText, WordConverter, configure_tesseract,
                          detect_type, docx_pages_text, kill_orphan_words, ocr_pdf_pages, pdf_pages_text)
 from .parsing import parse_pages
-from .preview import cache_name_for, intermediate_docx, render_preview
+from .preview import cache_name_for, ensure_intermediate_docx, render_preview
 
 EXTENSIONS = {".pdf", ".doc", ".docx"}
 ALWAYS_SKIPPED = ("~$*", ".~lock*", "Thumbs.db", "desktop.ini")
@@ -261,9 +261,8 @@ class FileProcessor:
         # puis lecture directe. Le .docx est gardé en cache et resservira pour l'aperçu.
         if not self.converter.available:
             raise ExtractionError("Fichier Word 97-2003 (.doc) : Microsoft Word ou LibreOffice est nécessaire.")
-        inter = intermediate_docx(res.chemin, self.cache_dir)
-        if not inter.exists() or inter.stat().st_mtime < res.mtime:
-            self.converter.convert(path, inter, "docx")
+        # Même .docx (et même signature .sig) que celui de l'aperçu : Word ne refait pas la conversion au guichet.
+        inter = ensure_intermediate_docx(res.chemin, self.cache_dir, self.converter)
         return docx_pages_text(inter)
 
     def process(self, src: SourceFile) -> FileResult:
