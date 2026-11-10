@@ -199,6 +199,12 @@ function registerIpc() {
   });
   handle("app:info", () => ({ version: app.getVersion(), logs: LOGS, platform: process.platform, e2e: !!process.env.SCOLARIX_E2E }));
   handle("app:zoom", (factor) => { if (win) win.webContents.setZoomFactor(Math.max(0.5, Math.min(2, factor))); return true; });
+  // mode focus du guichet : vrai plein écran (barre de titre et barre des tâches masquées) ; pas pendant les tests
+  handle("app:fullscreen", (on) => {
+    if (!win || process.env.SCOLARIX_E2E) return false;
+    win.setFullScreen(!!on);
+    return win.isFullScreen();
+  });
   handle("app:log", (level, text) => { write(level === "error" ? "ERROR" : "UI", String(text).slice(0, 4000)); return true; });
   handle("app:relaunch", () => { app.relaunch(); app.quit(); return true; });
   ipcMain.on("print-page:ready", (e, payload) => ipcMain.emit(`print-ready:${payload.id}`, e, payload));

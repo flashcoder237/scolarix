@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   call, sx, FILIERES, FIL_SHORT, flagTone, plural, statutTone,
-  type CheckResult, type Demande, type DemandeFull, type Group, type Releve, type ReleveDetail, type SearchResult,
+  type Alert as AlertT, type CheckResult, type Demande, type DemandeFull, type Group, type Releve, type ReleveDetail, type SearchResult, type Stats,
 } from "../api";
 import { useApp, useShortcuts } from "../state";
-import { Alert, Badge, Chip, Icon, Seg, Switch, dateFr, highlight, play, useDebounced, useDialogs, useToast } from "../components/ui";
-import { PdfView, forget } from "../components/PdfView";
+import { Alert, Badge, Icon, Popover, Switch, highlight, play, useDebounced, useDialogs, useToast } from "../components/ui";
+import { FIT_LABELS, PdfView, ZONES, forget, type PdfViewHandle, type PdfViewState } from "../components/PdfView";
 import { PreviewVariantToggle, useOriginalPreview, type PreviewVariant } from "../components/PreviewVariantToggle";
 import { DemandeDialog, STATUT_AIDE, STATUT_TONE } from "./DemandeDialog";
 import { CursusDialog } from "./CursusDialog";
@@ -26,6 +26,44 @@ export function samePerson(a: string | null | undefined, b: string | null | unde
 }
 
 type Pending = { kind: "print" | "export"; id: number } | null;
+type View = "groupe" | "releve";
+interface StudentGroup { matricule: string; nom: string; filiere: string; rows: Releve[] }
+
+/** Regroupement par étudiant dans l'ordre de pertinence ; dans un groupe, l'ordre du cursus (niveau, semestre, année). */
+export function groupByStudent(rows: Releve[]): StudentGroup[] {
+  const map = new Map<string, StudentGroup>();
+  for (const r of rows) {
+    let g = map.get(r.matricule);
+    if (!g) { g = { matricule: r.matricule, nom: r.nom_complet, filiere: FIL_SHORT[r.filiere_code || ""] || r.filiere || "?", rows: [] }; map.set(r.matricule, g); }
+    g.rows.push(r);
+  }
+  for (const g of map.values()) {
+    g.rows.sort((a, b) => a.niveau_num - b.niveau_num || (a.semestre || 0) - (b.semestre || 0) || (a.annee_academique || "").localeCompare(b.annee_academique || ""));
+  }
+  return [...map.values()];
+}
+
+/** Crédits tels que lus, rapportés au bon total : 60 pour un relevé annuel (deux semestres), 30 pour un semestre. */
+export function creditsLabel(rel: Pick<Releve, "credits" | "annuel" | "semestre" | "semestre_fin">, long = false) {
+  if (rel.credits == null) return "";
+  const deux = rel.annuel || (!!rel.semestre && !!rel.semestre_fin && rel.semestre_fin > rel.semestre);
+  const total = deux ? 60 : rel.semestre ? 30 : null;
+  if (total && rel.credits <= total) return long ? `${rel.credits}/${total} crédits` : `${rel.credits}/${total} cr.`;
+  return `${rel.credits} crédits`;
+}
+
+/** « N4 · S7-S8 » : niveau et semestres, comme la colonne Période de la 2.0. */
+export function periodLabel(r: Releve) {
+  return `${r.niveau_num > 0 && r.niveau_num < 100 ? `N${r.niveau_num}` : (r.niveau || "?").replace("Master ", "M")}${r.sem_label ? ` · ${r.sem_label}` : ""}`;
+}
+
+const pagesShort = (r: Releve) => (r.nb_pages > 1 ? `p. ${r.numero_page}–${r.page_fin}` : `p. ${r.numero_page}`);
+const isRattrapage = (r: Releve) => (r.session || "").toLowerCase().startsWith("rattrap");
+const nomAffiche = (r: Releve) => `${(r.nom || r.nom_complet).toUpperCase()} ${r.prenom || ""}`.trim();
+
+// Emplacement réservé dans le dock, groupe « Affichage » : bascule « Aperçu : corrigé / original »
+// (branche fix/apercu-doc, méthode preview_original du service). Rien n'y est affiché tant qu'elle n'est pas fusionnée.
+type PreviewVariantSlot = ReactNode;
 
 export function Guichet() {
   const app = useApp();
@@ -33,23 +71,26 @@ export function Guichet() {
   const { ask, prompt } = useDialogs();
   const active = app.page === "guichet";
   const inputRef = useRef<HTMLInputElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const pdf = useRef<PdfViewHandle>(null);
 
   // ---------------------------------------------------------------- recherche
   const [query, setQuery] = useState("");
   const [tolerant, setTolerant] = useState(true);      // comme la 1.x : tolérance aux fautes par défaut
   const [filiere, setFiliere] = useState<string | null>(null);
-  const [view, setView] = useState<"releve" | "groupe">("releve");
+  const [view, setViewRaw] = useState<View>("groupe");
   const [res, setRes] = useState<SearchResult | null>(null);
   const [searching, setSearching] = useState(false);
   const debounced = useDebounced(query, 120);
   const searchSeq = useRef(0);
+  const lastQ = useRef<string | null>(null);         // dernière recherche affichée (Entrée : plein écran si elle est à jour)
 
   const runSearch = useCallback(async (q: string) => {
     const my = ++searchSeq.current;
     setSearching(true);
     try {
       const r = await call<SearchResult>("search", { q, tolerant, demande_id: app.activeDemande });
-      if (my === searchSeq.current) { setRes(r); setSel(0); }
+      if (my === searchSeq.current) { setRes(r); setSel(0); lastQ.current = q; }
     } catch (e) {
       if (my === searchSeq.current) toast(`Recherche impossible : ${errMsg(e)}`, { tone: "red" });
     } finally {
@@ -60,8 +101,18 @@ export function Guichet() {
   useEffect(() => { if (app.info) void runSearch(debounced); }, [debounced, tolerant, app.info, runSearch]);
 
   const results = useMemo(() => (res?.results || []).filter((r) => !filiere || r.filiere_code === filiere), [res, filiere]);
+  const groups = useMemo(() => groupByStudent(results), [results]);
+  // ↑ ↓ suivent l'ordre affiché : groupé par étudiant, ou à plat (pertinence)
+  const ordered = useMemo(() => (view === "groupe" ? groups.flatMap((g) => g.rows) : results), [view, groups, results]);
   const [sel, setSel] = useState(0);
-  const current: Releve | null = results[Math.min(sel, results.length - 1)] || null;
+  const current: Releve | null = ordered[Math.min(sel, ordered.length - 1)] || null;
+  const setView = (v: View) => {
+    const id = current?.id;
+    const next = v === "groupe" ? groups.flatMap((g) => g.rows) : results;
+    setViewRaw(v);
+    setSel(Math.max(0, next.findIndex((r) => r.id === id)));
+  };
+  const pick = (id: number) => setSel(Math.max(0, ordered.findIndex((r) => r.id === id)));
 
   // ---------------------------------------------------------------- relevé affiché
   const [detail, setDetail] = useState<ReleveDetail | null>(null);
@@ -95,7 +146,7 @@ export function Guichet() {
             setDetail(d2);
             setRender("");
             setVersion((v) => v + 1);
-            // pages exactes connues : la ligne du tableau est mise à jour
+            // pages exactes connues : la ligne de la liste est mise à jour
             setRes((r) => r && { ...r, results: r.results.map((x) => (x.id === id ? { ...x, ...d2.releve, flags: x.flags } : x)) });
           } catch (e) {
             if (my !== detailSeq.current) return;
@@ -196,7 +247,7 @@ export function Guichet() {
         const full = await call<DemandeFull>("demande_get", { did: app.activeDemande });
         setDemandeIds(new Set(full.items.map((i) => i.item.releve_id)));
       } else setDemandeIds(new Set());
-    } catch { /* moteur en redémarrage : la barre se remettra à jour */ }
+    } catch { /* moteur en redémarrage : la pastille se remettra à jour */ }
   }, [app.activeDemande]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (app.info) void refreshDemandes(); }, [app.info, app.activeDemande, app.demandeVersion, refreshDemandes]);
   const activeD = openDemandes.find((d) => d.id === app.activeDemande) || null;
@@ -241,16 +292,53 @@ export function Guichet() {
     }
   }
 
+  // ---------------------------------------------------------------- mode focus (aperçu plein écran)
+  const [focus, setFocus] = useState(false);
+  const enterFocus = () => {
+    if (!current) return;
+    setFocus(true);
+    inputRef.current?.blur();
+    window.setTimeout(() => stageRef.current?.focus(), 0);
+    void sx.setFullScreen?.(true).catch(() => undefined);
+  };
+  const exitFocus = (thenSearch = true) => {
+    setFocus(false);
+    void sx.setFullScreen?.(false).catch(() => undefined);
+    // tout de suite (un second Échap rapide doit trouver la recherche), puis après le rendu par sûreté
+    if (thenSearch) { inputRef.current?.focus(); window.setTimeout(() => { if (document.activeElement === document.body) inputRef.current?.focus(); }, 0); }
+  };
+  useEffect(() => { if (focus && (!active || !current)) exitFocus(false); }, [active, current]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ---------------------------------------------------------------- clavier
-  const move = (step: number) => setSel((s) => Math.max(0, Math.min(results.length - 1, s + step)));
+  const move = (step: number) => setSel((s) => Math.max(0, Math.min(ordered.length - 1, s + step)));
+  const selectSearch = () => { if (focus) exitFocus(false); inputRef.current?.select(); };
+  /** ↑ ↓ partout sur le guichet, sauf dans un autre champ de saisie (la recherche, elle, les laisse passer ici). */
+  const nav = (step: number) => (e: KeyboardEvent) => {
+    const t = e.target as HTMLElement | null;
+    if (t && t !== inputRef.current && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return false;
+    move(step);
+  };
   useShortcuts({
-    "ctrl+p": () => void doPrint(), "ctrl+e": () => void doExport(), "ctrl+shift+e": () => current && setCursusFor(current.matricule),
-    "ctrl+d": () => void addToDemande(), "ctrl+n": () => void newDemande(current), "ctrl+k": () => inputRef.current?.select(),
-    "ctrl+f": () => inputRef.current?.select(), "f2": () => inputRef.current?.select(),
+    "ctrl+p": () => void doPrint(), "ctrl+e": () => void doExport(), "ctrl+shift+e": () => { if (current) setCursusFor(current.matricule); },
+    "ctrl+d": () => void addToDemande(), "ctrl+n": () => void newDemande(current), "ctrl+k": selectSearch,
+    "ctrl+f": selectSearch, "f2": selectSearch,
+    "arrowdown": nav(1), "arrowup": nav(-1), "pagedown": nav(8), "pageup": nav(-8),
+    "alt+1": () => pdf.current?.goZone("identite"), "alt+2": () => pdf.current?.goZone("notes"), "alt+3": () => pdf.current?.goZone("decision"),
+    "alt+t": () => setTolerant((t) => !t),
+    "f11": () => (focus ? exitFocus() : enterFocus()),
+    "enter": (e) => {
+      // Entrée sur la liste ou l'aperçu : plein écran (dans la recherche, Entrée est traitée par le champ)
+      const t = e.target as HTMLElement | null;
+      if (t && (t === inputRef.current || /^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(t.tagName))) return false;
+      if (!focus) enterFocus();
+    },
   }, active && !cursusFor && !demandeOpen);
+  // Échap par couches : fenêtres modales > menus > mode focus > nouvelle recherche (App)
+  useShortcuts({ "escape": () => exitFocus() }, active && focus && !cursusFor && !demandeOpen);
+
   useEffect(() => { if (active) inputRef.current?.focus(); }, [active]);
   // Échap / Ctrl+F depuis un autre écran : retour au guichet, recherche sélectionnée (nouvel étudiant)
-  useEffect(() => { if (app.searchFocus) window.setTimeout(() => inputRef.current?.select(), 0); }, [app.searchFocus]);
+  useEffect(() => { if (app.searchFocus) window.setTimeout(() => { if (focus) exitFocus(false); inputRef.current?.select(); }, 0); }, [app.searchFocus]); // eslint-disable-line react-hooks/exhaustive-deps
   // chiffres du jour tenus à jour (impressions des autres fenêtres, indexation), comme la 1.x (10 s)
   useEffect(() => {
     if (!active) return;
@@ -261,107 +349,105 @@ export function Guichet() {
   useEffect(() => { if (app.indexing.last?.type === "exit" && app.info) void runSearch(query); }, [app.indexing.last]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const onInputKey = (e: React.KeyboardEvent) => {
-    if (e.key === "ArrowDown") { e.preventDefault(); move(1); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); move(-1); }
-    else if (e.key === "PageDown") { e.preventDefault(); move(8); }
-    else if (e.key === "PageUp") { e.preventDefault(); move(-8); }
-    else if (e.key === "Escape") { setQuery(""); }
-    else if (e.key === "Enter") { e.preventDefault(); void runSearch(query); }     // sans attendre la fin de la frappe
+    if (e.key === "Escape") { if (focus) { e.preventDefault(); exitFocus(); } else setQuery(""); }
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      // recherche déjà à jour : Entrée ouvre le relevé sélectionné en plein écran ; sinon elle part sans attendre la frappe
+      if (lastQ.current === query && current && !searching) enterFocus();
+      else void runSearch(query);
+    }
   };
   const [jump, setJump] = useState(0);
   useEffect(() => setJump(0), [current?.id]);
+  const [pv, setPv] = useState<PdfViewState>({ fit: "auto", scale: null, overflow: false });
+  const [mmHost, setMmHost] = useState<HTMLDivElement | null>(null);
 
   const counts = res?.counts || {};
   const total = res?.results.length || 0;
-  const rel = detail && current && detail.releve.id === current.id ? detail.releve : current;
-  const message = !current ? (query.trim() ? "Aucun résultat : voir les pistes à gauche." : null)
+  const curDetail = detail && current && detail.releve.id === current.id ? detail : null;
+  const rel = curDetail ? curDetail.releve : current;
+  const message = !current ? (query.trim() ? "Aucun résultat pour cette recherche." : null)
     : render === "en cours" ? "Préparation de l'aperçu Word…" : render === "échec" ? `Aperçu Word impossible : ${renderErr}` : null;
-  const shownDetail = detail && current && detail.releve.id === current.id ? detail : null;
-  const [variant, setVariant] = useState<PreviewVariant>("corrige");
+  const onReveal = () => rel && void sx.reveal(rel.chemin).then((found) => toast(found ? "Dossier source ouvert (fichier surligné). Les originaux restent en lecture seule."
+    : "Fichier original introuvable à son emplacement indexé (déplacé ou renommé ?) : dossier le plus proche ouvert. Lancez la vérification d'intégrité (Indexation).", { tone: found ? "green" : "amber", sound: false }));
+  const students = new Set(results.map((r) => r.matricule)).size;
+  const idx = current ? ordered.indexOf(current) : -1;
+    const [variant, setVariant] = useState<PreviewVariant>("corrige");
   useEffect(() => setVariant("corrige"), [current?.id]);
-  const apercu = useOriginalPreview(shownDetail?.apercu?.original_disponible ? shownDetail.releve.id : null, variant);
+  const apercu = useOriginalPreview(curDetail?.apercu?.original_disponible ? curDetail.releve.id : null, variant);
+  const previewVariant: PreviewVariantSlot = curDetail?.apercu?.original_disponible
+    ? <PreviewVariantToggle releveId={curDetail.releve.id} value={variant} onChange={setVariant} available /> : null;
 
   return (
     <>
-      <Header />
-      {!app.compact && <StatsRow />}
-      <DemandeBar active={activeD} list={openDemandes} onPick={(id) => app.setActiveDemande(id)} onAdd={() => void addToDemande()}
-        onOpen={() => activeD && setDemandeOpen(activeD.id)} onNew={() => void newDemande(current)} canAdd={!!current} />
-      <section className="card" style={{ flex: "none" }}>
+      <header className="card topbar" data-testid="topbar">
         <div className="omni">
-          <Icon name="search" size={22} color="#475569" />
+          <Icon name="search" size={19} color="#475569" />
           <input ref={inputRef} value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={onInputKey}
             placeholder="Matricule, nom, prénom ou année…" aria-label="Recherche" data-testid="search" spellCheck={false} autoFocus />
           {res?.norm && query.trim() && <Badge text={`Recherché : ${res.norm}`} tone="blue" title="Matricule normalisé (tirets, espaces, minuscules ignorés)" />}
+          {res && query.trim() && !searching && <span className="muted tiny nowrap opt-wide" title="Résultats au fil de la frappe">{plural(students, "étudiant")} · {res.ms} ms</span>}
           {searching && <span className="spinner" style={{ color: "#94A3B8" }} />}
           {query && <button className="btn ghost sm icon" aria-label="Effacer la recherche" title="Effacer (Échap)" onClick={() => { setQuery(""); inputRef.current?.focus(); }} data-testid="search-clear"><Icon name="x" size={14} /></button>}
-          <span className="hint" title="Échap ou Ctrl+F : nouvelle recherche, depuis n'importe quel écran">Échap</span>
+          {!query && <span className="hint" title="Échap, F2 ou Ctrl+F : nouvelle recherche, depuis n'importe quel écran">Échap</span>}
         </div>
-        <div className="row wrap" style={{ gap: 8 }}>
-          <span className="eyebrow">Filière</span>
+        <div className="fseg" role="radiogroup" aria-label="Filière" data-testid="filieres">
           {FILIERES.map((f) => (
-            <button key={String(f.code)} className={`pill${filiere === f.code ? " on" : ""}`} onClick={() => setFiliere(f.code)}>
-              {f.label}{total > 0 && <span className="n">{f.code ? counts[f.code] || 0 : total}</span>}
+            <button key={String(f.code)} className={filiere === f.code ? "on" : ""} role="radio" aria-checked={filiere === f.code} onClick={() => setFiliere(f.code)} title={f.label}>
+              {f.code ? <><span className="lg">{f.label}</span><span className="sh">{FIL_TINY[f.code] || f.label}</span></> : f.label}
+              {total > 0 && <span className="n">{f.code ? counts[f.code] || 0 : total}</span>}
             </button>
           ))}
-          <span style={{ width: 16 }} />
-          <span className="eyebrow">Mode</span>
-          <Seg value={tolerant} options={[[false, "Exacte"], [true, "Tolérance fautes / phonétique"]]} onChange={setTolerant} label="Mode de recherche" />
-          <span className="grow" />
-          {!app.compact && <span className="muted tiny">{res && query.trim() ? `${res.ms} ms · au fil de la frappe` : "Tapez un matricule (18M042, 18-M-042…), un nom ou une année"}</span>}
         </div>
-      </section>
+        <span data-testid="tolerance"><Switch blue checked={tolerant} onChange={setTolerant} label={<span className="opt-mid">Tolérance</span>}
+          title={`Tolérance aux fautes et phonétique (Alt+T) : ${tolerant ? "activée" : "désactivée, recherche exacte"}`} /></span>
+        <span className="grow" />
+        <DemandeChip active={activeD} list={openDemandes} onPick={(id) => app.setActiveDemande(id)} onAdd={() => void addToDemande()}
+          onOpen={() => activeD && setDemandeOpen(activeD.id)} onNew={() => void newDemande(current)} canAdd={!!current} />
+        <StatsButton />
+      </header>
 
-      <div className="row" style={{ flex: 1, minHeight: 0, alignItems: "stretch", gap: 14 }}>
-        <section className="card" style={{ flex: "57 1 0", minWidth: 0 }}>
-          <div className="row">
+      <div className="gx-body">
+        <section className="card gx-list" aria-label="Résultats">
+          <div className="row" style={{ gap: 8 }}>
             <div className="grow">
-              <div className="eyebrow">Résultats · triés par pertinence</div>
-              <div className="h3" data-testid="count">{query.trim() ? `${plural(results.length, "relevé")} · ${plural(new Set(results.map((r) => r.matricule)).size, "étudiant")}` : "Prêt"}</div>
+              <div className="eyebrow">Résultats</div>
+              <div className="h3 ellipsis" data-testid="count">{query.trim() ? `${plural(results.length, "relevé")} · ${plural(students, "étudiant")}` : "Prêt"}</div>
             </div>
-            <Seg value={view} options={[["releve", "Par relevé"], ["groupe", "Groupée par étudiant"]]} onChange={setView} label="Affichage" />
+            <div className="seg sm" role="radiogroup" aria-label="Présentation des résultats">
+              <button className={view === "groupe" ? "on" : ""} role="radio" aria-checked={view === "groupe"} aria-label="Groupée par étudiant" title="Groupée par étudiant" onClick={() => setView("groupe")} data-testid="view-groupe"><Icon name="user" size={15} /></button>
+              <button className={view === "releve" ? "on" : ""} role="radio" aria-checked={view === "releve"} aria-label="Par relevé" title="Par relevé (liste à plat, par pertinence)" onClick={() => setView("releve")} data-testid="view-releve"><Icon name="filter" size={15} /></button>
+            </div>
           </div>
           {results.length === 0 ? (
             <Empty query={query.trim()} total={total} tolerant={tolerant} onAll={() => setFiliere(null)} onTolerant={() => setTolerant(true)} />
-          ) : view === "releve" ? (
-            <ResultsTable rows={results} sel={sel} onSel={setSel} q={query} inDemande={demandeIds} />
           ) : (
-            <GroupedView rows={results} current={current} onPick={(id) => setSel(results.findIndex((r) => r.id === id))} />
+            <ResultsList groups={view === "groupe" ? groups : null} rows={ordered} current={current} onPick={pick} q={query}
+              inDemande={demandeIds} onOpen={(id) => { pick(id); window.setTimeout(enterFocus, 0); }} />
           )}
-          <div className="muted tiny ellipsis">↑ ↓ parcourir + aperçu · Ctrl+P imprimer · Ctrl+E exporter · Ctrl+Maj+E cursus · Ctrl+D ajouter à la demande · Échap nouvelle recherche</div>
+          <div className="muted tiny gx-hints"><span className="key">↑</span><span className="key">↓</span> aperçu · <span className="key">Entrée</span> plein écran · <span className="key">Échap</span> nouvelle recherche</div>
         </section>
 
-        <section className="col" style={{ flex: "43 1 0", minWidth: 420, gap: 10 }}>
-          <Recap rel={rel} detail={detail && current && detail.releve.id === current.id ? detail : null} compact={app.compact}
-            onReveal={() => rel && void sx.reveal(rel.chemin).then((found) => toast(found ? "Dossier source ouvert (fichier surligné). Les originaux restent en lecture seule."
-              : "Fichier original introuvable à son emplacement indexé (déplacé ou renommé ?) : dossier le plus proche ouvert. Lancez la vérification d'intégrité (Indexation).", { tone: found ? "green" : "amber", sound: false }))} />
-          <div className="card grow" style={{ gap: 8 }}>
-            <div className="row">
-              {rel && rel.nb_pages > 1 && Array.from({ length: rel.nb_pages }, (_, i) => rel.numero_page + i).map((p) => (
-                <button key={p} className={`badge ${jump === p ? "t-blue" : "t-gray"}`} style={{ border: "none", cursor: "pointer" }} title={`Aller à la page ${p}`}
-                  onClick={() => setJump(p)} data-testid={`page-${p}`}>Page {p}</button>
-              ))}
-              {rel && rel.nb_pages === 1 && <span className="badge t-gray">Page {rel.numero_page}</span>}
-              <span className="grow" />
-              <PreviewVariantToggle releveId={shownDetail?.releve.id} value={variant} onChange={setVariant} available={!!shownDetail?.apercu?.original_disponible} />
-              <Switch checked={duplicata} onChange={setDuplicata} label="Duplicata" title="Timbre « Duplicata conforme » horodaté et journalisé · l'original reste intact" />
+        <section className="gx-preview">
+          <FicheStrip rel={rel} detail={curDetail} onReveal={onReveal} />
+          <div className={`gx-stage${focus ? " focus" : ""}`} ref={stageRef} tabIndex={-1} data-testid="stage" aria-label="Aperçu du relevé">
+            {focus && rel && (
+              <FocusBar rel={rel} alerts={curDetail?.alerts || []} pos={idx} total={ordered.length} busy={busy} duplicata={duplicata}
+                onPrint={() => void doPrint()} onDemande={() => void addToDemande()} onExport={() => void doExport()} onExit={() => exitFocus()}
+                onMove={move} pv={pv} pdf={pdf} setMm={setMmHost} />
+            )}
+            <div className="gx-view">
+              <PdfView ref={pdf} file={apercu.original?.file ?? (curDetail ? curDetail.preview_pdf : null)}
+                first={apercu.original?.first ?? (rel?.numero_page || 1)} last={apercu.original?.last ?? (rel?.page_fin || 1)}
+                version={`${rel?.id}-${version}${apercu.original ? "-o" : ""}`} message={apercu.message ?? message}
+                stamp={duplicata && !apercu.original} jumpTo={jump || undefined}
+                defaultFit="auto" toolbar={false} minimapHost={mmHost} onState={setPv} onDoubleClick={() => (focus ? exitFocus() : enterFocus())} />
             </div>
-            <PdfView file={apercu.original?.file ?? (detail && current && detail.releve.id === current.id ? detail.preview_pdf : null)}
-              first={apercu.original?.first ?? (rel?.numero_page || 1)} last={apercu.original?.last ?? (rel?.page_fin || 1)}
-              version={`${rel?.id}-${version}${apercu.original ? "-o" : ""}`} message={apercu.message ?? message}
-              stamp={duplicata && !apercu.original} jumpTo={jump || undefined} />
-          </div>
-          <div className="card" style={{ flex: "none", flexDirection: "row", gap: 8, padding: app.compact ? "10px 12px" : 14 }}>
-            <button className="btn primary grow" disabled={!current || !!busy} onClick={() => void doPrint()} data-testid="print">
-              {busy === "print" ? <span className="spinner" /> : <Icon name="printer" size={19} />}
-              {app.compact ? "Imprimer" : "Imprimer ce relevé"} <span className="kbd">Ctrl+P</span>
-            </button>
-            <button className="btn secondary" disabled={!current || !!busy} onClick={() => void doExport()} title="Exporter en PDF (Ctrl+E)" data-testid="export">
-              {busy === "export" ? <span className="spinner" /> : <Icon name="download" />}Exporter
-            </button>
-            <button className="btn secondary" disabled={!current} onClick={() => current && setCursusFor(current.matricule)} title="Cursus complet (Ctrl+Maj+E)" data-testid="cursus">
-              <Icon name="layers" />Cursus
-            </button>
+            {!focus && (
+              <Dock rel={current ? rel : null} busy={busy} duplicata={duplicata} setDuplicata={setDuplicata} onPrint={() => void doPrint()}
+                onDemande={() => void addToDemande()} onExport={() => void doExport()} onCursus={() => current && setCursusFor(current.matricule)}
+                onFocus={enterFocus} pv={pv} pdf={pdf} setMm={setMmHost} jump={jump} setJump={setJump} variant={previewVariant} />
+            )}
           </div>
         </section>
       </div>
@@ -371,218 +457,329 @@ export function Guichet() {
   );
 }
 
-// ------------------------------------------------------------------ en-tête et chiffres
-export function greeting(h = new Date().getHours()) {
-  return h < 12 ? "Bonjour" : h < 18 ? "Bon après-midi" : "Bonsoir";
-}
+const FIL_TINY: Record<string, string> = { M: "Méd.", P: "Pharma", B: "Bioméd.", MS: "Masters" };
 
-function Header() {
-  const { info, stats, compact, openSettings, settings } = useApp();
+// ------------------------------------------------------------------ barre supérieure : demande, chiffres du jour
+function DemandeChip({ active, list, onPick, onAdd, onOpen, onNew, canAdd }: {
+  active: Demande | null; list: Demande[]; onPick: (id: number | null) => void; onAdd: () => void; onOpen: () => void; onNew: () => void; canAdd: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const run = (f: () => void) => () => { setOpen(false); f(); };
   return (
-    <header className="header">
-      <div className="titles">
-        {!compact && <div className="eyebrow">{dateFr()} · Guichet d'exploitation</div>}
-        <h1 className="h1">{greeting()}, {settings?.operateur || info?.operateur || "…"}</h1>
-      </div>
-      {compact && stats && (
-        <span className="muted small" title={`Indexation : ${stats.derniere_indexation || "jamais"}`}>
-          {stats.releves.toLocaleString("fr-FR")} relevés · {stats.imprimes} imprimé(s) aujourd'hui{stats.anomalies ? ` · ${stats.anomalies} anomalie(s)` : ""}
+    <div className="anchor">
+      <button className={`dchip${active ? " on" : ""}`} onClick={() => setOpen((o) => !o)} data-testid="demande-chip" aria-expanded={open}
+        title="Demande en cours : une demande réunit les relevés demandés par une même personne. Ctrl+D ajoute le relevé affiché, Ctrl+N en crée une nouvelle.">
+        <Icon name="folder" size={17} />
+        <span className="dtxt">
+          <span className="eyebrow opt-wide">{active ? `Demande ${active.numero}` : "Demande en cours"}</span>
+          <span className="dn ellipsis" data-testid="demande-label">{active ? `${active.nom || active.matricule || "—"} · ${plural(active.n, "relevé")}` : "Aucune"}</span>
         </span>
-      )}
-      <Badge text="Sources en lecture seule" tone="green" big dot />
-      <button className="btn ghost" onClick={() => openSettings()} title="Réglages du poste : opérateur, imprimante, chemins" data-testid="settings">
-        <Icon name="sliders" />Poste {settings?.poste || ""}
+        <Icon name="chevron_down" size={15} />
       </button>
-    </header>
-  );
-}
-
-function StatsRow() {
-  const { stats, indexing } = useApp();
-  const ev = indexing.last;
-  const prog = indexing.running && ev?.type === "progress" && ev.total ? { done: ev.done as number, total: ev.total as number } : null;
-  const items: [string, any, string, string][] = [
-    ["shield", "green", "Base d'index", stats ? `${stats.releves.toLocaleString("fr-FR")} relevés · ${stats.etudiants.toLocaleString("fr-FR")} étudiants` : "—"],
-    ["database", "blue", "Indexation", prog ? `${Math.floor((prog.done * 100) / prog.total)} % · ${prog.done} / ${prog.total} fichiers` : indexing.running ? "En cours…" : stats?.derniere_indexation ? `Dernière passe : ${stats.derniere_indexation}` : "Jamais lancée"],
-    ["printer", "violet", "Imprimés aujourd'hui", stats ? `${stats.imprimes} relevés · ${stats.duplicatas} duplicata(s)` : "—"],
-    ["alert", "amber", "Anomalies à revoir", stats ? `${stats.anomalies} fichier(s)` : "—"],
-  ];
-  return (
-    <div className="stats-grid">
-      {items.map(([icon, tone, label, value]) => (
-        <div key={label} className="card kpi" style={{ flexDirection: "row", padding: 14 }}>
-          <Chip icon={icon} tone={tone} />
-          <div className="grow" style={{ minWidth: 0 }}><div className="eyebrow">{label}</div><div className="h3 ellipsis" title={value}>{value}</div>
-            {label === "Indexation" && prog && <div className="progress" style={{ marginTop: 6, height: 6 }}><div style={{ width: `${(prog.done * 100) / prog.total}%` }} /></div>}</div>
+      <Popover open={open} onClose={() => setOpen(false)} width={340} label="Demande en cours" testid="demande-menu">
+        {active ? (
+          <div className="pop-head">
+            <div className="row"><span className="h3 grow ellipsis">{active.numero} · {active.nom || "—"}</span>
+              <Badge text={STATUT_AIDE[active.statut] || active.statut} tone={STATUT_TONE[active.statut] || "gray"} /></div>
+            <div className="muted small">Demandeur : {active.demandeur || "—"} · matricule {active.matricule || "—"} · {plural(active.n, "relevé")}</div>
+          </div>
+        ) : <div className="pop-head muted small">Aucune demande en cours. Une demande réunit les relevés demandés par une même personne.</div>}
+        <button className="mi" disabled={!canAdd} onClick={run(onAdd)}><Icon name="plus" size={15} />Ajouter le relevé affiché<span className="kbd">Ctrl+D</span></button>
+        <button className="mi" disabled={!active} onClick={run(onOpen)} data-testid="demande-open"><Icon name="eye" size={15} />Voir / préparer…</button>
+        <button className="mi" onClick={run(onNew)} data-testid="demande-new"><Icon name="folder" size={15} />Nouvelle demande<span className="kbd">Ctrl+N</span></button>
+        <div className="sep" />
+        <div className="eyebrow" style={{ padding: "2px 10px" }}>Choisir une autre demande</div>
+        <div className="mlist" data-testid="demande-picker" role="radiogroup" aria-label="Demande active">
+          <button className={`mi${!active ? " on" : ""}`} role="radio" aria-checked={!active} onClick={run(() => onPick(null))} data-testid="demande-option">— aucune —</button>
+          {list.map((d) => (
+            <button key={d.id} className={`mi${active?.id === d.id ? " on" : ""}`} role="radio" aria-checked={active?.id === d.id} onClick={run(() => onPick(d.id))} data-testid="demande-option"
+              title={`${STATUT_AIDE[d.statut] || d.statut} · demandeur : ${d.demandeur || "—"}`}>
+              <span className="grow ellipsis">{d.numero} · {d.nom || d.matricule || "?"} ({d.n})</span>
+            </button>
+          ))}
         </div>
-      ))}
+      </Popover>
     </div>
   );
 }
 
-function DemandeBar({ active, list, onPick, onAdd, onOpen, onNew, canAdd }: {
-  active: Demande | null; list: Demande[]; onPick: (id: number | null) => void; onAdd: () => void; onOpen: () => void; onNew: () => void; canAdd: boolean;
-}) {
-  const { compact } = useApp();
+function StatsButton() {
+  const { stats, indexing, info, settings, openSettings, go } = useApp();
+  const [open, setOpen] = useState(false);
+  const s: Stats | null = stats;
+  const lbl = s ? `${plural(s.imprimes, "imprimé")}${s.anomalies ? ` · ${plural(s.anomalies, "anomalie")}` : ""}` : "Chiffres du jour";
   return (
-    <section className="card" style={{ flexDirection: "row", alignItems: "center", flex: "none", padding: compact ? "8px 12px" : 14 }} data-testid="demande-bar">
-      {!compact && <Chip icon="folder" tone="violet" size={36} />}
-      <div className="grow" style={{ minWidth: 0 }}>
-        {!compact && <div className="eyebrow">Demande en cours</div>}
-        <div className="h3 ellipsis" data-testid="demande-label" title="Une demande réunit les relevés demandés par une même personne : Ctrl+D ajoute le relevé affiché.">
-          {active ? (compact ? `Pour : ${active.nom || active.matricule || "—"} · ${plural(active.n, "relevé")}` : `${active.numero} · ${active.nom || "—"} · ${plural(active.n, "relevé")}`)
-            : compact ? "Demande en cours : aucune" : "Aucune — une demande réunit les relevés demandés par une même personne"}
+    <div className="anchor">
+      <button className="btn ghost sm statsbtn" onClick={() => setOpen((o) => !o)} aria-expanded={open} data-testid="stats-btn" title={`Chiffres du jour : ${lbl}`}>
+        <Icon name="chart" size={16} /><span className="opt-wide">{lbl}</span><Icon name="chevron_down" size={14} />
+      </button>
+      <Popover open={open} onClose={() => setOpen(false)} width={320} label="Chiffres du jour" testid="stats-pop">
+        <div className="pop-head"><div className="eyebrow">Chiffres du jour</div></div>
+        <div className="kv"><span>Imprimés aujourd'hui</span><b data-testid="stat-imprimes">{s ? plural(s.imprimes, "relevé") : "—"}</b></div>
+        <div className="kv"><span>dont duplicata</span><b>{s ? s.duplicatas : "—"}</b></div>
+        <div className="kv"><span>Anomalies à revoir</span><b style={s?.anomalies ? { color: "var(--amber)" } : undefined}>{s ? `${s.anomalies} fichier(s)` : "—"}</b></div>
+        <div className="kv"><span>Base d'index</span><b>{s ? `${s.releves.toLocaleString("fr-FR")} relevés · ${s.etudiants.toLocaleString("fr-FR")} étudiants` : "—"}</b></div>
+        <div className="kv"><span>Indexation</span><b>{indexing.running ? "en cours…" : s?.derniere_indexation || "jamais lancée"}</b></div>
+        <div className="sep" />
+        <div className="row" style={{ padding: "2px 6px", gap: 6 }}>
+          <Badge text="Sources en lecture seule" tone="green" dot />
+          <span className="grow" />
+          <button className="btn link tiny" onClick={() => { setOpen(false); go("indexation"); }}>Écran Indexation</button>
         </div>
-      </div>
-      {active && <Badge text={STATUT_AIDE[active.statut] || active.statut} tone={STATUT_TONE[active.statut] || "gray"} title={`Demandeur : ${active.demandeur || "—"} · matricule ${active.matricule || "—"}`} />}
-      <select className="field" style={{ width: compact ? 190 : 230 }} value={active?.id ?? ""} onChange={(e) => onPick(e.target.value ? Number(e.target.value) : null)} aria-label="Demande active" data-testid="demande-picker">
-        <option value="">— aucune —</option>
-        {list.map((d) => <option key={d.id} value={d.id}>{d.numero} · {d.nom || d.matricule || "?"} ({d.n})</option>)}
-      </select>
-      <button className="btn secondary" disabled={!canAdd} onClick={onAdd} title="Ajouter le relevé affiché à la demande (Ctrl+D)"><Icon name="plus" />Ajouter <span className="kbd">Ctrl+D</span></button>
-      <button className="btn ghost" disabled={!active} onClick={onOpen}>Voir / préparer</button>
-      <button className="btn ghost" onClick={onNew} title="Nouvelle demande (Ctrl+N)">Nouvelle <span className="kbd">Ctrl+N</span></button>
-    </section>
+        <button className="mi" onClick={() => { setOpen(false); openSettings(); }} data-testid="settings" title="Réglages du poste : opérateur, imprimante, chemins (Ctrl+,)">
+          <Icon name="sliders" size={15} />Poste {settings?.poste || info?.poste || ""} · {settings?.operateur || info?.operateur || "?"}<span className="kbd">Ctrl+,</span>
+        </button>
+      </Popover>
+    </div>
   );
 }
 
 // ------------------------------------------------------------------ résultats
-function ResultsTable({ rows, sel, onSel, q, inDemande }: { rows: Releve[]; sel: number; onSel: (i: number) => void; q: string; inDemande: Set<number> }) {
-  const body = useRef<HTMLTableSectionElement>(null);
+function ResultsList({ groups, rows, current, onPick, q, inDemande, onOpen }: {
+  groups: StudentGroup[] | null; rows: Releve[]; current: Releve | null; onPick: (id: number) => void; q: string; inDemande: Set<number>; onOpen: (id: number) => void;
+}) {
+  const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    const tr = body.current?.children[sel] as HTMLElement | undefined;
-    tr?.scrollIntoView({ block: "nearest" });
-  }, [sel]);
+    (box.current?.querySelector(".it.sel") as HTMLElement | null)?.scrollIntoView({ block: "nearest" });
+  }, [current?.id, groups]);
+  // dossier complet de chaque étudiant (périodes manquantes) : en tête de groupe, sans retarder la liste
+  const [dossiers, setDossiers] = useState<Record<string, Group>>({});
+  const ids = rows.map((r) => r.id).join(",");
+  useEffect(() => {
+    if (!groups) return;
+    let alive = true;
+    const t = window.setTimeout(() => {
+      void call<Group[]>("groups", { releve_ids: rows.map((r) => r.id) })
+        .then((gs) => alive && setDossiers(Object.fromEntries(gs.map((g) => [g.matricule, g])))).catch(() => undefined);
+    }, 250);
+    return () => { alive = false; window.clearTimeout(t); };
+  }, [ids, !!groups]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const item = (r: Releve, flat: boolean) => {
+    const flags = inDemande.has(r.id) && !r.flags.includes("✓ DEMANDE") ? ["✓ DEMANDE", ...r.flags] : r.flags;
+    const on = current?.id === r.id;
+    return (
+      <div key={r.id} className={`it${on ? " sel" : ""}`} onClick={() => onPick(r.id)} onDoubleClick={() => onOpen(r.id)}
+        role="option" aria-selected={on} data-testid="result-item" title="Double-clic ou Entrée : plein écran">
+        {flat && <div className="l0"><span className="mono">{highlight(r.matricule, q)}</span><span className="ellipsis">{highlight(r.nom_complet, q)}</span></div>}
+        <div className="l1"><b className="nowrap">{periodLabel(r)}</b><span className="muted nowrap">{r.annee_academique || "?"}</span><span className="grow" />
+          <Badge text={r.statut || "—"} tone={statutTone(r.statut)} dot /></div>
+        <div className="l2"><span className="ellipsis">{ligne2(r) || (flat ? FIL_SHORT[r.filiere_code || ""] || r.filiere || "" : "")}</span><span className="grow" /><span className="nowrap">{pagesShort(r)}</span></div>
+        {flags.length > 0 && <div className="flags">{flags.map((f) => <Badge key={f} text={f} tone={flagTone(f)} />)}</div>}
+      </div>
+    );
+  };
   return (
-    <div className="table-wrap" data-testid="results">
-      <table className="grid">
-        <colgroup><col style={{ width: 92 }} /><col /><col style={{ width: 112 }} /><col style={{ width: 104 }} /><col style={{ width: 104 }} /><col style={{ width: 58 }} /></colgroup>
-        <thead><tr><th>Matricule</th><th>Nom &amp; prénom</th><th>Période</th><th>Année</th><th>Statut</th><th>Pages</th></tr></thead>
-        <tbody ref={body}>
-          {rows.map((r, i) => {
-            const flags = inDemande.has(r.id) && !r.flags.includes("✓ DEMANDE") ? ["✓ DEMANDE", ...r.flags] : r.flags;
-            return (
-              <tr key={r.id} className={i === sel ? "sel" : ""} onClick={() => onSel(i)} aria-selected={i === sel}>
-                <td className="mono" style={{ fontSize: 12.5 }}>{highlight(r.matricule, q)}</td>
-                <td className="cell2">
-                  <div className="l1 ellipsis" title={r.nom_complet}>{highlight(r.nom_complet, q)}</div>
-                  {flags.length > 0 && <div className="flags">{flags.map((f) => <Badge key={f} text={f} tone={flagTone(f)} />)}</div>}
-                </td>
-                <td className="cell2"><div className="l1 ellipsis">{r.niveau_num > 0 && r.niveau_num < 100 ? `N${r.niveau_num}` : (r.niveau || "?").replace("Master ", "M")}{r.sem_label ? ` · ${r.sem_label}` : ""}</div>
-                  <div className="l2">{FIL_SHORT[r.filiere_code || ""] || r.filiere || "?"}</div></td>
-                <td className="cell2"><div className="l1">{r.annee_academique || "?"}</div><div className="l2">{ligne2(r)}</div></td>
-                <td><Badge text={r.statut || "—"} tone={statutTone(r.statut)} dot /></td>
-                <td className="muted">{r.nb_pages > 1 ? `${r.numero_page}–${r.page_fin}` : r.numero_page}</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+    <div className="gx-items" ref={box} role="listbox" aria-label="Relevés trouvés" data-testid="results">
+      {groups ? groups.map((g) => {
+        const d = dossiers[g.matricule];
+        return (
+          <div key={g.matricule} className="grp" data-testid="result-group">
+            <div className="ghead">
+              <div className="row" style={{ gap: 8 }}><span className="mono">{highlight(g.matricule, q)}</span><span className="gname grow ellipsis" title={g.nom}>{highlight(g.nom, q)}</span></div>
+              <div className="row tiny muted" style={{ gap: 6 }}>
+                <span className="nowrap">{g.filiere} · {plural(g.rows.length, "relevé")}</span><span className="grow" />
+                {d && <Badge text={d.missing.length ? `${d.missing.join(", ")} manquant${d.missing.length > 1 ? "s" : ""}` : `Complet · ${d.valides}/${d.total} validé(s)`} tone={d.tone}
+                  title={d.missing.length ? `Périodes absentes du dossier indexé : ${d.missing.join(", ")}` : "Toutes les périodes du cursus sont indexées"} />}
+              </div>
+            </div>
+            {g.rows.map((r) => item(r, false))}
+          </div>
+        );
+      }) : rows.map((r) => item(r, true))}
     </div>
   );
 }
 
-/** Seconde ligne de la colonne Année (1.x) : rattrapage, sinon moyenne · grade, sinon session ; rien d'inventé. */
+/** Seconde ligne (1.x) : rattrapage, sinon moyenne · grade, sinon session ; rien d'inventé. */
 export function ligne2(r: Releve) {
-  if ((r.session || "").toLowerCase().startsWith("rattrap")) return "Session de rattrapage";
+  if (isRattrapage(r)) return "Session de rattrapage";
   if (r.moyenne) return `Moy. ${r.moyenne}${r.grade ? ` · ${r.grade}` : ""}`;
   if (r.session) return `Session ${r.session.toLowerCase()}`;
   return "";
 }
 
-function GroupedView({ rows, current, onPick }: { rows: Releve[]; current: Releve | null; onPick: (id: number) => void }) {
-  const [groups, setGroups] = useState<Group[] | null>(null);
-  const ids = rows.map((r) => r.id).join(",");
-  useEffect(() => {
-    let alive = true;
-    void call<Group[]>("groups", { releve_ids: rows.map((r) => r.id) }).then((g) => alive && setGroups(g)).catch(() => alive && setGroups([]));
-    return () => { alive = false; };
-  }, [ids]); // eslint-disable-line react-hooks/exhaustive-deps
-  if (!groups) return <div className="empty muted"><span className="spinner" /></div>;
-  return (
-    <div className="table-wrap col" style={{ gap: 10 }}>
-      {groups.map((g) => (
-        <div key={g.matricule} className="soft col" style={{ gap: 6 }}>
-          <div className="row">
-            <span className="mono">{g.matricule}</span><span className="h3 grow ellipsis">{g.nom}</span>
-            <Badge text={g.missing.length ? `${g.missing.join(", ")} manquant${g.missing.length > 1 ? "s" : ""}` : `Tous présents · ${g.valides}/${g.total} validé(s)`} tone={g.tone} />
-          </div>
-          {g.found.map((r) => (
-            <div key={r.id} className="row small" style={{ cursor: "pointer", padding: "4px 6px", borderRadius: 8, background: current?.id === r.id ? "#EEF4FF" : undefined }}
-              onClick={() => onPick(r.id)}>
-              <span style={{ width: 170 }} className="ellipsis">{r.periode}</span>
-              <span className="muted" style={{ width: 150 }}>{r.annee_academique} · moy. {r.moyenne || "—"}</span>
-              <Badge text={r.statut || "—"} tone={statutTone(r.statut)} />
-              <span className="grow" />
-              <span className="muted tiny">{r.pages_label}</span>
-            </div>
-          ))}
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function Empty({ query, total, tolerant, onAll, onTolerant }: { query: string; total: number; tolerant: boolean; onAll: () => void; onTolerant: () => void }) {
   if (!query) return (
     <div className="empty"><h2 className="h2">Qui se présente au guichet ?</h2>
-      <div className="muted" style={{ maxWidth: 460 }}>Tapez le matricule (18M042, 18-M-042, 18 m 042…), le nom ou le prénom, ou une année. Les résultats s'affichent pendant la frappe ; ↑ ↓ pour parcourir.</div></div>
+      <div className="muted small">Tapez le matricule (18M042, 18-M-042, 18 m 042…), le nom ou le prénom, ou une année. Les résultats s'affichent pendant la frappe ; ↑ ↓ pour parcourir, Entrée pour l'aperçu en plein écran.</div></div>
   );
   if (total) return (
     <div className="empty"><h2 className="h2">Aucun relevé de cette filière pour « {query} »</h2>
-      <div className="muted">{plural(total, "relevé trouvé", "relevés trouvés")} dans d'autres filières.</div>
+      <div className="muted small">{plural(total, "relevé trouvé", "relevés trouvés")} dans d'autres filières.</div>
       <button className="btn secondary" onClick={onAll}>Afficher toutes les filières ({total})</button></div>
   );
   return (
     <div className="empty" data-testid="empty"><h2 className="h2">Aucun relevé pour « {query} »</h2>
-      <div className="muted" style={{ maxWidth: 480 }}>Pistes : vérifiez l'orthographe ou tapez seulement le nom de famille ; pour un matricule, essayez sans la lettre de filière (ex. 18 042) ; un relevé récent n'est peut-être pas encore indexé (écran Indexation, Ctrl+3).</div>
+      <div className="muted small">Pistes : vérifiez l'orthographe ou tapez seulement le nom de famille ; pour un matricule, essayez sans la lettre de filière (ex. 18 042) ; un relevé récent n'est peut-être pas encore indexé (écran Indexation, Ctrl+3).</div>
       {!tolerant && <button className="btn secondary" onClick={onTolerant}>Essayer avec la tolérance aux fautes</button>}</div>
   );
 }
 
-// ------------------------------------------------------------------ récapitulatif du contrôle
-function Recap({ rel, detail, compact, onReveal }: { rel: Releve | null; detail: ReleveDetail | null; compact: boolean; onReveal: () => void }) {
+// ------------------------------------------------------------------ fiche condensée (au-dessus de la page)
+function shortAlert(t: string) {
+  // libellé court de la puce (texte complet en infobulle et au clic) : jusqu'au premier « . », « : » ou « — »
+  const cut = t.split(/(?<=[^.]{12,})(?:\. | : | — | \(autres)/)[0];
+  return cut.length > 90 ? cut.slice(0, 88) + "…" : cut;
+}
+
+function recapBits(rel: Releve) {
+  const bits: [string, string][] = [];
+  if (rel.moyenne) bits.push(["Moyenne", `${rel.moyenne}/20${rel.grade ? ` · grade ${rel.grade}` : ""}${rel.mgp ? ` (MGP ${rel.mgp})` : ""}`]);
+  else bits.push(["Moyenne", "non lue"]);
+  if (rel.decision_deduite) bits.push(["Décision", `déduite : ${rel.decision}`]);
+  else if (rel.decision) bits.push(["Décision", `« ${rel.decision} »`]);
+  bits.push(["Session", isRattrapage(rel) ? "rattrapage" : rel.session ? rel.session.toLowerCase() : "—"]);
+  if (rel.credits != null) bits.push(["Crédits", creditsLabel(rel, true)]);
+  if (rel.date_connue) bits.push(["Naissance", `${rel.date_connue}${rel.lieu_naissance ? ` à ${rel.lieu_naissance}` : ""}`]);
+  else if (rel.date_naissance) bits.push(["Naissance", "non renseignée sur le relevé"]);
+  bits.push(["Filière", rel.filiere || FIL_SHORT[rel.filiere_code || ""] || "?"]);
+  bits.push(["À imprimer", rel.pages_label + (rel.nb_pages > 1 ? " liées" : "")]);
+  return bits;
+}
+
+function FicheStrip({ rel, detail, onReveal }: { rel: Releve | null; detail: ReleveDetail | null; onReveal: () => void }) {
+  const [expand, setExpand] = useState(false);
+  const [details, setDetails] = useState(false);
+  useEffect(() => { setDetails(false); }, [rel?.id]);
   if (!rel) return (
-    <div className="card" style={{ flex: "none" }}><div className="eyebrow">Contrôle avant impression</div><h2 className="h2">Aucun relevé sélectionné</h2></div>
+    <div className="card strip" data-testid="recap"><span className="eyebrow">Contrôle avant impression</span><span className="nm muted">Aucun relevé sélectionné</span></div>
   );
-  let sem = rel.semestre ? rel.sem_label + (rel.annuel ? " (annuel)" : "") : "?";
-  if (rel.credits != null) sem += ` · ${rel.credits}/30 crédits`;
-  if ((rel.session || "").toLowerCase().startsWith("rattrap")) sem += " · rattrapage";
-  const pages = rel.pages_label + (rel.nb_pages > 1 ? " liées" : "");
-  const bits: string[] = [];
-  if (rel.moyenne) bits.push(`Moyenne ${rel.moyenne}/20`);
-  if (rel.grade) bits.push(`grade ${rel.grade}${rel.mgp ? ` (MGP ${rel.mgp})` : ""}`);
-  if (rel.decision_deduite) bits.push(`décision déduite : ${rel.decision}`);
-  else if (rel.decision) bits.push(`décision : « ${rel.decision} »`);
-  if (rel.date_connue) bits.push(`né(e) le ${rel.date_connue}${rel.lieu_naissance ? ` à ${rel.lieu_naissance}` : ""}`);
-  else if (rel.date_naissance) bits.push("date de naissance non renseignée sur le relevé");
-  const nom = `${(rel.nom || rel.nom_complet).toUpperCase()} ${rel.prenom || ""}`.trim();
+  const alerts = detail?.alerts || [];
+  const sem = rel.semestre ? rel.sem_label + (rel.annuel ? " annuel" : "") : "";
+  const facts: ReactNode[] = [rel.annee_academique || "année ?", rel.niveau || "niveau ?"];
+  if (sem) facts.push(sem);
+  if (rel.credits != null) facts.push(<span className="opt-mid" key="cr">{creditsLabel(rel)}</span>);
+  if (rel.date_connue) facts.push(<span key="nais">né(e) le {rel.date_connue}<span className="opt-wide">{rel.lieu_naissance ? ` à ${rel.lieu_naissance}` : ""}</span></span>);
+  facts.push(rel.nb_pages > 1 ? `pages ${rel.numero_page}–${rel.page_fin}` : `page ${rel.numero_page}`);
+  const bits = recapBits(rel);
+  const bitsText = bits.map(([k, v]) => `${k} : ${v}`).join(" · ");
   return (
-    <div className="card" style={{ flex: "none", maxHeight: "45%", overflow: "auto" }} data-testid="recap">
-      <div className="row" style={{ alignItems: "flex-start" }}>
-        <div className="grow" style={{ minWidth: 0 }}>
-          {!compact && <div className="eyebrow">Contrôle avant impression</div>}
-          <h2 className="h2 ellipsis selectable" title={rel.nom_complet} style={{ fontSize: compact ? 16 : 19 }}>{nom}</h2>
-          <div className="muted small ellipsis selectable" title={bits.join(" · ")} data-testid="recap-details">{bits.join(" · ") || "Moyenne non lue"}</div>
-        </div>
-        <div className="col" style={{ alignItems: "flex-end", gap: 4 }}>
-          <Badge text={rel.statut || "Décision non lue"} tone={statutTone(rel.statut)} big dot />
-          <button className="btn link tiny" onClick={onReveal} title={`Ouvrir l'emplacement du fichier original (lecture seule) : ${rel.chemin}`} data-testid="recap-reveal">Fichier original</button>
-        </div>
+    <div className="card strip" data-testid="recap">
+      <Badge text={rel.statut || "Décision non lue"} tone={statutTone(rel.statut)} big dot />
+      <span className="nm ellipsis selectable" title={rel.nom_complet}>{nomAffiche(rel)}</span>
+      <span className="mat selectable">{rel.matricule}</span>
+      <span className="facts selectable" data-testid="recap-line">{facts.map((f, i) => <span key={i}>{i > 0 && <i>·</i>}{f}</span>)}</span>
+      {isRattrapage(rel) && <Badge text="RATTRAPAGE" tone="amber" />}
+      <span className="grow" />
+      {alerts.length > 0 && (
+        <span className="chips">
+          {alerts.map((a, i) => (
+            <button key={i} className={`achip t-${a.tone}${a.tone === "red" ? " strong" : ""}`} title={`${a.text}\n(cliquer pour ${expand ? "replier" : "déplier"} les alertes)`}
+              onClick={() => setExpand((x) => !x)} data-testid="alert-chip">
+              <Icon name={a.tone === "green" ? "check" : a.tone === "blue" ? "info" : "alert"} size={13} /><span className="ellipsis">{shortAlert(a.text)}</span>
+            </button>
+          ))}
+        </span>
+      )}
+      <div className="anchor">
+        <button className="btn link tiny" onClick={() => setDetails((d) => !d)} title={bitsText} data-testid="recap-details" aria-expanded={details}>Détails</button>
+        <Popover open={details} onClose={() => setDetails(false)} width={380} label="Détails du relevé" testid="recap-pop">
+          <div className="pop-head"><div className="eyebrow">Contrôle avant impression</div><div className="h3 selectable">{nomAffiche(rel)} · <span className="mono">{rel.matricule}</span></div></div>
+          {bits.map(([k, v]) => <div key={k} className="kv"><span>{k}</span><b className="selectable">{v}</b></div>)}
+          <div className="kv src"><span>Source</span><b className="selectable" data-testid="recap-source">{rel.chemin} · {rel.type_fichier}</b></div>
+          {alerts.map((a, i) => <Alert key={i} text={a.text} tone={a.tone} />)}
+        </Popover>
       </div>
-      {compact ? (
-        <div className="soft selectable" style={{ padding: "8px 12px", fontWeight: 600 }} data-testid="recap-line">
-          <span className="mono">{rel.matricule}</span> · {rel.annee_academique || "?"} · {rel.niveau || "?"}{sem !== "?" ? ` · ${sem}` : ""} · {pages}
-        </div>
-      ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-          {[["Matricule", rel.matricule, true], ["Année · niveau", `${rel.annee_academique || "?"} · ${rel.niveau || "?"}`, false], ["Semestre", sem, false], ["À imprimer", pages, false]].map(([k, v, mono]) => (
-            <div key={String(k)} className="soft" style={{ padding: "8px 12px" }}><div className="eyebrow">{k}</div><div className={mono ? "mono selectable" : "h3 selectable"}>{v}</div></div>
+      <button className="btn link tiny nowrap" onClick={onReveal} title={`Ouvrir l'emplacement du fichier original (lecture seule) : ${rel.chemin}`} data-testid="recap-reveal">Fichier original</button>
+      {expand && alerts.length > 0 && <div className="strip-alerts">{alerts.map((a, i) => <Alert key={i} text={a.text} tone={a.tone} />)}</div>}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ dock d'actions et d'affichage
+interface DockProps {
+  rel: Releve | null; busy: "" | "print" | "export"; duplicata: boolean; setDuplicata: (v: boolean) => void;
+  onPrint: () => void; onDemande: () => void; onExport: () => void; onCursus: () => void; onFocus: () => void;
+  pv: PdfViewState; pdf: React.RefObject<PdfViewHandle | null>; setMm: (el: HTMLDivElement | null) => void;
+  jump: number; setJump: (p: number) => void;
+  variant?: PreviewVariantSlot;     // bascule « Aperçu : corrigé / original » (fix/apercu-doc)
+}
+
+function Dock({ rel, busy, duplicata, setDuplicata, onPrint, onDemande, onExport, onCursus, onFocus, pv, pdf, setMm, jump, setJump, variant }: DockProps) {
+  const fitOn = (m: string) => pv.fit === m;
+  return (
+    <aside className="dock" data-testid="dock" aria-label="Actions et affichage">
+      <div className="grp">
+        <button className="btn primary" disabled={!rel || !!busy} onClick={onPrint} data-testid="print" title="Imprimer ce relevé (Ctrl+P)">
+          <span className="r">{busy === "print" ? <span className="spinner" /> : <Icon name="printer" size={18} />}Imprimer</span><span className="kbd">Ctrl+P</span>
+        </button>
+        <button className="btn secondary sm" disabled={!rel} onClick={onDemande} data-testid="add-demande" title="Ajouter à la demande en cours (Ctrl+D)"><Icon name="plus" size={15} />Demande<span className="kbd">Ctrl+D</span></button>
+        <button className="btn ghost sm" disabled={!rel || !!busy} onClick={onExport} data-testid="export" title="Exporter en PDF (Ctrl+E)">
+          {busy === "export" ? <span className="spinner" /> : <Icon name="download" size={15} />}Exporter<span className="kbd">Ctrl+E</span></button>
+        <button className="btn ghost sm" disabled={!rel} onClick={onCursus} data-testid="cursus" title="Cursus complet (Ctrl+Maj+E)"><Icon name="layers" size={15} />Cursus<span className="kbd">Ctrl+Maj+E</span></button>
+        <Switch checked={duplicata} onChange={setDuplicata} label="Duplicata" title="Timbre « Duplicata conforme » horodaté et journalisé · l'original reste intact" />
+      </div>
+      <div className="grp">
+        <span className="lbl row" style={{ gap: 4 }}><span className="grow">Affichage</span><span className="pct" data-testid="scale">{pv.scale ? `${Math.round(pv.scale * 100)} %` : ""}</span></span>
+        <div className="fitgrid" role="radiogroup" aria-label="Ajustement de l'aperçu">
+          {FIT_LABELS.map(([m, l, t]) => (
+            <button key={m} className={`btn ghost xs${fitOn(m) ? " on" : ""}`} role="radio" aria-checked={fitOn(m)} title={t} onClick={() => pdf.current?.setFit(m)} data-testid={`fit-${m}`}>{l}</button>
           ))}
         </div>
-      )}
-      {(detail?.alerts || []).map((a, i) => <Alert key={i} text={a.text} tone={a.tone} />)}
-      {!compact && <div className="muted tiny ellipsis selectable" title={rel.chemin} data-testid="recap-source">Source : {rel.chemin} · {rel.type_fichier}</div>}
-    </div>
+        <div className="fitgrid three">
+          <button className="btn ghost xs" aria-label="Zoom arrière" title="Zoom arrière (ou Ctrl + molette)" onClick={() => pdf.current?.zoomBy(1 / 1.2)}>−</button>
+          <button className="btn ghost xs" aria-label="Zoom avant" title="Zoom avant (ou Ctrl + molette)" onClick={() => pdf.current?.zoomBy(1.2)}>+</button>
+          <button className="btn ghost xs" disabled={!rel} onClick={onFocus} data-testid="focus-open" aria-label="Plein écran"
+            title="Aperçu en plein écran (Entrée, F11 ou double-clic sur la page ; Échap pour sortir)"><Icon name="fit" size={14} /></button>
+        </div>
+        {/* emplacement réservé : « Aperçu : corrigé / original » (branche fix/apercu-doc) */}
+        {variant && <div className="variant" data-testid="dock-variant">{variant}</div>}
+        {rel && rel.nb_pages > 1 && (
+          <>
+            <span className="lbl">Pages</span>
+            <div className="fitgrid">{Array.from({ length: rel.nb_pages }, (_, i) => rel.numero_page + i).map((p) => (
+              <button key={p} className={`btn ghost xs${jump === p ? " on" : ""}`} title={`Aller à la page ${p}`} onClick={() => setJump(p)} data-testid={`page-${p}`}>p. {p}</button>
+            ))}</div>
+          </>
+        )}
+        <span className="lbl">Points de contrôle</span>
+        {ZONES.map((z) => (
+          <button key={z.id} className="btn ghost xs zone" disabled={!rel} onClick={() => pdf.current?.goZone(z.id)} title={`${z.label} : aller à la zone et la surligner (${z.key})`} data-testid={`zone-${z.id}`}>
+            <Icon name={z.icon} size={13} /><span className="grow">{z.label}</span><span className="kbd">{z.key}</span>
+          </button>
+        ))}
+        <div className="mm-host" ref={setMm} />
+      </div>
+    </aside>
+  );
+}
+
+// ------------------------------------------------------------------ mode focus : barre flottante
+function FocusBar({ rel, alerts, pos, total, busy, duplicata, onPrint, onDemande, onExport, onExit, onMove, pv, pdf, setMm }: {
+  rel: Releve; alerts: AlertT[]; pos: number; total: number; busy: string; duplicata: boolean;
+  onPrint: () => void; onDemande: () => void; onExport: () => void; onExit: () => void; onMove: (n: number) => void;
+  pv: PdfViewState; pdf: React.RefObject<PdfViewHandle | null>; setMm: (el: HTMLDivElement | null) => void;
+}) {
+  const worst = alerts.find((a) => a.tone === "red") || alerts.find((a) => a.tone === "amber");
+  return (
+    <>
+      <div className="fbar" data-testid="focus-bar">
+        <Badge text={rel.statut || "Décision non lue"} tone={statutTone(rel.statut)} dot />
+        <b className="nm ellipsis" title={rel.nom_complet}>{nomAffiche(rel)}</b>
+        <span className="mono">{rel.matricule}</span>
+        <span className="muted small nowrap opt-mid" data-testid="focus-facts">{rel.annee_academique || "?"} · {periodLabel(rel)} · {rel.nb_pages > 1 ? `pages ${rel.numero_page}–${rel.page_fin}` : `page ${rel.numero_page}`}</span>
+        {worst && <span className={`badge t-${worst.tone}`} title={alerts.map((a) => a.text).join("\n")}><Icon name="alert" size={12} />{plural(alerts.length, "alerte")}</span>}
+        {duplicata && <Badge text="DUPLICATA" tone="red" title="Timbre « Duplicata conforme » apposé à l'impression" />}
+        <button className="btn primary sm" disabled={!!busy} onClick={onPrint} data-testid="focus-print">{busy === "print" ? <span className="spinner" /> : <Icon name="printer" size={16} />}Imprimer<span className="kbd">Ctrl+P</span></button>
+        <button className="btn secondary sm" onClick={onDemande}><Icon name="plus" size={14} />Demande<span className="kbd opt-wide">Ctrl+D</span></button>
+        <button className="btn ghost sm" disabled={!!busy} onClick={onExport}><Icon name="download" size={14} />Exporter<span className="kbd opt-wide">Ctrl+E</span></button>
+        <button className="btn ghost sm" onClick={onExit} data-testid="focus-exit" title="Quitter le plein écran (Échap)"><Icon name="x" size={14} />Quitter<span className="kbd">Échap</span></button>
+      </div>
+      <div className="fside" aria-label="Navigation et affichage">
+        <button className="btn ghost xs icon" aria-label="Relevé précédent" title="Relevé précédent (↑)" disabled={pos <= 0} onClick={() => onMove(-1)}><Icon name="arrow_up" size={15} /></button>
+        <span className="tiny muted" style={{ textAlign: "center" }} data-testid="focus-pos">{pos + 1}/{total}</span>
+        <button className="btn ghost xs icon" aria-label="Relevé suivant" title="Relevé suivant (↓)" disabled={pos >= total - 1} onClick={() => onMove(1)}><Icon name="arrow_down" size={15} /></button>
+        <div className="sep" />
+        {FIT_LABELS.filter(([m]) => m !== "largeur").map(([m, l, t]) => (
+          <button key={m} className={`btn ghost xs${pv.fit === m ? " on" : ""}`} title={t} onClick={() => pdf.current?.setFit(m)}>{l}</button>
+        ))}
+        <div className="sep" />
+        {ZONES.map((z, i) => (
+          <button key={z.id} className="btn ghost xs icon" title={`${z.label} (${z.key})`} aria-label={z.label} onClick={() => pdf.current?.goZone(z.id)}><Icon name={z.icon} size={14} /><sub>{i + 1}</sub></button>
+        ))}
+        <div className="mm-host" ref={setMm} />
+      </div>
+    </>
   );
 }

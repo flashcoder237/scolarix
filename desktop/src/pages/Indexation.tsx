@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { call, sx } from "../api";
 import { useApp } from "../state";
 import { Badge, Chip, Icon, Seg, Switch, useDialogs, useToast } from "../components/ui";
+import { StatsRow } from "../components/StatsRow";
 
 interface Anomalie { id: number; horodatage: string; niveau: string; chemin: string | null; message: string; action: string | null }
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -113,6 +114,8 @@ export function Indexation() {
         <div className="titles"><div className="eyebrow">Robot d'indexation · processus séparé</div><h1 className="h1">Indexation des archives</h1></div>
         <Badge text={live.status} tone={tone} big />
       </header>
+      {/* chiffres de supervision, venus du guichet (2.1) */}
+      <StatsRow />
       <section className="card">
         <div className="row">
           <Chip icon="folder" tone="blue" />

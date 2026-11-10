@@ -67,6 +67,32 @@ async function stopProbe() {
   return page.evaluate(() => { clearInterval(window.__probe); return Math.round(window.__lag); });
 }
 
+// liste de résultats (2.1) : relevés sur deux lignes, groupés par étudiant
+const ROWS = '[data-testid="results"] [data-testid="result-item"]';
+const SEL = `${ROWS}.sel`;
+
+/** Mesures de l'aperçu (zone, échelle, part de la page visible) pour le rapport. */
+async function measurePreview() {
+  return page.evaluate(() => {
+    const v = document.querySelector('[data-page="guichet"] [data-testid="viewer"]');
+    const st = document.querySelector('[data-page="guichet"] [data-testid="stage"]');
+    const c = v.querySelector("canvas");
+    const r = v.getBoundingClientRect(), s = st.getBoundingClientRect();
+    const ch = c ? c.clientHeight : 0, cw = c ? c.clientWidth : 0;
+    return {
+      viewer: [Math.round(r.width), Math.round(r.height)], stage: [Math.round(s.width), Math.round(s.height)], win: [innerWidth, innerHeight],
+      fit: v.dataset.fit, scale: Number(v.dataset.scale), canvas: [cw, ch],
+      visible: ch ? Math.min(1, (v.clientHeight - 12) / ch) : 0, scrollTop: v.scrollTop,
+      surface: (r.width * r.height) / (innerWidth * innerHeight),
+    };
+  });
+}
+const fmt = (m) => `zone d'aperçu ${m.viewer[0]}×${m.viewer[1]} px (avec le dock ${m.stage[0]}×${m.stage[1]}, ${Math.round(m.surface * 100)} % de la fenêtre ${m.win[0]}×${m.win[1]}) · mode ${m.fit} · échelle ${Math.round(m.scale * 100)} % · ${Math.round(m.visible * 100)} % de la page visible`;
+async function waitPage() {
+  await page.locator('[data-page="guichet"] [data-testid="viewer"][data-ready="1"] canvas').first().waitFor({ timeout: 60000 });
+  await page.waitForTimeout(400);
+}
+
 async function search(q) {
   const box = page.getByTestId("search");
   await box.click();
@@ -101,14 +127,14 @@ async function search(q) {
 
   await scenario("Matricule à l'oral « 18 m 042 », relevé N4, Ctrl+P", async () => {
     await search("18 m 042");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     for (let i = 0; i < 15; i++) {
-      const line = await page.locator('[data-testid="results"] tbody tr.sel').innerText();
+      const line = await page.locator(SEL).innerText();
       if (/N4\b/.test(line)) break;
       await page.keyboard.press("ArrowDown");
       await page.waitForTimeout(120);
     }
-    await page.locator('[data-testid="viewer"] canvas').first().waitFor({ timeout: 60000 });
+    await waitPage();                                     // la page du relevé N4, pas celle du précédent
     await shot("niveau4");
     const before = printedCount();
     await page.keyboard.press("Control+p");
@@ -119,7 +145,7 @@ async function search(q) {
 
   await scenario("Export PDF d'un relevé (Ctrl+E)", async () => {
     for (let i = 0; i < 10; i++) {          // relevé N1 : un PDF (pas besoin de Word)
-      const line = await page.locator('[data-testid="results"] tbody tr.sel').innerText();
+      const line = await page.locator(SEL).innerText();
       if (/N1\b/.test(line)) break;
       await page.getByTestId("search").press("ArrowUp");
       await page.waitForTimeout(120);
@@ -132,8 +158,8 @@ async function search(q) {
 
   if (process.env.E2E_NO_WORD) await scenario("Poste sans Word : message clair, délivrance bloquée", async () => {
     await search("2021");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
-    const rows = page.locator('[data-testid="results"] tbody tr');
+    await page.locator(ROWS).first().waitFor();
+    const rows = page.locator(ROWS);
     const n = await rows.count();
     for (let i = 0; i < n; i++) {
       await rows.nth(i).click();
@@ -152,14 +178,14 @@ async function search(q) {
 
   if (!process.env.E2E_NO_WORD) await scenario("Relevé Word : Ctrl+P immédiat, l'impression part toute seule", async () => {
     await search("2021");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
-    const rows = page.locator('[data-testid="results"] tbody tr');
+    await page.locator(ROWS).first().waitFor();
+    const rows = page.locator(ROWS);
     const n = await rows.count();
     // comme un fichier jamais consulté : on vide le cache des aperçus Word
     for (const f of readdirSync(join(work, "cache"))) rmSync(join(work, "cache", f), { recursive: true, force: true });
     await search("2020");
     await search("2021");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     const before = printedCount();
     // un relevé Word (aperçu produit à la demande) : on prend le premier qui affiche « Préparation »
     let found = false;
@@ -178,12 +204,12 @@ async function search(q) {
 
   await scenario("↓ maintenu sur tout le dossier : aucun gel, l'aperçu suit", async () => {
     await search("18M042");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     await startProbe();
     for (let i = 0; i < 6; i++) await page.getByTestId("search").press("ArrowDown", { delay: 30 });
     await page.waitForTimeout(1500);
     const lag = await stopProbe();
-    const sel = await page.locator('[data-testid="results"] tbody tr.sel').innerText();
+    const sel = await page.locator(SEL).innerText();
     const recap = await page.getByTestId("recap").innerText();
     const per = sel.match(/N\d\b/);
     if (per && !recap.includes(`Niveau ${per[0].slice(1)}`)) throw new Error(`aperçu en retard : ligne « ${sel.split("\n").join(" ")} », fiche « ${recap.split("\n")[1]} »`);
@@ -191,22 +217,147 @@ async function search(q) {
     if (lag > 300) throw new Error(`interface figée ${lag} ms`);
   });
 
+  await scenario("Aperçu d'abord : page lisible, ajustements Auto / Page / 1:1, points de contrôle", async () => {
+    await search("18M042");
+    await page.locator(ROWS).first().waitFor();
+    await waitPage();
+    const m = await measurePreview();
+    console.log(`    ${SIZE.join("×")} : ${fmt(m)}`);
+    if (m.fit !== "auto" || m.scale < 0.68) throw new Error(`mode Auto illisible : ${JSON.stringify(m)}`);
+    if (m.canvas[0] > m.viewer[0]) throw new Error(`page plus large que la zone : ${JSON.stringify(m)}`);
+    if (m.viewer[1] < 0.7 * m.win[1]) throw new Error(`zone d'aperçu trop basse : ${m.viewer[1]} px`);
+    const strip = await page.getByTestId("recap").boundingBox();
+    if (strip.height > 92) throw new Error(`fiche sur plus de deux lignes : ${strip.height} px`);
+    if (m.visible < 0.999) {                             // zoom de lecture : mini-carte, Alt+3 descend à la décision
+      await page.getByTestId("minimap").waitFor({ timeout: 5000 });
+      await page.keyboard.press("Alt+3");
+      await page.locator('.zone-hl[data-zone="decision"]').waitFor({ timeout: 3000 });
+      await page.waitForTimeout(700);
+      const top = (await measurePreview()).scrollTop;
+      if (top < 50) throw new Error(`Alt+3 n'a pas fait défiler jusqu'à la décision (scrollTop ${top})`);
+      await shot("controle_decision");
+      await page.keyboard.press("Alt+1");
+      await page.locator('.zone-hl[data-zone="identite"]').waitFor({ timeout: 3000 });
+      await page.waitForTimeout(700);
+      if ((await measurePreview()).scrollTop >= top) throw new Error("Alt+1 n'est pas remonté à l'identité");
+    }
+    await page.getByTestId("fit-page").click();
+    await page.waitForTimeout(700);
+    const p = await measurePreview();
+    if (p.fit !== "page" || p.visible < 0.98) throw new Error(`mode Page : ${JSON.stringify(p)}`);
+    await shot("apercu_page_entiere");
+    await page.getByTestId("zone-notes").click();           // page entière illisible : zoom de lecture puis la zone des notes
+    await page.locator('.zone-hl[data-zone="notes"]').waitFor({ timeout: 5000 });
+    await page.getByTestId("fit-1:1").click();
+    await page.waitForTimeout(500);
+    if ((await measurePreview()).scale !== 1) throw new Error("mode 1:1");
+    await page.getByTestId("fit-auto").click();
+    await page.waitForTimeout(500);
+    if ((await measurePreview()).fit !== "auto") throw new Error("retour au mode Auto");
+    // la liste suit ↑ ↓ dans l'ordre affiché, l'aperçu suit la liste
+    const idx = () => page.locator(ROWS).evaluateAll((els) => els.findIndex((e) => e.classList.contains("sel")));
+    const i0 = await idx();
+    const key = i0 > 0 ? "ArrowUp" : "ArrowDown";
+    await page.keyboard.press(key);
+    await page.waitForTimeout(300);
+    if ((await idx()) !== i0 + (key === "ArrowUp" ? -1 : 1)) throw new Error(`${key} : relevé ${i0} → ${await idx()}`);
+  });
+
+  await scenario("Mode focus : Entrée, ↑ ↓, Échap par couches (fenêtre > focus > recherche)", async () => {
+    await search("18M042");
+    await page.locator(ROWS).first().waitFor();
+    await waitPage();
+    await page.waitForTimeout(400);
+    await page.getByTestId("search").press("Enter");        // recherche à jour : Entrée = plein écran
+    const bar = page.getByTestId("focus-bar");
+    await bar.waitFor({ timeout: 5000 });
+    const st = await page.getByTestId("stage").boundingBox();
+    if (Math.round(st.width) !== SIZE[0] || Math.round(st.height) !== SIZE[1]) throw new Error(`plein écran : ${st.width}×${st.height}`);
+    await waitPage();
+    const m = await measurePreview();
+    console.log(`    focus ${SIZE.join("×")} : ${fmt(m)}`);
+    await shot("focus");
+    const pos = await page.getByTestId("focus-pos").innerText();
+    await page.keyboard.press(pos.startsWith("1/") ? "ArrowDown" : "ArrowUp");
+    await page.waitForTimeout(400);
+    const pos2 = await page.getByTestId("focus-pos").innerText();
+    if (pos === pos2) throw new Error(`↓ en mode focus : ${pos} → ${pos2}`);
+    // une fenêtre modale passe avant : Échap la ferme, le mode focus reste
+    await page.keyboard.press("Control+n");
+    await page.getByRole("dialog", { name: "Nouvelle demande" }).waitFor();
+    await page.keyboard.press("Escape");
+    await page.getByRole("dialog", { name: "Nouvelle demande" }).waitFor({ state: "detached" });
+    if (!(await bar.isVisible())) throw new Error("Échap sur la fenêtre a aussi quitté le mode focus");
+    await page.keyboard.press("Escape");                   // sortie du mode focus, recherche intacte
+    await bar.waitFor({ state: "detached" });
+    if ((await page.getByTestId("search").inputValue()) !== "18M042") throw new Error("Échap en mode focus a effacé la recherche");
+    await page.keyboard.press("F11");                      // F11 : bascule
+    await bar.waitFor();
+    await page.locator('[data-page="guichet"] [data-testid="viewer"]').dblclick();   // double-clic : sortie
+    await bar.waitFor({ state: "detached" });
+    await page.locator(SEL).dblclick();                     // double-clic sur un relevé : plein écran
+    await bar.waitFor();
+    await page.getByTestId("focus-exit").click();
+    await bar.waitFor({ state: "detached" });
+    await page.keyboard.press("Escape");                   // puis Échap = nouvelle recherche
+    await page.waitForTimeout(200);
+    if (await page.getByTestId("search").inputValue()) throw new Error("Échap hors mode focus n'efface pas la recherche");
+  });
+
+  await scenario("Grand écran 1920×1080 : page entière, chiffres du jour, mode focus", async () => {
+    const resize = (w, h) => electronApp.evaluate(({ BrowserWindow }, [w, h]) => BrowserWindow.getAllWindows()[0].setContentSize(w, h), [w, h]);
+    try {
+      await resize(1920, 1080);
+      await page.waitForTimeout(600);
+      await search("18M042");
+      await page.locator(ROWS).first().waitFor();
+      await waitPage();
+      await page.waitForTimeout(600);
+      const m = await measurePreview();
+      console.log(`    1920×1080 : ${fmt(m)}`);
+      if (m.visible < 0.999 || m.scale < 0.68) throw new Error(`page entière attendue à 1920×1080 : ${JSON.stringify(m)}`);
+      if (await page.getByTestId("minimap").count()) throw new Error("mini-carte affichée alors que la page est entière");
+      await shot("ecran_1920");
+      await page.getByTestId("stats-btn").click();
+      const pop = await page.getByTestId("stats-pop").innerText();
+      if (!/Imprimés aujourd'hui/.test(pop) || !/Anomalies/.test(pop)) throw new Error(`chiffres du jour : ${pop}`);
+      await shot("chiffres_du_jour_1920");
+      await page.keyboard.press("Escape");
+      await page.getByTestId("search").press("Enter");
+      await page.getByTestId("focus-bar").waitFor();
+      await waitPage();
+      await page.waitForTimeout(500);
+      console.log(`    focus 1920×1080 : ${fmt(await measurePreview())}`);
+      await shot("focus_1920");
+      await page.keyboard.press("Escape");
+      await page.getByTestId("focus-bar").waitFor({ state: "detached" });
+    } finally {
+      await resize(SIZE[0], SIZE[1]);
+      await page.waitForTimeout(600);
+    }
+  });
+
   await scenario("Nom avec fautes « tchoa alin » (tolérance)", async () => {
     await search("tchoa alin");
-    await page.getByText("Tolérance fautes / phonétique").click();
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor({ timeout: 10000 });
-    const first = await page.locator('[data-testid="results"] tbody tr').first().innerText();
-    if (!/TCHOUA/i.test(first)) throw new Error(`premier résultat : ${first}`);
-    await page.getByText("Groupée par étudiant").click();
-    await page.waitForTimeout(500);
+    const tol = page.getByTestId("tolerance");
+    if (!(await tol.locator("input").isChecked())) await tol.click();
+    await page.locator(ROWS).first().waitFor({ timeout: 10000 });
+    const first = await page.locator('[data-testid="result-group"]').first().innerText();
+    if (!/TCHOUA/i.test(first)) throw new Error(`premier étudiant : ${first}`);
+    await page.getByTestId("view-groupe").waitFor();
     await shot("groupee");
-    await page.getByText("Par relevé").click();
-    await page.getByText("Exacte").click();
+    // liste à plat : le nom revient sur chaque relevé, ↑ ↓ suivent l'ordre de pertinence
+    await page.getByTestId("view-releve").click();
+    const flat = await page.locator(ROWS).first().innerText();
+    if (!/TCHOUA/i.test(flat)) throw new Error(`liste à plat, premier relevé : ${flat}`);
+    await page.getByTestId("view-groupe").click();
+    await tol.click();                                   // recherche exacte (comme l'ancien bouton « Exacte »)
+    if (await tol.locator("input").isChecked()) throw new Error("l'interrupteur Tolérance ne se désactive pas");
   });
 
   await scenario("Demande multi-années : Ctrl+D ×3, imprimer tout, remettre", async () => {
     await search("18M042");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     // première ajout : la demande est créée (demandeur)
     await page.keyboard.press("Control+d");
     await page.getByRole("dialog", { name: "Nouvelle demande" }).waitFor();
@@ -220,8 +371,11 @@ async function search(q) {
       await page.waitForTimeout(400);
     }
     const label = await page.getByTestId("demande-label").innerText();
-    if (!/3 relevés/.test(label)) throw new Error(`barre de demande : ${label}`);
-    await page.getByText("Voir / préparer").click();
+    if (!/3 relevés/.test(label)) throw new Error(`pastille de demande : ${label}`);
+    await page.getByTestId("demande-chip").click();
+    await page.getByTestId("demande-menu").waitFor();
+    await shot("menu_demande");
+    await page.getByTestId("demande-open").click();
     await page.getByRole("dialog").first().waitFor();
     await shot("demande");
     const before = printedCount();
@@ -239,14 +393,14 @@ async function search(q) {
 
   await scenario("Deux personnes : Ctrl+D sur un autre étudiant propose une nouvelle demande", async () => {
     await search("kouame");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     await page.keyboard.press("Control+d");
     await page.getByRole("dialog", { name: "Nouvelle demande" }).waitFor();
     await page.locator('[role="dialog"] input').fill("Sa sœur");
     await page.keyboard.press("Enter");
     await waitToast(/Ajouté à la demande/);
     await search("18M042");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     await page.keyboard.press("Control+d");
     const dlg = page.getByRole("dialog", { name: "Autre étudiant" });
     await dlg.waitFor();
@@ -257,18 +411,23 @@ async function search(q) {
     await waitToast(/Ajouté à la demande/);
     let opts = [];
     for (let i = 0; i < 25; i++) {
-      opts = await page.getByTestId("demande-picker").locator("option").allInnerTexts();
+      await page.getByTestId("demande-chip").click();
+      opts = await page.getByTestId("demande-picker").getByTestId("demande-option").allInnerTexts();
       if (opts.filter((o) => /KOUAME|TCHOUA/i.test(o)).length >= 2) break;
+      await page.keyboard.press("Escape");
       await page.waitForTimeout(200);
     }
     if (opts.filter((o) => /KOUAME|TCHOUA/i.test(o)).length < 2) throw new Error(`demandes ouvertes : ${opts.join(" / ")}`);
-    const kouame = await page.getByTestId("demande-picker").locator("option", { hasText: "KOUAME" }).first().innerText();
+    const kouame = opts.find((o) => /KOUAME/i.test(o));
     if (!/\(1\)/.test(kouame)) throw new Error(`la demande de KOUAME a reçu le relevé d'un autre : ${kouame}`);
+    await page.keyboard.press("Escape");                 // Échap ferme le menu seulement
+    await page.getByTestId("demande-menu").waitFor({ state: "detached" });
+    if (!(await page.getByTestId("search").inputValue())) throw new Error("Échap sur le menu a aussi effacé la recherche");
   });
 
   await scenario("Cursus : fusion et export, interface jamais figée", async () => {
     await search("18M042");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     await page.keyboard.press("Control+Shift+E");
     await page.getByRole("dialog", { name: "Cursus complet" }).waitFor();
     await page.waitForTimeout(400);
@@ -292,10 +451,16 @@ async function search(q) {
   await scenario("Parité 1.x : matricule normalisé affiché, fiche détaillée, Échap depuis un autre écran", async () => {
     await search("18 m 042");
     await page.getByText("Recherché : 18M042").waitFor({ timeout: 10000 });
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     await page.getByTestId("recap-details").waitFor({ timeout: 10000 });
-    const src = await page.getByTestId("recap-reveal").getAttribute("title");     // 768 px : chemin source en infobulle
+    const src = await page.getByTestId("recap-reveal").getAttribute("title");     // chemin source en infobulle
     if (!/archives/.test(src || "")) throw new Error(`chemin source absent : ${src}`);
+    await page.getByTestId("recap-details").click();                               // moyenne, décision, naissance, source…
+    const pop = await page.getByTestId("recap-pop").innerText();
+    if (!/Moyenne/.test(pop) || !/archives/.test(pop)) throw new Error(`détails de la fiche : ${pop.slice(0, 200)}`);
+    await shot("fiche_details");
+    await page.keyboard.press("Escape");
+    await page.getByTestId("recap-pop").waitFor({ state: "detached" });
     await page.keyboard.press("Control+4");
     await page.getByRole("heading", { name: "Extraction et journal" }).waitFor();
     await page.locator("body").click({ position: { x: 700, y: 20 } });
@@ -306,14 +471,15 @@ async function search(q) {
 
   await scenario("Demande : « Ajouter tout le cursus validé »", async () => {
     await search("18M042");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor();
+    await page.locator(ROWS).first().waitFor();
     await page.keyboard.press("Control+n");
     await page.getByRole("dialog", { name: "Nouvelle demande" }).waitFor();
     await page.keyboard.press("Enter");
     await page.waitForTimeout(400);
     await page.keyboard.press("Control+d");
     await waitToast(/Ajouté à la demande/);
-    await page.getByText("Voir / préparer").click();
+    await page.getByTestId("demande-chip").click();
+    await page.getByTestId("demande-open").click();
     await page.getByTestId("demande-cursus").click();
     await waitToast(/ajoutés? \(cursus/);
     const n = await page.locator('[role="dialog"] table.grid tbody tr').count();
@@ -328,7 +494,7 @@ async function search(q) {
     await page.getByRole("heading", { name: "Demandes de relevés" }).waitFor();
     await page.waitForTimeout(400);
     await shot("demandes");
-    await page.getByText("Toutes", { exact: true }).click();
+    await page.locator('[data-page="demandes"]').getByText("Toutes", { exact: true }).click();
     await page.getByTestId("demandes-filter").fill("kouame");
     await page.waitForTimeout(300);
     const rows = await page.locator('[data-page="demandes"] table.grid tbody tr').allInnerTexts();
@@ -377,6 +543,7 @@ async function search(q) {
 
   await scenario("Indexation (Ctrl+3) : relance différentielle", async () => {
     await page.keyboard.press("Control+3");
+    await page.getByTestId("stats-row").getByText("Imprimés aujourd'hui").waitFor();     // tuiles venues du guichet
     await page.getByTestId("index-start").click();
     await page.getByText("TERMINÉ").first().waitFor({ timeout: 120000 });
     await shot("indexation");
@@ -397,7 +564,7 @@ async function search(q) {
     await page.getByText("TERMINÉ").first().waitFor({ timeout: 180000 });
     await page.keyboard.press("Control+1");
     await search("18M042");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor({ timeout: 30000 });
+    await page.locator(ROWS).first().waitFor({ timeout: 30000 });
     await page.keyboard.press("Control+4");
     await page.waitForTimeout(800);
     const j = await page.locator("table.grid").last().innerText();
@@ -435,11 +602,13 @@ async function search(q) {
     await waitToast(/moteur a redémarré|ne répondait plus/i, 30000);
     await page.waitForTimeout(3000);
     await search("18M042");
-    await page.locator('[data-testid="results"] tbody tr').first().waitFor({ timeout: 30000 });
+    await page.locator(ROWS).first().waitFor({ timeout: 30000 });
     await shot("apres_relance_moteur");
   });
 
   await scenario("Réglages : ouverture et enregistrement", async () => {
+    await page.keyboard.press("Control+1");
+    await page.getByTestId("stats-btn").click();                 // chiffres du jour : poste et opérateur
     await page.getByTestId("settings").click();
     const dlg = page.getByRole("dialog", { name: "Réglages" });
     await dlg.waitFor();

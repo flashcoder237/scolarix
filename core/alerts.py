@@ -33,7 +33,7 @@ def compute(rel: Releve, siblings: list[Releve], rules_active: bool,
         out.append((f"{len(siblings) + 1} relevés existent pour {periode} (autres : {autres}). "
                     f"Vous êtes sur celui de {rel.annee_academique}.", "amber"))
     elif rel.statut and not rel.is_success:
-        cred = f" ({rel.credits}/30 crédits)" if rel.credits is not None else ""
+        cred = f" ({rel.credits} crédits capitalisés)" if rel.credits is not None else ""   # 30 par semestre, 60 sur un relevé annuel
         out.append((f"« {rel.decision or rel.statut} »{cred} : {periode} non validé. "
                     "Délivrance soumise à la scolarité.", "red"))
     elif not rel.statut:

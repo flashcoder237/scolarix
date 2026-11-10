@@ -20,7 +20,7 @@ export function PreviewVariantToggle({ releveId, value, onChange, available = tr
     <span title="« Original » : le document tel qu'il est archivé, sans les corrections d'en-tête (consultation seulement ; l'impression reste corrigée)"
       data-testid="apercu-variant">
       <Seg<PreviewVariant> value={value} onChange={onChange} label="Aperçu"
-        options={[["corrige", "Aperçu corrigé"], ["original", "Original"]]} />
+        options={[["corrige", "Corrigé"], ["original", "Original"]]} />
     </span>
   );
 }
