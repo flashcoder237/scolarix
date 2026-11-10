@@ -517,7 +517,7 @@ function StatsButton() {
         <div className="pop-head"><div className="eyebrow">Chiffres du jour</div></div>
         <div className="kv"><span>Imprimés aujourd'hui</span><b data-testid="stat-imprimes">{s ? plural(s.imprimes, "relevé") : "—"}</b></div>
         <div className="kv"><span>dont duplicata</span><b>{s ? s.duplicatas : "—"}</b></div>
-        <div className="kv"><span>Anomalies à revoir</span><b style={s?.anomalies ? { color: "var(--amber)" } : undefined}>{s ? `${s.anomalies} fichier(s)` : "—"}</b></div>
+        <div className="kv"><span>Anomalies à revoir</span><b style={s?.anomalies ? { color: "var(--amber)" } : undefined}>{s ? `${s.anomalies_fichiers ?? "?"} fichier(s) · ${s.anomalies} anomalie(s)` : "—"}</b></div>
         <div className="kv"><span>Base d'index</span><b>{s ? `${s.releves.toLocaleString("fr-FR")} relevés · ${s.etudiants.toLocaleString("fr-FR")} étudiants` : "—"}</b></div>
         <div className="kv"><span>Indexation</span><b>{indexing.running ? "en cours…" : s?.derniere_indexation || "jamais lancée"}</b></div>
         <div className="sep" />
