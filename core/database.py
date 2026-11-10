@@ -20,6 +20,7 @@ from typing import Iterable
 
 from rapidfuzz import fuzz, process
 
+from .anomalies import classify as classify_anomaly, folder_of, year_of
 from .normalize import looks_like_matricule, name_key, norm_matricule, norm_text
 
 SCHEMA = """
@@ -152,6 +153,42 @@ CREATE TABLE IF NOT EXISTS demande_items (
     etat        TEXT,                            -- PRÊT, BLOQUÉ : motif
     UNIQUE (demande_id, releve_id)
 );
+"""
+
+# Écran Indexation (2.1) : tri des anomalies par cause et historique des passes. Uniquement des AJOUTS
+# (colonnes et tables nouvelles) : les bases existantes et l'application 1.3.1, qui partage le même dossier de
+# données, continuent de fonctionner (elle écrit des anomalies sans code : elles sont classées après coup).
+ANOMALIES_SCHEMA = """
+-- Anomalies « vues » : décision de l'agent, par fichier et par cause. Gardée d'une passe à l'autre (le robot
+-- remplace les anomalies d'un fichier relu, la marque « vu » reste tant que la même cause revient).
+CREATE TABLE IF NOT EXISTS anomalies_vues (
+    chemin    TEXT NOT NULL,
+    code      TEXT NOT NULL,
+    vu_le     TEXT DEFAULT (datetime('now','localtime')),
+    operateur TEXT,
+    PRIMARY KEY (chemin, code)
+);
+-- Historique des passes du robot (carte « Prochaine passe » : dernière passe, passes récentes).
+CREATE TABLE IF NOT EXISTS passes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    debut           TEXT DEFAULT (datetime('now','localtime')),
+    fin             TEXT,                      -- NULL : passe interrompue (robot arrêté de force, plantage)
+    mode            TEXT,                      -- DIFFERENTIELLE, COMPLETE, RELECTURE
+    source          TEXT,
+    fichiers        INTEGER DEFAULT 0,         -- fichiers trouvés
+    lus             INTEGER DEFAULT 0,         -- fichiers réellement lus
+    ecrits          INTEGER DEFAULT 0,         -- relevés écrits
+    echecs          INTEGER DEFAULT 0,
+    ignores         INTEGER DEFAULT 0,         -- inchangés, non relus
+    exclus          INTEGER DEFAULT 0,
+    releves_delta   INTEGER,
+    anomalies_delta INTEGER,
+    duree_s         REAL,
+    arretee         INTEGER DEFAULT 0,         -- arrêt demandé par l'agent
+    workers         INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_anom_chemin ON anomalies(chemin);
+CREATE INDEX IF NOT EXISTS idx_anom_code   ON anomalies(code, dossier, chemin);
 """
 
 FTS_TRIGGERS = """
@@ -452,6 +489,14 @@ def resolve_cache(value: str | None, cache_dir: Path | None) -> str | None:
     return str(candidate)
 
 
+_ANOMALY_INSERT = "INSERT INTO anomalies(niveau, chemin, message, action, code, dossier, annee) VALUES (?,?,?,?,?,?,?)"
+
+
+def _anomaly_row(niveau: str, chemin: str | None, message: str, action: str | None) -> tuple:
+    """Ligne d'anomalie avec sa cause normalisée, son dossier et son année (core/anomalies.py)."""
+    return (niveau, chemin, message, action, classify_anomaly(niveau, message), folder_of(chemin), year_of(chemin))
+
+
 class Database:
     """Connexion à la base d'index. Une instance par thread/processus."""
 
@@ -486,6 +531,15 @@ class Database:
             if "version_analyse" not in fcols:
                 # NULL = analysé par une version antérieure : relu à la prochaine indexation différentielle
                 self.conn.execute("ALTER TABLE fichiers ADD COLUMN version_analyse TEXT")
+            acols = {r[1] for r in self.conn.execute("PRAGMA table_info(anomalies)")}
+            for col in ("code", "dossier", "annee"):
+                if col not in acols:   # cause normalisée, dossier et année du fichier (écran Anomalies, 2.1)
+                    try:
+                        self.conn.execute(f"ALTER TABLE anomalies ADD COLUMN {col} TEXT")
+                    except sqlite3.OperationalError as exc:   # ajoutée entre-temps par une autre connexion
+                        if "duplicate" not in str(exc).lower():
+                            raise
+            self.conn.executescript(ANOMALIES_SCHEMA)
             row = self.conn.execute("SELECT valeur FROM meta WHERE cle='fts_mode'").fetchone()
             if row:
                 self.fts_mode = row[0]
@@ -538,8 +592,8 @@ class Database:
                                          message, releves, version)
                 if anomalies is not None:
                     cur.execute("DELETE FROM anomalies WHERE chemin=?", (chemin,))
-                    cur.executemany("INSERT INTO anomalies(niveau, chemin, message, action) VALUES (?,?,?,?)",
-                                    [(niveau, chemin, msg, action) for niveau, msg, action in anomalies])
+                    cur.executemany(_ANOMALY_INSERT, [_anomaly_row(niveau, chemin, msg, action)
+                                                      for niveau, msg, action in anomalies])
                 cur.execute("COMMIT")
             except Exception:
                 cur.execute("ROLLBACK")
@@ -641,6 +695,8 @@ class Database:
     def remove_file(self, chemin: str) -> None:
         with self._lock:
             self.conn.execute("DELETE FROM fichiers WHERE chemin=?", (chemin,))
+            # fichier retiré de l'index (exclusion) : ses anomalies n'ont plus d'objet
+            self.conn.execute("DELETE FROM anomalies WHERE chemin=?", (chemin,))
             self.conn.commit()
         self._token_index = None
 
@@ -651,15 +707,49 @@ class Database:
     # --------------------------------------------------------------- anomalies
     def add_anomaly(self, niveau: str, chemin: str | None, message: str, action: str | None = None) -> None:
         with self._lock:
-            self.conn.execute("INSERT INTO anomalies(niveau, chemin, message, action) VALUES (?,?,?,?)",
-                              (niveau, chemin, message, action))
+            self.conn.execute(_ANOMALY_INSERT, _anomaly_row(niveau, chemin, message, action))
             self.conn.commit()
 
-    def anomalies(self, niveau: str | None = None, limit: int = 500) -> list[sqlite3.Row]:
-        if niveau:
-            return self.conn.execute("SELECT * FROM anomalies WHERE niveau=? ORDER BY id DESC LIMIT ?",
-                                     (niveau, limit)).fetchall()
-        return self.conn.execute("SELECT * FROM anomalies ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    def anomalies(self, niveau: str | None = None, limit: int | None = None, offset: int = 0) -> list[sqlite3.Row]:
+        """Anomalies, les plus récentes d'abord. Plus de plafond à 500 (un poste réel en a 9 000+) :
+        ``limit`` / ``offset`` pour paginer, ``limit=None`` pour tout."""
+        where, args = ("WHERE niveau=?", [niveau]) if niveau else ("", [])
+        sql = f"SELECT * FROM anomalies {where} ORDER BY id DESC"
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args += [int(limit), max(0, int(offset or 0))]
+        return self.conn.execute(sql, args).fetchall()
+
+    def anomalies_backfill(self) -> int:
+        """Classe les anomalies sans cause (bases antérieures, lignes écrites par l'application 1.3.1)."""
+        rows = self.conn.execute("SELECT id, niveau, message, chemin FROM anomalies WHERE code IS NULL").fetchall()
+        if not rows:
+            return 0
+        with self._lock:
+            self.conn.executemany("UPDATE anomalies SET code=?, dossier=?, annee=? WHERE id=?",
+                                  [(classify_anomaly(r[1], r[2]), folder_of(r[3]), year_of(r[3]), r[0]) for r in rows])
+            self.conn.commit()
+        return len(rows)
+
+    # --------------------------------------------------------------- passes du robot
+    def pass_begin(self, mode: str, source: str) -> int:
+        with self._lock:
+            cur = self.conn.execute("INSERT INTO passes(mode, source) VALUES (?, ?)", (mode, source))
+            self.conn.commit()
+            return int(cur.lastrowid)
+
+    PASS_FIELDS = ("fichiers", "lus", "ecrits", "echecs", "ignores", "exclus", "releves_delta", "anomalies_delta",
+                   "duree_s", "arretee", "workers")
+
+    def pass_end(self, pass_id: int, **fields) -> None:
+        cols = [k for k in fields if k in self.PASS_FIELDS]
+        with self._lock:
+            self.conn.execute(f"UPDATE passes SET fin=datetime('now','localtime'){''.join(f', {k}=?' for k in cols)} "
+                              "WHERE id=?", [fields[k] for k in cols] + [pass_id])
+            self.conn.commit()
+
+    def passes(self, limit: int = 8) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM passes ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
 
     def clear_anomalies_for(self, chemin: str) -> None:
         with self._lock:

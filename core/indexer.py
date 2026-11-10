@@ -406,45 +406,58 @@ class Indexer:
         else:
             c.echecs += 1
 
-    def run(self, root: Path, only_new: bool | None = None, workers: int | None = None) -> Counters:
+    def run(self, root: Path, only_new: bool | None = None, workers: int | None = None,
+            paths: list[str] | None = None) -> Counters:
+        """Une passe du robot. ``paths`` : relecture de ces seuls fichiers (écran Anomalies, « Relire »),
+        sans exploration ni différentiel ; ``root`` sert alors seulement à l'historique."""
         only_new = self.s.differential if only_new is None else only_new
         started = time.time()
-        if not root.exists():
+        relecture = paths is not None
+        if not relecture and not root.exists():
             raise FileNotFoundError(f"Dossier introuvable : {root}")
-        root = root.resolve()
-        exclusions = Exclusions(root, self.s.exclusions)
-        self.emit({"type": "scan", "root": str(root)})
-        files = scan_sources(root, exclusions, self.counters)
-        self.counters.detectes = len(files)
-
-        purged = self._purge_excluded(root, exclusions)
-        todo: list[SourceFile] = []
-        if self.counters.illisibles:
-            msg = (f"{len(self.counters.illisibles)} dossier(s) illisible(s), ignoré(s) cette fois : "
-                   + "; ".join(self.counters.illisibles[:5]))
-            self.emit({"type": "warning", "message": msg})
-            self.db.add_anomaly("AVERTISSEMENT", str(root), msg, "Vérifier l'accès réseau")
-        if only_new:
-            known = {_path_key(k): v for k, v in self.db.file_signatures(with_version=True).items()}
-            for f in files:
-                state = known.get(_path_key(f.path))
-                if state is not None and state[0] == f.taille and abs((state[1] or 0) - f.mtime) < 1:
-                    if state[2] == PARSER_VERSION:
-                        self.counters.ignores += 1   # inchangé depuis la dernière passe (même en erreur)
-                        continue
-                    self.counters.relus += 1         # inchangé, mais lu par une version antérieure de l'analyse
-                todo.append(f)
-            if self.counters.relus:
-                self.emit({"type": "warning", "message": f"{self.counters.relus} fichier(s) inchangé(s) relu(s) : "
-                                                         f"les règles de lecture ont été mises à jour "
-                                                         f"({PARSER_VERSION})."})
+        if not relecture or root.exists():
+            root = root.resolve()
+        mode = "RELECTURE" if relecture else ("DIFFERENTIELLE" if only_new else "COMPLETE")
+        pass_id, before = self._pass_begin(mode, str(root))
+        purged = 0
+        if relecture:
+            files = self._sources_for(paths)
+            self.counters.detectes = len(files)
+            todo = list(files)
         else:
-            todo = files
+            exclusions = Exclusions(root, self.s.exclusions)
+            self.emit({"type": "scan", "root": str(root)})
+            files = scan_sources(root, exclusions, self.counters)
+            self.counters.detectes = len(files)
+
+            purged = self._purge_excluded(root, exclusions)
+            todo: list[SourceFile] = []
+            if self.counters.illisibles:
+                msg = (f"{len(self.counters.illisibles)} dossier(s) illisible(s), ignoré(s) cette fois : "
+                       + "; ".join(self.counters.illisibles[:5]))
+                self.emit({"type": "warning", "message": msg})
+                self.db.add_anomaly("AVERTISSEMENT", str(root), msg, "Vérifier l'accès réseau")
+            if only_new:
+                known = {_path_key(k): v for k, v in self.db.file_signatures(with_version=True).items()}
+                for f in files:
+                    state = known.get(_path_key(f.path))
+                    if state is not None and state[0] == f.taille and abs((state[1] or 0) - f.mtime) < 1:
+                        if state[2] == PARSER_VERSION:
+                            self.counters.ignores += 1   # inchangé depuis la dernière passe (même en erreur)
+                            continue
+                        self.counters.relus += 1         # inchangé, mais lu par une version antérieure de l'analyse
+                    todo.append(f)
+                if self.counters.relus:
+                    self.emit({"type": "warning", "message": f"{self.counters.relus} fichier(s) inchangé(s) relu(s) : "
+                                                             f"les règles de lecture ont été mises à jour "
+                                                             f"({PARSER_VERSION})."})
+            else:
+                todo = files
 
         n_workers = workers if workers is not None else (self.s.index_workers or default_workers())
         n_workers = max(1, min(int(n_workers), 16, max(1, len(todo))))
         self.emit({"type": "start", "total": len(files), "a_traiter": len(todo), "workers": n_workers,
-                   "exclus": self.counters.exclus, "retires": purged})
+                   "exclus": self.counters.exclus, "retires": purged, "mode": mode})
         done = self.counters.ignores
         self._progress(done, None, started, force=True)
 
@@ -463,13 +476,60 @@ class Indexer:
         else:
             done = self._run_parallel(todo, n_workers, done, started)
 
-        self.db.set_meta("derniere_indexation", time.strftime("%d/%m/%Y %H:%M"))
-        self.db.set_meta("source_root", str(root))
+        if not relecture:
+            self.db.set_meta("derniere_indexation", time.strftime("%d/%m/%Y %H:%M"))
+            self.db.set_meta("source_root", str(root))
         summary = {k: v for k, v in self.counters.__dict__.items() if k != "illisibles"} | {
             "illisibles": len(self.counters.illisibles), "duree_s": round(time.time() - started, 1), "stopped": self.stopped,
-                                            "workers": n_workers}
+                                            "workers": n_workers, "mode": mode}
+        self._pass_end(pass_id, before, summary)
         self.emit({"type": "done", **summary})
         return self.counters
+
+    def _sources_for(self, paths: list[str]) -> list[SourceFile]:
+        """Fichiers à relire (liste choisie dans l'écran Anomalies) : ceux qui existent encore."""
+        out, seen, missing = [], set(), 0
+        for p in paths:
+            key = _path_key(p)
+            if not p or key in seen:
+                continue
+            seen.add(key)
+            try:
+                st = os.stat(p)
+            except OSError:
+                missing += 1
+                continue
+            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in EXTENSIONS:
+                out.append(SourceFile(p, st.st_size, st.st_mtime))
+        if missing:
+            self.emit({"type": "warning", "message": f"{missing} fichier(s) à relire introuvable(s) (déplacés, "
+                                                     "renommés ou supprimés) : ignorés."})
+        return out
+
+    def _pass_begin(self, mode: str, source: str) -> tuple[int | None, tuple[int, int]]:
+        """Historique des passes (jamais bloquant : une base d'une version antérieure ne doit rien empêcher)."""
+        try:
+            c = self.db.conn
+            before = (c.execute("SELECT COUNT(*) FROM etudiants_releves").fetchone()[0],
+                      c.execute("SELECT COUNT(*) FROM anomalies").fetchone()[0])
+            return self.db.pass_begin(mode, source), before
+        except Exception:
+            return None, (0, 0)
+
+    def _pass_end(self, pass_id: int | None, before: tuple[int, int], summary: dict) -> None:
+        if pass_id is None:
+            return
+        try:
+            c = self.db.conn
+            after = (c.execute("SELECT COUNT(*) FROM etudiants_releves").fetchone()[0],
+                     c.execute("SELECT COUNT(*) FROM anomalies").fetchone()[0])
+            k = self.counters
+            self.db.pass_end(pass_id, fichiers=k.detectes, lus=k.extraits + k.echecs, ecrits=k.ecrits,
+                             echecs=k.echecs, ignores=k.ignores, exclus=k.exclus, releves_delta=after[0] - before[0],
+                             anomalies_delta=after[1] - before[1], duree_s=summary.get("duree_s"),
+                             arretee=1 if self.stopped else 0, workers=summary.get("workers"))
+        except Exception:
+            pass
 
     def _run_parallel(self, todo: list[SourceFile], n_workers: int, done: int, started: float) -> int:
         import multiprocessing
@@ -623,6 +683,7 @@ def cli(argv: list[str]) -> int:
                         help="Dossier ou motif à exclure (répétable), en plus de ceux de la configuration")
     parser.add_argument("--stdin-control", action="store_true", help="Écouter « stop » sur l'entrée standard")
     parser.add_argument("--json", action="store_true", help="Progression en lignes JSON (utilisé par l'interface)")
+    parser.add_argument("--paths-file", help="Relire seulement ces fichiers (un chemin par ligne, UTF-8)")
     args = parser.parse_args(argv)
     _ensure_stdio()
 
@@ -646,13 +707,22 @@ def cli(argv: list[str]) -> int:
         missing = check_integrity(db)
         emit({"type": "integrity", "orphans": missing})
         return 0
-    source = Path(args.source or settings.source_root)
-    if not str(source) or not source.exists():
+    source = Path(args.source or settings.source_root or ".")
+    paths = None
+    if args.paths_file:
+        # relecture d'une liste de fichiers (écran Anomalies) : la liste est lue puis le fichier supprimé
+        with open(args.paths_file, encoding="utf-8") as fh:
+            paths = [line.rstrip("\r\n") for line in fh if line.strip()]
+        try:
+            os.unlink(args.paths_file)
+        except OSError:
+            pass
+    elif not str(source) or not source.exists():
         print("Dossier source introuvable. Utilisez --source.", file=sys.stderr)
         return 2
     only_new = True if args.only_new else (False if args.full else None)
     indexer = Indexer(settings, db, emit)
     if args.stdin_control:
         _listen_for_stop(indexer)
-    indexer.run(source, only_new=only_new, workers=args.workers)
+    indexer.run(source, only_new=only_new, workers=args.workers, paths=paths)
     return 0

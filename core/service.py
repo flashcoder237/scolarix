@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import alerts, demandes, exports, pdf_tools, verification
+from . import anomalies as anomaly_causes
 from .config import (APP_NAME, APP_VERSION, DEFAULT_TEXT_RULES, UI_SCALES, Settings, config_path, is_network_path,
                      save_settings)
 from .database import Database, Releve, missing_periods
@@ -190,12 +191,16 @@ class Service:
         counts = {a: n for a, n in db.conn.execute(
             "SELECT action, COUNT(*) FROM journal WHERE horodatage >= ? AND action IN ('IMPRESSION','DUPLICATA') "
             "GROUP BY action", (today,)).fetchall()}
-        anomalies = db.conn.execute(
-            "SELECT COUNT(*) FROM anomalies WHERE niveau IN ('ERREUR','AVERTISSEMENT')").fetchone()[0]
+        # « à revoir » : erreurs et avertissements que l'agent n'a pas encore marqués « vus » (écran Indexation)
+        anomalies, anomalies_fichiers = db.conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT a.chemin) FROM anomalies a LEFT JOIN anomalies_vues v "
+            "ON v.chemin = COALESCE(a.chemin, '') AND v.code = a.code "
+            "WHERE a.niveau IN ('ERREUR','AVERTISSEMENT') AND v.chemin IS NULL").fetchone()
         return {"releves": st["releves"], "etudiants": st["etudiants"], "fichiers": st["fichiers"],
                 "pages": st["pages"], "echecs": st["echecs"], "multi_pages": st.get("multi_pages", 0), "formats": st["formats"], "annees": st["annees"],
                 "imprimes": counts.get("IMPRESSION", 0) + counts.get("DUPLICATA", 0),
                 "duplicatas": counts.get("DUPLICATA", 0), "anomalies": anomalies,
+                "anomalies_fichiers": anomalies_fichiers,
                 "derniere_indexation": db.get_meta("derniere_indexation")}
 
     # ------------------------------------------------------------------ recherche
@@ -616,14 +621,21 @@ class Service:
 
     def check_integrity(self) -> dict:
         """Vérification d'intégrité : fichiers indexés déplacés, renommés ou supprimés (liens orphelins)."""
+        import json
         missing = [r["chemin"] for r in self.db.orphan_files()]
+        with self.db._lock:     # une seule ligne par fichier orphelin, même après plusieurs vérifications
+            self.db.conn.execute("DELETE FROM anomalies WHERE message LIKE 'Lien orphelin%'")
+            self.db.conn.commit()
         for chemin in missing:
             self.db.add_anomaly("AVERTISSEMENT", chemin, "Lien orphelin : fichier déplacé, renommé ou supprimé.",
                                 "Relocaliser")
+        self.db.set_meta("integrite", json.dumps({"date": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                                                  "orphelins": len(missing)}))
         return {"orphelins": len(missing), "fichiers": missing[:50]}
 
-    def anomalies(self, niveau: str | None = None) -> list[dict]:
-        return [_row(r) for r in self.db.anomalies(niveau or None, 500)]
+    def anomalies(self, niveau: str | None = None, offset: int = 0, limit: int | None = None) -> list[dict]:
+        """Liste brute (compatibilité) : sans plafond, paginée si ``limit`` est donné."""
+        return [_row(r) for r in self.db.anomalies(niveau or None, limit, offset)]
 
     def index_reset(self, confirm: str = "") -> dict:
         """Vide l'index (pas le journal, ni le registre, ni les demandes) et le cache des aperçus Word."""
@@ -771,6 +783,392 @@ class Service:
         compiled = self._check_rules(rules)
         out, n = apply_text(text or "", compiled)
         return {"text": out, "count": n, "avertissements": rule_warnings(compiled)}
+
+    # ---- indexation ----
+    # Écran Indexation (2.1) : état du fonds, tri des anomalies par cause, relecture d'une liste de fichiers.
+    # Toutes les listes sont paginées côté moteur (un poste réel a 9 000+ anomalies).
+
+    ANOM_VUES = ("a_traiter", "vues", "tout")
+    _VU_JOIN = ("LEFT JOIN anomalies_vues v ON v.chemin = COALESCE(a.chemin, '') AND v.code = a.code")
+
+    def _tesseract_found(self) -> bool:
+        import os
+        import shutil
+        cmd = (self.s.tesseract_cmd or "").strip()
+        if cmd:
+            return Path(cmd).exists() or bool(shutil.which(cmd))
+        if shutil.which("tesseract"):
+            return True
+        return os.name == "nt" and any(Path(p).exists() for p in (
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"))
+
+    def _rel_folder(self, dossier: str | None) -> str:
+        """Dossier affiché relativement au dossier racine des archives (« 2004-2005\\Pharmacie\\Scans »)."""
+        d = dossier or ""
+        root = (self.s.source_root or "").rstrip("\\/")
+        if root and len(d) > len(root) and d[:len(root)].casefold() == root.casefold() and d[len(root)] in "\\/":
+            return d[len(root) + 1:]
+        return d or "(sans dossier)"
+
+    def _anom_where(self, f: dict | None, skip: tuple = ()) -> tuple[str, list]:
+        """Filtre commun (cause ou niveau, vue, texte, dossier, année) des requêtes d'anomalies."""
+        f = f or {}
+        where, args = ["1=1"], []
+        cause = str(f.get("cause") or "")
+        if cause.startswith("@"):
+            where.append("a.niveau = ?")
+            args.append(cause[1:])
+        elif cause:
+            where.append("a.code = ?")
+            args.append(cause)
+        vue = f.get("vue") or "a_traiter"
+        if vue == "a_traiter":
+            where.append("v.chemin IS NULL")
+        elif vue == "vues":
+            where.append("v.chemin IS NOT NULL")
+        q = str(f.get("q") or "").strip()
+        if q:
+            esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append("(a.chemin LIKE ? ESCAPE '\\' OR a.message LIKE ? ESCAPE '\\')")
+            args += [f"%{esc}%", f"%{esc}%"]
+        if "dossier" not in skip and f.get("dossier") is not None and f.get("dossier") != "":
+            where.append("a.dossier = ?")
+            args.append(f["dossier"])
+        if "annee" not in skip and f.get("annee"):
+            if f["annee"] == "-":
+                where.append("a.annee IS NULL")
+            else:
+                where.append("a.annee = ?")
+                args.append(f["annee"])
+        return " AND ".join(where), args
+
+    def _anom_counts(self) -> dict:
+        """Effectifs par cause pour chaque vue (À traiter / Vues / Tout), en une passe sur la table."""
+        rows = self.db.conn.execute(
+            "SELECT a.code, a.niveau, COUNT(*), COUNT(DISTINCT a.chemin), SUM(v.chemin IS NOT NULL), "
+            "COUNT(DISTINCT CASE WHEN v.chemin IS NULL THEN a.chemin END), "
+            "COUNT(DISTINCT CASE WHEN v.chemin IS NOT NULL THEN a.chemin END) "
+            f"FROM anomalies a {self._VU_JOIN} GROUP BY a.code, a.niveau").fetchall()
+        out = {}
+        for code, niveau, n, nf, vus, f_todo, f_vus in rows:
+            vus = vus or 0
+            out[code or ""] = {"code": code or "", "niveau": niveau, "label": anomaly_causes.label(code),
+                               "fix": getattr(anomaly_causes.BY_CODE.get(code or ""), "fix", ""),
+                               "tout": n, "tout_fichiers": nf, "vues": vus, "vues_fichiers": f_vus,
+                               "a_traiter": n - vus, "a_traiter_fichiers": f_todo}
+        return out
+
+    def _anom_totals(self, vue_filter: str) -> tuple[int, int]:
+        cond = {"a_traiter": "v.chemin IS NULL", "vues": "v.chemin IS NOT NULL"}.get(vue_filter, "1=1")
+        n, f = self.db.conn.execute(f"SELECT COUNT(*), COUNT(DISTINCT a.chemin) FROM anomalies a {self._VU_JOIN} "
+                                    f"WHERE {cond}").fetchone()
+        return n or 0, f or 0
+
+    def _common_fix(self, counts: dict) -> dict | None:
+        """La correction à plus fort levier (« 1 correction règle 3 104 anomalies »)."""
+        fixes = []
+        ocr = counts.get("ocr_off")
+        if ocr and ocr["a_traiter"]:
+            if not self.s.ocr_enabled:
+                fixes.append({"code": "ocr_off", "titre": "l'OCR est désactivé sur ce poste",
+                              "texte": "Activez l'OCR des scans, puis relisez ces fichiers en une passe "
+                                       "(le guichet reste utilisable).", "action": "ocr_enable",
+                              "bouton": "Activer l'OCR"})
+            elif not self._tesseract_found():
+                fixes.append({"code": "ocr_off", "titre": "Tesseract est introuvable sur ce poste",
+                              "texte": "Installez-le ou indiquez son chemin dans les Réglages, puis relisez ces "
+                                       "fichiers en une passe (le guichet reste utilisable).",
+                              "action": "settings", "bouton": "Configurer Tesseract…"})
+            else:
+                fixes.append({"code": "ocr_off", "titre": "l'OCR est maintenant disponible sur ce poste",
+                              "texte": "Ces scans ont été lus sans OCR : relisez-les en une passe.",
+                              "action": "reread", "bouton": None})
+            fixes[-1].update(n=ocr["a_traiter"], fichiers=ocr["a_traiter_fichiers"])
+        word = counts.get("word_absent")
+        if word and word["a_traiter"]:
+            fixes.append({"code": "word_absent", "titre": "Word ou LibreOffice est absent de ce poste",
+                          "texte": "Installez LibreOffice (ou activez la passerelle COM Word), puis relisez "
+                                   "ces fichiers.", "action": "settings", "bouton": "Ouvrir les Réglages…",
+                          "n": word["a_traiter"], "fichiers": word["a_traiter_fichiers"]})
+        return max(fixes, key=lambda x: x["n"]) if fixes else None
+
+    @staticmethod
+    def _year_series(annees: list) -> list[dict]:
+        """Relevés par année académique, années manquantes comprises ; « trou » = année anormalement creuse
+        par rapport à ses voisines (dossier manquant ?)."""
+        import re
+        import statistics
+        by_y: dict[int, tuple[str, int]] = {}
+        others = []
+        for a, n in annees:
+            m = re.match(r"\s*((?:19|20)\d{2})", str(a or ""))
+            if m:
+                y = int(m.group(1))
+                label, prev = by_y.get(y, (f"{y}-{y + 1}", 0))
+                by_y[y] = (label, prev + n)
+            else:
+                others.append((a, n))
+        out = []
+        if by_y:
+            lo, hi = min(by_y), max(by_y)
+            years = range(lo, hi + 1) if hi - lo <= 60 else sorted(by_y)
+            series = [(y, by_y.get(y, (f"{y}-{y + 1}", 0))) for y in years]
+            counts = [n for _, (_, n) in series]
+            for i, (y, (label, n)) in enumerate(series):
+                neigh = [counts[j] for j in range(max(0, i - 3), min(len(counts), i + 4)) if j != i]
+                med = statistics.median(neigh) if neigh else 0
+                out.append({"annee": label, "n": n, "trou": bool(med >= 20 and n < 0.25 * med)})
+        return out
+
+    def index_overview(self) -> dict:
+        """Tout l'écran « État du fonds » en un appel : chiffres, santé, formats, années, causes, passes."""
+        import json
+        db = self.db
+        db.anomalies_backfill()
+        c = db.conn
+        st = db.stats()
+        one = lambda sql, *a: c.execute(sql, a).fetchone()[0] or 0  # noqa: E731
+        avert = one("SELECT COUNT(DISTINCT a.chemin) FROM anomalies a JOIN fichiers f ON f.chemin = a.chemin "
+                    "WHERE a.niveau = 'AVERTISSEMENT' AND COALESCE(f.statut, 'OK') <> 'ERREUR'")
+        echecs = st["echecs"]
+        today = datetime.now().strftime("%Y-%m-%d")
+        jour = {a: n for a, n in c.execute(
+            "SELECT action, COUNT(*) FROM journal WHERE horodatage >= ? AND action IN "
+            "('IMPRESSION','DUPLICATA','VERIFICATION','EXTRACTION') GROUP BY action", (today,)).fetchall()}
+        counts = self._anom_counts()
+        ocr_files = one("SELECT COUNT(DISTINCT a.chemin) FROM anomalies a JOIN fichiers f ON f.chemin = a.chemin "
+                        "WHERE a.code = 'ocr_off'")
+        ocr_why = ("OCR désactivé" if not self.s.ocr_enabled else
+                   "Tesseract introuvable" if not self._tesseract_found() else "lus sans OCR")
+        labels = {"PDF_SCAN": "PDF scanné", "DOC": "Word .doc", "PDF_TEXT": "PDF texte", "DOCX": "Word .docx",
+                  "PDF": "PDF illisible"}
+        fmts: dict[str, dict] = {}
+        for t, statut, n in c.execute("SELECT type_fichier, COALESCE(statut, 'OK'), COUNT(*) FROM fichiers "
+                                      "GROUP BY type_fichier, statut").fetchall():
+            d = fmts.setdefault(t or "?", {"type": t or "?", "label": labels.get(t or "", t or "?"), "n": 0,
+                                           "echecs": 0, "note": ""})
+            d["n"] += n
+            if statut == "ERREUR":
+                d["echecs"] += n
+        for d in fmts.values():
+            notes = []
+            if d["type"] == "PDF_SCAN" and ocr_files:
+                notes.append(f"{ocr_files:,} non lu(s) · {ocr_why}".replace(",", "\u202f"))
+            if d["echecs"]:
+                notes.append(f"{d['echecs']:,} en échec".replace(",", "\u202f"))
+            d["note"] = " · ".join(notes)
+        passes = []
+        for r in db.passes(8):
+            p = dict(r)
+            passes.append(p)
+        try:
+            integ = json.loads(db.get_meta("integrite") or "null")
+        except ValueError:
+            integ = None
+        last_exclus = next((p["exclus"] for p in passes if p.get("fin") and p.get("mode") != "RELECTURE"), None)
+        todo_n, todo_f = self._anom_totals("a_traiter")
+        all_n, all_f = self._anom_totals("tout")
+        causes = sorted((x for x in counts.values() if x["a_traiter"]), key=lambda x: -x["a_traiter"])
+        return {
+            "releves": st["releves"], "etudiants": st["etudiants"], "pages": st["pages"], "fichiers": st["fichiers"],
+            "sante": {"fichiers": st["fichiers"], "echec": echecs, "avertissement": avert,
+                      "ok": max(0, st["fichiers"] - echecs - avert), "exclus": last_exclus},
+            "aujourdhui": {"imprimes": jour.get("IMPRESSION", 0) + jour.get("DUPLICATA", 0),
+                           "duplicatas": jour.get("DUPLICATA", 0), "verifications": jour.get("VERIFICATION", 0),
+                           "extractions": jour.get("EXTRACTION", 0)},
+            "formats": sorted(fmts.values(), key=lambda d: -d["n"]),
+            "annees": self._year_series(st["annees"]),
+            "anomalies": {"a_traiter": todo_n, "a_traiter_fichiers": todo_f, "tout": all_n, "tout_fichiers": all_f,
+                          "causes": len(causes)},
+            "causes": causes,
+            "fix": self._common_fix(counts),
+            "passes": passes,
+            "derniere_indexation": db.get_meta("derniere_indexation"),
+            "integrite": {"date": (integ or {}).get("date"), "orphelins": counts.get("orphelin", {}).get("tout_fichiers", 0),
+                          "verifiee": bool(integ)},
+            "outils": {"ocr": bool(self.s.ocr_enabled), "tesseract": self._tesseract_found()},
+            "source": {"chemin": self.s.source_root, "existe": bool(self.s.source_root) and Path(self.s.source_root).exists()},
+        }
+
+    def anomalies_summary(self, vue: str = "a_traiter") -> dict:
+        """Colonne « Causes » : effectifs par cause et par niveau pour la vue choisie, et totaux des trois vues."""
+        self.db.anomalies_backfill()
+        vue = vue if vue in self.ANOM_VUES else "a_traiter"
+        counts = self._anom_counts()
+        causes = []
+        order = {c.code: i for i, c in enumerate(anomaly_causes.CAUSES)}
+        for x in counts.values():
+            if x[vue]:
+                causes.append({"code": x["code"], "niveau": x["niveau"], "label": x["label"], "fix": x["fix"],
+                               "n": x[vue], "fichiers": x[f"{vue}_fichiers"]})
+        rank = {"ERREUR": 0, "AVERTISSEMENT": 1, "INFO": 2}
+        causes.sort(key=lambda x: (rank.get(x["niveau"], 3), -x["n"], order.get(x["code"], 99)))
+        totaux = {}
+        for v in self.ANOM_VUES:
+            n, f = self._anom_totals(v)
+            totaux[v] = {"n": n, "fichiers": f}
+        return {"vue": vue, "causes": causes, "totaux": totaux, "fix": self._common_fix(counts)}
+
+    def anomalies_files(self, filter: dict | None = None, offset: int = 0, limit: int = 200) -> dict:
+        """Colonne « Fichiers » : fichiers de la cause choisie (une ligne par fichier), triés par dossier,
+        paginés ; avec les effectifs par dossier et par année (filtres et en-têtes de groupe)."""
+        c = self.db.conn
+        f = filter or {}
+        where, args = self._anom_where(f)
+        limit = max(1, min(int(limit or 200), 2000))
+        rows = c.execute(
+            "SELECT a.chemin, a.dossier, a.annee, COUNT(*) AS n, MIN(a.id) AS premier, a.message, a.niveau, "
+            "GROUP_CONCAT(DISTINCT a.code) AS codes, SUM(v.chemin IS NOT NULL) AS vus, "
+            "MAX(f.nb_pages) AS nb_pages, MAX(f.type_fichier) AS type_fichier, MAX(f.statut) AS statut "
+            f"FROM anomalies a {self._VU_JOIN} LEFT JOIN fichiers f ON f.chemin = a.chemin "
+            f"WHERE {where} GROUP BY a.chemin ORDER BY a.dossier COLLATE NOCASE, a.chemin COLLATE NOCASE "
+            "LIMIT ? OFFSET ?", args + [limit, max(0, int(offset or 0))]).fetchall()
+        out = []
+        for r in rows:
+            chemin = r["chemin"] or ""
+            out.append({"chemin": chemin, "nom": Path(chemin).name if chemin else "(sans fichier)",
+                        "dossier": r["dossier"] or "", "annee": r["annee"], "n": r["n"], "message": r["message"],
+                        "niveau": r["niveau"], "codes": (r["codes"] or "").split(","), "vu": (r["vus"] or 0) >= r["n"],
+                        "nb_pages": r["nb_pages"], "type_fichier": r["type_fichier"], "statut": r["statut"],
+                        "page": anomaly_causes.page_of(r["message"])})
+        total = c.execute(f"SELECT COUNT(DISTINCT COALESCE(a.chemin, '')), COUNT(*) FROM anomalies a {self._VU_JOIN} "
+                          f"WHERE {where}", args).fetchone()
+        dw, da = self._anom_where(f, skip=("dossier",))
+        dossiers = [{"dossier": d or "", "label": self._rel_folder(d), "n": n} for d, n in c.execute(
+            f"SELECT a.dossier, COUNT(DISTINCT COALESCE(a.chemin, '')) FROM anomalies a {self._VU_JOIN} WHERE {dw} "
+            "GROUP BY a.dossier ORDER BY a.dossier COLLATE NOCASE", da).fetchall()]
+        yw, ya = self._anom_where(f, skip=("annee",))
+        annees = [{"annee": y or "-", "n": n} for y, n in c.execute(
+            f"SELECT a.annee, COUNT(DISTINCT COALESCE(a.chemin, '')) FROM anomalies a {self._VU_JOIN} WHERE {yw} "
+            "GROUP BY a.annee ORDER BY a.annee", ya).fetchall()]
+        return {"offset": int(offset or 0), "rows": out, "total": total[0] or 0, "anomalies": total[1] or 0,
+                "dossiers": dossiers, "annees": annees}
+
+    def anomalies_detail(self, chemin: str) -> dict:
+        """Volet « Détail » : le fichier, toutes ses anomalies et de quoi l'afficher."""
+        c = self.db.conn
+        rows = c.execute(f"SELECT a.*, v.chemin IS NOT NULL AS vu FROM anomalies a {self._VU_JOIN} "
+                         "WHERE COALESCE(a.chemin, '') = ? ORDER BY a.id", (chemin or "",)).fetchall()
+        fic = c.execute("SELECT * FROM fichiers WHERE chemin = ?", (chemin,)).fetchone()
+        exists = bool(chemin) and Path(chemin).is_file()
+        preview = None
+        if exists and chemin.lower().endswith(".pdf"):
+            preview = chemin
+        elif fic is not None and fic["cache_pdf"]:
+            from .database import resolve_cache
+            cand = resolve_cache(fic["cache_pdf"], Path(self.cache_dir))
+            if cand and Path(cand).exists():
+                preview = cand
+        rel = c.execute("SELECT r.id FROM etudiants_releves r JOIN fichiers f ON f.id = r.fichier_id "
+                        "WHERE f.chemin = ? ORDER BY r.numero_page LIMIT 1", (chemin,)).fetchone()
+        return {"chemin": chemin, "nom": Path(chemin).name if chemin else "", "dossier": anomaly_causes.folder_of(chemin),
+                "dossier_label": self._rel_folder(anomaly_causes.folder_of(chemin)), "existe": exists,
+                "type_fichier": fic["type_fichier"] if fic else None, "nb_pages": fic["nb_pages"] if fic else None,
+                "statut": fic["statut"] if fic else None, "preview_pdf": preview,
+                "is_word": Path(chemin or "").suffix.lower() in (".doc", ".docx"),
+                "releve_id": rel[0] if rel else None,
+                "anomalies": [{"id": r["id"], "code": r["code"], "label": anomaly_causes.label(r["code"]),
+                               "niveau": r["niveau"], "message": r["message"], "action": r["action"],
+                               "horodatage": r["horodatage"], "vu": bool(r["vu"]),
+                               "page": anomaly_causes.page_of(r["message"])} for r in rows]}
+
+    def _anom_pairs(self, items: list[str] | None, filter: dict | None) -> list[tuple[str, str]]:
+        """(fichier, cause) visés par une action de lot : les fichiers cochés (items), ou tout le filtre."""
+        where, args = self._anom_where(filter)
+        sql = (f"SELECT DISTINCT COALESCE(a.chemin, ''), a.code FROM anomalies a {self._VU_JOIN} WHERE {where}")
+        c = self.db.conn
+        if items is None:
+            return [(p, code) for p, code in c.execute(sql, args).fetchall()]
+        out: list[tuple[str, str]] = []
+        items = [str(x) for x in items]
+        for i in range(0, len(items), 400):
+            chunk = items[i:i + 400]
+            out += c.execute(sql + f" AND COALESCE(a.chemin, '') IN ({','.join('?' * len(chunk))})",
+                             args + chunk).fetchall()
+        return [(p, code) for p, code in out]
+
+    def anomalies_mark_seen(self, items: list[str] | None = None, filter: dict | None = None,
+                            seen: bool = True) -> dict:
+        """« Marquer vus » (ou « à traiter » de nouveau) : la marque reste d'une passe à l'autre."""
+        f = dict(filter or {})
+        f["vue"] = "a_traiter" if seen else "vues"
+        pairs = self._anom_pairs(items, f)
+        db = self.db
+        with db._lock:
+            if seen:
+                db.conn.executemany("INSERT OR IGNORE INTO anomalies_vues(chemin, code, operateur) VALUES (?,?,?)",
+                                    [(p, code, self.s.operateur) for p, code in pairs])
+            else:
+                db.conn.executemany("DELETE FROM anomalies_vues WHERE chemin = ? AND code = ?", pairs)
+            db.conn.commit()
+        return {"n": len(pairs), "fichiers": len({p for p, _ in pairs}), "seen": bool(seen)}
+
+    def anomalies_paths(self, items: list[str] | None = None, filter: dict | None = None) -> list[str]:
+        """Fichiers à relire (« Relire », « Relire les 3 104 »)."""
+        return sorted({p for p, _ in self._anom_pairs(items, filter) if p})
+
+    def anomalies_export(self, path: str = "", items: list[str] | None = None, filter: dict | None = None) -> dict:
+        """Export CSV (séparateur « ; », UTF-8 avec BOM pour Excel) des anomalies de la sélection."""
+        import csv
+        if not path:
+            path = str(exports.dest_for(self.s, exports.JOURNAL, "Anomalies.csv"))
+        where, args = self._anom_where(filter)
+        sql = (f"SELECT a.*, v.chemin IS NOT NULL AS vu FROM anomalies a {self._VU_JOIN} WHERE {where}")
+        c = self.db.conn
+        rows: list = []
+        if items is None:
+            rows = c.execute(sql + " ORDER BY a.dossier, a.chemin, a.id", args).fetchall()
+        else:
+            items = [str(x) for x in items]
+            for i in range(0, len(items), 400):
+                chunk = items[i:i + 400]
+                rows += c.execute(sql + f" AND COALESCE(a.chemin, '') IN ({','.join('?' * len(chunk))}) "
+                                  "ORDER BY a.dossier, a.chemin, a.id", args + chunk).fetchall()
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh, delimiter=";")
+            w.writerow(["Niveau", "Cause", "Fichier", "Dossier", "Année", "Message", "Action", "Horodatage", "Vu"])
+            for r in rows:
+                w.writerow([r["niveau"], anomaly_causes.label(r["code"]), r["chemin"] or "",
+                            self._rel_folder(r["dossier"]), r["annee"] or "", r["message"], r["action"] or "",
+                            r["horodatage"], "oui" if r["vu"] else "non"])
+        return {"path": str(path), "name": Path(path).name, "count": len(rows)}
+
+    def index_exclude_folder(self, dossier: str, apply: bool = False) -> dict:
+        """« Exclure ce dossier » : ajouté aux exclusions (enregistré tout de suite) ; ses fichiers et leurs
+        relevés sont retirés de l'index maintenant (les archives ne sont jamais touchées)."""
+        d = str(dossier or "").rstrip("\\/")
+        if not d:
+            raise ServiceError("Dossier à exclure manquant.")
+        sep = "\\" if "\\" in d else "/"
+        prefix = d + sep
+        c = self.db.conn
+        cond = "lower(substr(chemin, 1, ?)) = lower(?)"
+        n_files = c.execute(f"SELECT COUNT(*) FROM fichiers WHERE {cond}", (len(prefix), prefix)).fetchone()[0]
+        n_rel = c.execute(f"SELECT COUNT(*) FROM etudiants_releves r JOIN fichiers f ON f.id = r.fichier_id "
+                          f"WHERE lower(substr(f.chemin, 1, ?)) = lower(?)", (len(prefix), prefix)).fetchone()[0]
+        n_anom = c.execute(f"SELECT COUNT(*) FROM anomalies WHERE {cond}", (len(prefix), prefix)).fetchone()[0]
+        res = {"dossier": d, "label": self._rel_folder(d), "fichiers": n_files, "releves": n_rel, "anomalies": n_anom,
+               "deja": any(str(x).rstrip("\\/").casefold() == d.casefold() for x in self.s.exclusions)}
+        if not apply:
+            return res
+        if not res["deja"]:
+            self.s.exclusions = list(self.s.exclusions) + [d]
+            save_settings(self.s)
+        db = self.db
+        with db._lock:
+            cur = c.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                cur.execute(f"DELETE FROM fichiers WHERE {cond}", (len(prefix), prefix))
+                cur.execute(f"DELETE FROM anomalies WHERE {cond}", (len(prefix), prefix))
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+        db._token_index = None
+        self._log("INDEX EXCLUSION", None, f"Dossier exclu : {d} · {n_files} fichier(s), {n_rel} relevé(s) et "
+                                           f"{n_anom} anomalie(s) retirés de l'index (archives non modifiées)")
+        return dict(res, applique=True, exclusions=list(self.s.exclusions))
 
 
 def _unlink_temp(file: str | None) -> None:
