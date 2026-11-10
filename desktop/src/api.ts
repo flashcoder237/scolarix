@@ -86,6 +86,7 @@ export interface Stats {
   imprimes: number;
   duplicatas: number;
   anomalies: number;
+  anomalies_fichiers?: number;   // fichiers distincts concernés (la tuile disait « fichier(s) » en comptant des lignes)
   derniere_indexation: string | null;
   annees: [string, number][];
   formats: Record<string, number>;

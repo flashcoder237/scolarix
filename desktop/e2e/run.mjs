@@ -697,18 +697,202 @@ async function search(q) {
     await page.getByTestId("verdict").filter({ hasText: "Non conforme" }).waitFor({ timeout: 180000 });
   });
 
-  await scenario("Indexation (Ctrl+3) : relance différentielle", async () => {
+  // ---------------------------------------------------------------- Indexation (2.1) : état du fonds + tri des anomalies
+  const ixResize = (w, h) => electronApp.evaluate(({ BrowserWindow }, [w, h]) => BrowserWindow.getAllWindows()[0].setContentSize(w, h), [w, h]);
+  const ixNoPageScroll = async (label) => {
+    const o = await page.evaluate(() => { const el = document.querySelector('[data-page="indexation"]'); return [el.scrollHeight, el.clientHeight, el.scrollWidth, el.clientWidth]; });
+    if (o[0] > o[1] + 1 || o[2] > o[3] + 1) throw new Error(`${label} : l'écran entier défile (${o.join(" × ")})`);
+  };
+  const ixWaitDone = async (timeout = 180000) => {
+    await page.getByTestId("index-status").filter({ hasText: /TERMINÉ|ARRÊTÉE|ARRÊT ANORMAL/ }).waitFor({ timeout });
+  };
+
+  await scenario("Indexation (Ctrl+3) : état du fonds, relance différentielle, historique des passes", async () => {
     await page.keyboard.press("Control+3");
-    await page.getByTestId("stats-row").getByText("Imprimés aujourd'hui").waitFor();     // tuiles venues du guichet
-    await page.getByTestId("index-start").click();
-    await page.getByText("TERMINÉ").first().waitFor({ timeout: 120000 });
+    const kpis = page.getByTestId("index-kpis");
+    await kpis.getByText("relevés indexés").waitFor();
+    await page.getByTestId("index-today").getByText(/imprimé/).waitFor();                  // activité du jour (ex-tuiles du guichet)
+    await page.getByTestId("index-health").getByText(/lus sans remarque/).waitFor({ timeout: 15000 });   // chiffres chargés
+    await page.getByTestId("index-years").waitFor();
+    await ixNoPageScroll("état du fonds 1366");
+    await shot("indexation_etat");
+    await page.keyboard.press("Control+Enter");                                              // Ctrl+Entrée : lancer
+    await ixWaitDone(120000);
+    await page.getByTestId("index-last-pass").getByText(/Différentielle/).waitFor({ timeout: 15000 });
     await shot("indexation");
-    await page.getByTestId("index-kpis").getByText("Fichiers en échec").waitFor();
     await page.getByTestId("index-integrity").click();
     await waitToast(/Intégrité vérifiée/);
+    await page.getByTestId("index-maintenance").getByText(/vérifiée le/).waitFor({ timeout: 15000 });
+  });
+
+  await scenario("Indexation : passe complète en cours, Arrêter puis Forcer", async () => {
+    await page.getByTestId("index-mode").getByRole("radio", { name: "Complète" }).click();
+    await page.getByTestId("index-start").click();
+    await page.getByTestId("index-live").waitFor({ timeout: 15000 });
+    await page.getByTestId("index-status").filter({ hasText: /EN COURS|TERMINÉ/ }).waitFor({ timeout: 15000 });
+    await page.waitForTimeout(400);
+    await shot("indexation_en_cours");
+    const stop = page.getByTestId("index-stop");
+    if (await stop.count()) {
+      await stop.click().catch(() => undefined);                                            // 1er clic : arrêt propre
+      if (await page.getByTestId("index-force").isEnabled().catch(() => false)) await shot("indexation_arret_demande");
+    }
+    await ixWaitDone(120000);
+    await page.getByTestId("index-mode").getByRole("radio", { name: "Différentielle" }).click();
+    await page.getByTestId("index-start").click();                                          // reprise en différentielle
+    await page.waitForTimeout(500);
+    await page.getByTestId("index-status").filter({ hasText: "TERMINÉ" }).waitFor({ timeout: 120000 });
+    if (!/Différentielle|Complète/.test(await page.getByTestId("index-passes").innerText())) throw new Error("passes récentes absentes");
+  });
+
+  const FICT = join(work, "fonds_fictif");
+  await scenario("Anomalies : 10 000 anomalies fictives, tri par cause, liste virtualisée", async () => {
+    await page.keyboard.press("Control+3");
+    const { execSync } = await import("node:child_process");
+    execSync(`${py} "${resolve(app, "..", "tools", "anomalies_fictives.py")}" "${join(work, "index.db")}" 10000 "${FICT}"`);
+    const t0 = Date.now();
+    await page.getByTestId("ix-view-anomalies").click();
+    await page.getByTestId("anom-file").first().waitFor({ timeout: 15000 });
+    const tOpen = Date.now() - t0;
+    const total = await page.getByTestId("anom-total").innerText();
+    if (!/10\s?\d{3}/.test(total)) throw new Error(`total des causes : « ${total} »`);
+    const t1 = Date.now();
+    await page.locator('[data-testid="anom-cause"][data-code="ocr_off"]').click();
+    await page.getByTestId("anom-title").filter({ hasText: "PDF scanné non lu" }).waitFor();
+    await page.getByTestId("anom-file").first().waitFor();
+    const tCause = Date.now() - t1;
+    await page.getByTestId("anom-fix").waitFor();                                          // correction commune : « Relire les N »
+    // défilement jusqu'en bas de la cause (pages chargées au fil de l'eau) : aucun gel, DOM borné
+    await startProbe();
+    const t2 = Date.now();
+    for (let i = 0; i < 40; i++) {
+      await page.getByTestId("anom-files").evaluate((el) => { el.scrollTop = el.scrollHeight; });
+      await page.waitForTimeout(60);
+    }
+    const lag = await stopProbe();
+    const tScroll = Date.now() - t2;
+    const dom = await page.getByTestId("anom-file").count();
+    console.log(`    10 000 anomalies : vue ouverte en ${tOpen} ms · changement de cause ${tCause} ms · défilement complet ${tScroll} ms (retard max ${lag} ms) · ${dom} lignes dans le DOM`);
+    if (dom > 120) throw new Error(`liste non virtualisée : ${dom} lignes dans le DOM`);
+    if (lag > 400) throw new Error(`interface figée pendant le défilement : ${lag} ms`);
+    await page.getByTestId("anom-files").evaluate((el) => { el.scrollTop = 0; });
+    await page.waitForTimeout(200);
+    await ixNoPageScroll("anomalies 1366");
+    await shot("anomalies_1366");
+  });
+
+  await scenario("Anomalies : clavier, lot (Marquer vus, CSV), vue « Vues », filtres, exclure un dossier", async () => {
+    await page.keyboard.press("Control+3");
+    await page.getByTestId("anom-file").first().click();
+    const p0 = await page.getByTestId("anom-path").innerText();
+    await page.keyboard.press("ArrowDown");
+    await page.getByTestId("anom-path").filter({ hasNotText: p0 }).waitFor({ timeout: 5000 });   // ↓ : fichier suivant, détail à jour
+    await page.keyboard.press("Space");
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Space");
+    await page.getByTestId("anom-selbar").getByText("2 fichiers sélectionnés").waitFor();
+    const dest = join(work, "anomalies_e2e.csv");
+    rmSync(dest, { force: true });
+    await electronApp.evaluate(({ dialog }, file) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath: file }); }, dest);
+    await page.getByTestId("anom-csv").click();
+    await waitToast(/Anomalies exportées/);
+    if (!existsSync(dest)) throw new Error("CSV des anomalies non écrit");
+    await shot("anomalies_selection");
+    const vuesBefore = await page.getByTestId("anom-vue").innerText();
+    await page.getByTestId("anom-seen").click();
+    await waitToast(/marqué\(s\) « vu »/);
+    await page.keyboard.press("v");                                                         // V : le fichier courant aussi
+    await waitToast(/marqué\(s\) « vu »/);
+    await page.waitForTimeout(400);
+    const vuesAfter = await page.getByTestId("anom-vue").innerText();
+    if (vuesAfter === vuesBefore) throw new Error(`compteur « Vues » inchangé : ${vuesAfter}`);
+    await page.getByTestId("anom-vue").getByRole("radio", { name: /Vues/ }).click();
+    await page.getByTestId("anom-file").first().waitFor();
+    if ((await page.getByTestId("anom-file").count()) < 3) throw new Error("fichiers « vus » absents de la vue Vues");
+    await page.getByTestId("anom-vue").getByRole("radio", { name: "À traiter" }).click();
+    // Ctrl+A : toute la cause ; Échap : sélection vidée
+    await page.getByTestId("anom-file").first().click();
+    await page.keyboard.press("Control+a");
+    await page.getByTestId("anom-selbar").getByText(/Tous les/).waitFor();
+    await page.keyboard.press("Escape");
+    await page.getByTestId("anom-selbar").waitFor({ state: "detached" });
+    // filtres : texte, dossier, année
+    await page.getByTestId("anom-filter").fill("Lot_07");
+    await page.waitForTimeout(500);
+    const names = await page.locator('[data-testid="anom-path"]').innerText().catch(() => "");
+    void names;
+    await page.getByTestId("anom-filter").fill("");
+    const folderOpt = await page.getByTestId("anom-folder").locator("option").nth(1).getAttribute("value");
+    await page.getByTestId("anom-folder").selectOption(folderOpt);
+    await page.waitForTimeout(400);
+    const exclusionsBefore = await page.evaluate(() => window.scolarix.call("settings_get").then((s) => s.exclusions));
+    await page.getByTestId("anom-exclude").first().click();
+    const dlg = page.getByRole("dialog", { name: "Exclure ce dossier" });
+    await dlg.waitFor();
+    await shot("anomalies_exclure_dossier");
+    await dlg.getByRole("button", { name: "Exclure ce dossier" }).click();
+    await waitToast(/Dossier exclu/);
+    await page.evaluate((ex) => window.scolarix.call("settings_save", { values: { exclusions: ex } }), exclusionsBefore);   // état d'origine
+    await page.getByTestId("anom-folder").selectOption("");
+  });
+
+  await scenario("Anomalies : fichier réel, aperçu, relire ce fichier (passe « Relecture »)", async () => {
+    await page.keyboard.press("Control+3");
+    await page.getByTestId("ix-view-etat").click();
+    await page.getByTestId("health-err").click();                                           // santé du fonds → fichiers en échec
+    await page.getByTestId("anom-title").filter({ hasText: "Toutes les erreurs" }).waitFor();
+    const sep = process.platform === "win32" ? "\\" : "/";
+    await page.getByTestId("anom-filter").fill(`${sep}archives${sep}`);
+    await page.getByTestId("anom-file").filter({ hasNotText: "fictif" }).first().waitFor({ timeout: 10000 });
+    await page.getByTestId("anom-file").first().click();
+    const det = page.getByTestId("anom-detail");
+    await det.locator(".ax-ph").first().waitFor({ timeout: 30000 });                        // .doc illisible : pas d'aperçu, message clair
+    await page.getByTestId("ix-view-etat").click();
+    await page.keyboard.press("Control+Tab");                                               // Ctrl+Tab : vue sœur
+    await page.getByTestId("anomalies").waitFor();
+    await page.getByTestId("anom-vue").getByRole("radio", { name: "Tout" }).click();
+    await page.getByTestId("anom-causes").getByRole("button", { name: /Infos/ }).click();
+    await page.getByTestId("anom-filter").fill(`${sep}archives${sep}`);
+    await page.getByTestId("anom-file").filter({ hasText: ".pdf" }).filter({ hasNotText: "fictif" }).first().waitFor({ timeout: 10000 });
+    await page.getByTestId("anom-file").first().click();
+    await det.locator("canvas").first().waitFor({ timeout: 30000 });                        // PDF : aperçu PdfView
+    await page.waitForTimeout(500);
+    await shot("anomalies_fichier_reel");
+    await page.getByTestId("anom-reread-one").click();
+    await waitToast(/Relecture de 1 fichier lancée/);
+    await page.getByTestId("index-status").filter({ hasText: "TERMINÉ" }).waitFor({ timeout: 120000 });
+    await page.getByTestId("anom-filter").fill("");
+    await page.getByTestId("ix-view-etat").click();
+    await page.getByTestId("index-last-pass").getByText(/Relecture/).waitFor({ timeout: 15000 });
+  });
+
+  await scenario("Indexation à 1920×1080 : état du fonds et tri des anomalies", async () => {
+    await page.keyboard.press("Control+3");
+    try {
+      await ixResize(1920, 1080);
+      await page.waitForTimeout(700);
+      await ixNoPageScroll("état du fonds 1920");
+      await shot("indexation_etat_1920");
+      await page.getByTestId("index-triage").click();
+      await page.locator('[data-testid="anom-cause"][data-code="ocr_off"]').click();
+      await page.getByTestId("anom-file").first().click();
+      await page.keyboard.press("Space");
+      await page.keyboard.press("ArrowDown");
+      await page.keyboard.press("Space");
+      await page.waitForTimeout(500);
+      await ixNoPageScroll("anomalies 1920");
+      await shot("anomalies_1920");
+      await page.keyboard.press("Escape");
+      await page.getByTestId("ix-view-etat").click();
+    } finally {
+      await ixResize(SIZE[0], SIZE[1]);
+      await page.waitForTimeout(600);
+    }
   });
 
   await scenario("Vider l'index puis tout réindexer (journal et registre conservés)", async () => {
+    await page.keyboard.press("Control+3");
+    await page.getByTestId("ix-view-etat").click();
     await page.getByTestId("index-reset").click();
     const dlg = page.getByRole("dialog", { name: "Vider l'index" });
     await dlg.waitFor();
@@ -717,7 +901,9 @@ async function search(q) {
     await shot("vider_index");
     await dlg.getByRole("button", { name: "Vider et tout réindexer" }).click();
     await waitToast(/Index vidé/);
-    await page.getByText("TERMINÉ").first().waitFor({ timeout: 180000 });
+    await page.getByTestId("index-status").filter({ hasText: "TERMINÉ" }).waitFor({ timeout: 180000 });
+    const n = Number((await page.getByTestId("ix-anom-count").innerText()).replace(/\D/g, "") || 0);
+    if (n >= 10000) throw new Error(`anomalies fictives encore là après le vidage : ${n}`);
     await page.keyboard.press("Control+1");
     await search("18M042");
     await page.locator(ROWS).first().waitFor({ timeout: 30000 });
@@ -727,6 +913,7 @@ async function search(q) {
     if (!/INDEX VIDÉ/.test(j) || !/IMPRESSION|EXPORT/.test(j)) throw new Error("journal incomplet après le vidage");
     await page.keyboard.press("Control+3");
   });
+  // ---------------------------------------------------------------- fin du bloc Indexation
 
   await scenario("Taille de l'interface : Ctrl+Plus immédiat, Ctrl+0", async () => {
     await page.keyboard.press("Control+1");

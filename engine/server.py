@@ -98,10 +98,13 @@ class Engine:
                  "verify_compare", "verify_report", "settings_get", "settings_save", "rules_defaults", "rules_test",
                  "visual_refused", "demande_add_cursus", "journal_export", "suggest_path", "exports_dir",
                  "check_integrity", "verify_print_prepare", "verify_printed", "preview_original"]
+        names += ["index_overview", "anomalies_summary", "anomalies_files", "anomalies_detail", "anomalies_mark_seen", "anomalies_export"]  # écran Indexation (2.1)
         table = {n: getattr(s, n) for n in names}
         table.update({"index_start": self.index_start, "index_stop": self.index_stop,
                       "index_reset": self.index_reset, "index_impact": s.index_impact,
                       "index_status": self.index_status, "logs_dir": lambda: str(self.data_dir / "logs")})
+        table.update({"index_reread": self.index_reread, "index_exclude_folder": self.index_exclude_folder})
+
         return table
 
     # ------------------------------------------------------------------ traitement
@@ -138,20 +141,29 @@ class Engine:
                                             "trace": traceback.format_exc(limit=8)}})
 
     # ------------------------------------------------------------------ indexation (processus robot)
-    def index_start(self, source: str, full: bool = False) -> dict:
+    def index_start(self, source: str, full: bool = False, paths: list[str] | None = None) -> dict:
+        """Lance le robot. ``paths`` : relecture de ces seuls fichiers (écran Anomalies, « Relire »)."""
         from core.config import save_settings
         with self._indexer_lock:
             if self.indexer and self.indexer.poll() is None:
                 return {"running": True, "already": True}
-            if not source or not Path(source).exists():
+            if paths is None and (not source or not Path(source).exists()):
                 from core.service import ServiceError
                 raise ServiceError("Dossier source introuvable : choisissez le dossier racine des archives.")
-            self.settings.source_root = source
-            save_settings(self.settings)
+            if paths is None:
+                self.settings.source_root = source
+                save_settings(self.settings)
             program = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(ROOT / "main.py")]
-            args = program + ["--index", "--json", "--stdin-control", "--source", source,
+            args = program + ["--index", "--json", "--stdin-control", "--source", source or "",
                               "--db", str(self.service.db_path),
                               "--full" if (full or not self.settings.differential) else "--only-new"]
+            if paths is not None:
+                # liste dans un fichier (une ligne de commande Windows est limitée à 32 000 caractères)
+                tmp = self.data_dir / "tmp"
+                tmp.mkdir(parents=True, exist_ok=True)
+                listing = tmp / f"relire_{os.getpid()}_{self._run_gen + 1}.txt"
+                listing.write_text("\n".join(paths) + "\n", encoding="utf-8")
+                args += ["--paths-file", str(listing)]
             if not self.settings.ocr_enabled:
                 args.append("--no-ocr")
             env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
@@ -168,6 +180,21 @@ class Engine:
             self._run_gen += 1
             threading.Thread(target=self._relay_index, args=(self.indexer,), daemon=True).start()
         return {"running": True}
+
+    def index_reread(self, items: list[str] | None = None, filter: dict | None = None) -> dict:
+        """« Relire » (écran Anomalies) : une passe sur les fichiers cochés, ou sur tous ceux d'une cause."""
+        from core.service import ServiceError
+        paths = self.service.anomalies_paths(items, filter)
+        if not paths:
+            raise ServiceError("Aucun fichier à relire dans cette sélection.")
+        res = self.index_start(self.settings.source_root, paths=paths)
+        return dict(res, fichiers=len(paths))
+
+    def index_exclude_folder(self, dossier: str, apply: bool = False) -> dict:
+        from core.service import ServiceError
+        if apply and self.indexer and self.indexer.poll() is None:
+            raise ServiceError("Une indexation est en cours : arrêtez-la avant d'exclure un dossier.")
+        return self.service.index_exclude_folder(dossier, apply)
 
     def index_reset(self, confirm: str = "") -> dict:
         from core.service import ServiceError

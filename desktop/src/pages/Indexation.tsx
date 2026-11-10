@@ -1,54 +1,71 @@
-import { useEffect, useState } from "react";
-import { call, sx } from "../api";
-import { useApp } from "../state";
-import { Badge, Chip, Icon, Seg, Switch, useDialogs, useToast } from "../components/ui";
-import { StatsRow } from "../components/StatsRow";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { call } from "../api";
+import { useApp, useShortcuts } from "../state";
+import { Badge, Icon, useDialogs, useToast } from "../components/ui";
+import { duree, errMsg, fr, short, type Overview } from "../indexation";
+import { IndexDashboard } from "./IndexDashboard";
+import { AnomalyTriage } from "./AnomalyTriage";
 
-interface Anomalie { id: number; horodatage: string; niveau: string; chemin: string | null; message: string; action: string | null }
-const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
-const short = (p: string, n = 90) => (p.length > n ? "…" + p.slice(-n) : p);
-const FORMATS: Record<string, [string, string]> = { DOCX: ["Word .docx", "#1D4ED8"], DOC: ["Word .doc 97-2003", "#6D28D9"], PDF_TEXT: ["PDF texte", "#15803D"], PDF_SCAN: ["PDF scanné (OCR)", "#B45309"] };
-const fr = (x: number | undefined) => (x || 0).toLocaleString("fr-FR");
+// Écran Indexation (2.1) : une seule barre en haut et deux vues sœurs, « État du fonds » et « Anomalies ».
+// Le robot tourne dans un processus séparé : le guichet reste utilisable pendant une passe.
 
-export function Indexation() {
+export interface Live {
+  status: "PRÊT" | "EN COURS" | "ARRÊT…" | "TERMINÉ" | "ARRÊTÉ";
+  total: number; done: number; pct: number; aTraiter: number; workers: number; mode: string;
+  stages: [number, number, number, number];        // trouvés, fichiers lus, blocs, relevés écrits
+  ignores: number; echecs: number; rate: number | null; eta: number | null; current: string; detail: string;
+  stopAt: number | null;                           // heure de la demande d'arrêt (arrêt forcé au bout de 60 s)
+  error: string | null;                            // cause d'un arrêt anormal du robot
+}
+const IDLE: Live = { status: "PRÊT", total: 0, done: 0, pct: 0, aTraiter: 0, workers: 0, mode: "", stages: [0, 0, 0, 0], ignores: 0,
+  echecs: 0, rate: null, eta: null, current: "", detail: "", stopAt: null, error: null };
+// gardé d'un affichage de l'écran à l'autre (l'écran est démonté quand on passe au guichet)
+let kept: Live = IDLE;
+let keptView: "etat" | "anomalies" = "etat";
+export const FORCE_AFTER_S = 60;
+
+export interface IxNav { view: "etat" | "anomalies"; cause?: string; nonce: number }
+
+function useIndexRun() {
   const app = useApp();
   const toast = useToast();
-  const { ask } = useDialogs();
-  const s = app.settings;
-  const [src, setSrc] = useState(s?.source_root || "");
-  const [anoms, setAnoms] = useState<Anomalie[]>([]);
-  const [niveau, setNiveau] = useState<string>("");
-  const [live, setLive] = useState({ total: 0, done: 0, pct: 0, detail: "", current: "", stages: [0, 0, 0, 0], status: "PRÊT" });
-  const running = app.indexing.running;
-
-  useEffect(() => { if (s && !src) setSrc(s.source_root || ""); }, [s]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { void call<Anomalie[]>("anomalies", { niveau: niveau || null }).then(setAnoms).catch(() => undefined); }, [niveau, running]);
+  const [live, setLiveRaw] = useState<Live>(() => {
+    if (app.indexing.running) return { ...kept, status: kept.status === "PRÊT" || kept.status === "TERMINÉ" ? "EN COURS" : kept.status };
+    // passe finie pendant que l'écran était fermé : on ne la montre plus « en cours »
+    return kept.status === "EN COURS" || kept.status === "ARRÊT…" ? { ...kept, status: "PRÊT", stopAt: null } : kept;
+  });
+  const setLive = useCallback((f: (l: Live) => Live) => setLiveRaw((l) => (kept = f(l))), []);
 
   useEffect(() => {
     const ev = app.indexing.last;
     if (!ev) return;
     setLive((l) => {
-      const n = { ...l };
+      const n: Live = { ...l };
       if (ev.type === "start") {
-        n.total = ev.total; n.stages = [ev.total, 0, 0, 0]; n.status = "EN COURS";
-        n.current = [`${ev.a_traiter ?? ev.total} fichier(s) à lire`, `${ev.workers || 1} processus`, ev.exclus ? `${ev.exclus} élément(s) exclu(s)` : ""].filter(Boolean).join(" · ");
+        Object.assign(n, { ...IDLE, status: "EN COURS", total: ev.total, aTraiter: ev.a_traiter ?? ev.total, workers: ev.workers || 1,
+          mode: ev.mode || "", stages: [ev.total, 0, 0, 0],
+          current: [`${fr(ev.a_traiter ?? ev.total)} fichier(s) à lire`, ev.exclus ? `${fr(ev.exclus)} élément(s) exclu(s)` : "",
+            ev.retires ? `${fr(ev.retires)} retiré(s) de l'index (exclusions)` : ""].filter(Boolean).join(" · ") });
       } else if (ev.type === "progress") {
         const c = ev.counters;
+        if (n.status === "PRÊT" || n.status === "TERMINÉ" || n.status === "ARRÊTÉ") n.status = "EN COURS";
         n.done = ev.done; n.total = ev.total; n.pct = Math.floor((ev.done * 100) / Math.max(1, ev.total));
-        const eta = ev.eta_s ? ` · restant ≈ ${ev.eta_s >= 3600 ? `${Math.floor(ev.eta_s / 3600)} h ${String(Math.floor((ev.eta_s % 3600) / 60)).padStart(2, "0")} min` : `${Math.floor(ev.eta_s / 60)} min ${Math.floor(ev.eta_s % 60)} s`}` : "";
-        n.detail = `${ev.done} / ${ev.total} fichiers · ${c.ignores} inchangé(s) · ${c.echecs} en échec${ev.rate ? ` · ${ev.rate.toFixed(1)} fichiers/s` : ""}${eta}`;
-        if (ev.file) n.current = `Dernier fichier lu : ${short(ev.file)}`;
-        n.stages = [n.stages[0], c.extraits, c.blocs, c.ecrits];
+        n.rate = ev.rate ?? null; n.eta = ev.eta_s ?? null; n.ignores = c.ignores; n.echecs = c.echecs;
+        if (ev.file) n.current = `Dernier fichier lu : ${short(ev.file, 110)}`;
+        n.stages = [n.stages[0] || ev.total, c.extraits + c.echecs, c.blocs, c.ecrits];
       } else if (ev.type === "stage") {
-        n.current = `${ev.stage === "ocr" ? `OCR de ${ev.pages} page(s)` : ev.stage === "conversion" ? `Conversion → PDF (${ev.backend})` : ev.stage} : ${short(ev.file, 80)}`;
+        n.current = `${ev.stage === "ocr" ? `OCR de ${ev.pages} page(s)` : ev.stage === "conversion" ? `Conversion → PDF (${ev.backend})` : "Lecture"} : ${short(ev.file, 100)}`;
       } else if (ev.type === "warning") {
         toast(ev.message, { tone: "amber" });
       } else if (ev.type === "done") {
-        n.status = "TERMINÉ"; n.pct = 100;
-        n.detail = `Terminé en ${ev.duree_s} s · ${ev.ecrits} relevé(s) écrit(s) · ${ev.ignores} inchangé(s) · ${ev.echecs} en échec`;
+        n.status = "TERMINÉ"; n.pct = 100; n.stopAt = null;
+        n.detail = `${fr(ev.extraits + ev.echecs)} fichier(s) lu(s) en ${duree(ev.duree_s)} · ${fr(ev.ecrits)} relevé(s) écrit(s) · ${fr(ev.ignores)} inchangé(s) · ${fr(ev.echecs)} en échec`;
+        if (ev.stopped) { n.status = "ARRÊTÉ"; n.detail = `Passe arrêtée : ${n.detail}`; }
       } else if (ev.type === "exit") {
+        n.stopAt = null;
         if (n.status === "EN COURS" || n.status === "ARRÊT…") {
           n.status = "ARRÊTÉ";
+          n.error = ev.error || null;
           n.detail = ev.error ? `Le robot s'est arrêté : ${ev.error}` : "Indexation arrêtée. Relancez en mode différentiel pour reprendre là où il s'est arrêté.";
           toast(n.detail, { tone: "amber", ms: 15000 });
         }
@@ -58,160 +75,144 @@ export function Indexation() {
     });
   }, [app.indexing.last]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const start = async () => {
+  const started = useCallback(() => setLive(() => ({ ...IDLE, status: "EN COURS", detail: "Analyse de l'arborescence…" })), [setLive]);
+  const start = useCallback(async (full = false) => {
     try {
-      await call("index_start", { source: src });
-      setLive({ total: 0, done: 0, pct: 0, detail: "Analyse de l'arborescence…", current: "", stages: [0, 0, 0, 0], status: "EN COURS" });
+      const src = app.settings?.source_root || "";
+      await call("index_start", { source: src, full });
+      started();
     } catch (e) { toast(errMsg(e), { tone: "red" }); }
-  };
-  const stop = async () => {
-    const force = live.status === "ARRÊT…";
-    await call("index_stop", { force });
-    setLive((l) => ({ ...l, status: "ARRÊT…", detail: force ? "Arrêt forcé." : "Arrêt demandé : fin des fichiers en cours… (cliquer encore pour forcer)" }));
-  };
+  }, [app.settings, started, toast]);
+  const stop = useCallback(async (forceIt = false) => {
+    const force = forceIt || live.status === "ARRÊT…";
+    await call("index_stop", { force }).catch(() => undefined);
+    setLive((l) => ({ ...l, status: "ARRÊT…", stopAt: l.stopAt ?? Date.now(),
+      detail: force ? "Arrêt forcé." : "Arrêt demandé : fin des fichiers en cours… (cliquer encore pour forcer)" }));
+  }, [live.status, setLive]);
+  const reset = useCallback(() => setLive(() => IDLE), [setLive]);
+  return { live, start, stop, started, reset };
+}
+export type IndexRun = ReturnType<typeof useIndexRun>;
+
+export function Indexation() {
+  const app = useApp();
+  const toast = useToast();
+  const dialogs = useDialogs();
+  const run = useIndexRun();
+  const { live } = run;
+  const running = app.indexing.running || live.status === "EN COURS" || live.status === "ARRÊT…";
+  const [nav, setNav] = useState<IxNav>({ view: keptView, nonce: 0 });
+  const [ov, setOv] = useState<Overview | null>(null);
+  const [now, setNow] = useState(Date.now());
+  const loading = useRef(false);
+  keptView = nav.view;
+
+  const refresh = useCallback(() => {
+    if (loading.current) return;
+    loading.current = true;
+    void call<Overview>("index_overview").then(setOv).catch((e) => toast(errMsg(e), { tone: "red" })).finally(() => { loading.current = false; });
+  }, [toast]);
+  // chiffres tenus à jour (impressions des autres écrans, robot qui écrit), comme la 1.x : toutes les 10 s
+  useEffect(() => {
+    refresh();
+    const t = window.setInterval(() => { refresh(); app.refreshStats(); }, 10000);
+    return () => window.clearInterval(t);
+  }, [refresh]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (app.indexing.last?.type === "exit" || app.indexing.last?.type === "done") refresh(); }, [app.indexing.last, refresh]);
+  // compte à rebours de l'arrêt forcé
+  useEffect(() => {
+    if (!live.stopAt) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [live.stopAt]);
+
+  const go = useCallback((view: "etat" | "anomalies", cause?: string) => {
+    setNav((n) => ({ view, cause, nonce: n.nonce + 1 }));
+    refresh();                 // compteurs de la barre à jour à chaque changement de vue
+  }, [refresh]);
+  const full = !app.settings?.differential;
+  const launch = () => { if (!running) void run.start(); };
+  useShortcuts({
+    "ctrl+enter": () => launch(),
+    "ctrl+tab": () => go(nav.view === "etat" ? "anomalies" : "etat"),
+    "ctrl+shift+tab": () => go(nav.view === "etat" ? "anomalies" : "etat"),
+  });
+
+  const lastPass = ov?.passes?.[0];
+  const pct = live.status === "EN COURS" ? ` · ${live.pct} %` : "";
+  let chip: { text: string; tone: "green" | "blue" | "amber" | "gray" | "red"; icon: string };
+  if (live.status === "ARRÊT…") chip = { text: "ARRÊT EN COURS…", tone: "amber", icon: "stop" };
+  else if (running) chip = { text: `EN COURS${pct}`, tone: "blue", icon: "refresh" };
+  else if (live.status === "TERMINÉ") chip = { text: `TERMINÉ · ${live.detail.split(" · ")[0] || ""}`, tone: "green", icon: "check" };
+  else if (live.status === "ARRÊTÉ") chip = { text: live.error ? "ARRÊT ANORMAL" : "ARRÊTÉE · relancer en différentielle", tone: live.error ? "red" : "amber", icon: "alert" };
+  else if (lastPass && (!lastPass.fin || lastPass.arretee)) chip = { text: `INTERROMPUE · passe du ${(ov?.derniere_indexation || "").slice(0, 5)} ${(ov?.derniere_indexation || "").slice(11)}`.trim(), tone: "amber", icon: "alert" };
+  else if (ov?.derniere_indexation) chip = { text: `À JOUR · passe du ${ov.derniere_indexation.slice(0, 5)} ${ov.derniere_indexation.slice(11)}`, tone: "green", icon: "check" };
+  else chip = { text: ov ? "JAMAIS INDEXÉ" : "…", tone: "gray", icon: "info" };
+  const todo = ov?.anomalies.a_traiter ?? 0;
+  const forceIn = live.stopAt ? Math.max(0, FORCE_AFTER_S - Math.floor((now - live.stopAt) / 1000)) : null;
+
   const reset = async () => {
     try {
       const n = await call<Record<string, number>>("index_impact");
-      const fr = (x: number) => x.toLocaleString("fr-FR");
-      const i = await ask({
+      const i = await dialogs.ask({
         title: "Vider l'index",
         danger: true,
         text: `Seront retirés : ${fr(n.releves)} relevé(s) indexé(s), ${fr(n.fichiers)} fichier(s), ${fr(n.anomalies)} anomalie(s) et les aperçus Word en cache.\n\n`
-          + `Seront conservés : le journal (${fr(n.journal)} ligne(s)), le registre des délivrances (${fr(n.delivrances)} document(s)) et les demandes (${fr(n.demandes)}).`
+          + `Seront conservés : le journal (${fr(n.journal)} ligne(s)), le registre des délivrances (${fr(n.delivrances)} document(s)) et les demandes (${fr(n.demandes)}), `
+          + "ainsi que les anomalies marquées « vues » et l'historique des passes."
           + (n.demandes_ouvertes ? `\n\nAttention : ${n.demandes_ouvertes} demande(s) en cours. Leurs relevés devront être ajoutés à nouveau après la réindexation.` : ""),
         details: "Les archives d'origine ne sont jamais touchées. La recherche au guichet sera vide jusqu'à la fin de la réindexation.",
         choices: ["Vider et tout réindexer", "Vider seulement"],
       });
       if (i < 0) return;
-      const r = await call<{ releves: number; stats: any }>("index_reset", { confirm: "VIDER" });
+      const r = await call<{ releves: number }>("index_reset", { confirm: "VIDER" });
       app.refreshStats();
-      setLive({ total: 0, done: 0, pct: 0, detail: "", current: "", stages: [0, 0, 0, 0], status: "PRÊT" });
+      run.reset();
+      refresh();
       toast(`Index vidé : ${fr(r.releves)} relevé(s) retiré(s). Journal, registre et demandes conservés.`, { tone: "green", ms: 12000 });
       if (i === 0) {
-        await call("index_start", { source: src, full: true });
-        setLive({ total: 0, done: 0, pct: 0, detail: "Analyse de l'arborescence…", current: "", stages: [0, 0, 0, 0], status: "EN COURS" });
+        await call("index_start", { source: app.settings?.source_root || "", full: true });
+        run.started();
       }
     } catch (e) { toast(errMsg(e), { tone: "red" }); }
   };
-  const integrity = async () => {
-    try {
-      const r = await call<{ orphelins: number }>("check_integrity");
-      if (r.orphelins) toast(`${r.orphelins} lien(s) orphelin(s) trouvé(s) : fichiers déplacés, renommés ou supprimés (voir les anomalies). Relancez une indexation différentielle sur le nouveau dossier : seuls les fichiers déplacés seront relus.`, { tone: "amber", ms: 15000 });
-      else toast("Intégrité vérifiée : tous les fichiers indexés sont présents.");
-      setNiveau(""); void call<Anomalie[]>("anomalies", { niveau: null }).then(setAnoms);
-      app.refreshStats();
-    } catch (e) { toast(errMsg(e), { tone: "red" }); }
-  };
-  const reveal = async (path: string) => {
-    if (!(await sx.reveal(path))) toast("Fichier introuvable à cet emplacement (déplacé ou renommé) : dossier le plus proche ouvert.", { tone: "amber", sound: false });
-  };
-  const tone = live.status === "EN COURS" ? "blue" : live.status === "TERMINÉ" ? "green" : live.status.startsWith("ARR") ? "amber" : "gray";
-  const st = app.stats;
 
   return (
-    <div className="page scroll">
-      <header className="header">
-        <div className="titles"><div className="eyebrow">Robot d'indexation · processus séparé</div><h1 className="h1">Indexation des archives</h1></div>
-        <Badge text={live.status} tone={tone} big />
-      </header>
-      {/* chiffres de supervision, venus du guichet (2.1) */}
-      <StatsRow />
-      <section className="card">
-        <div className="row">
-          <Chip icon="folder" tone="blue" />
-          <label className="lbl grow">Dossier racine des archives (lu en lecture seule, jamais modifié)
-            <input className="field" value={src} onChange={(e) => setSrc(e.target.value)} placeholder="\\\\serveur\\archives ou D:\\Archives" />
-          </label>
-          <button className="btn ghost" style={{ marginTop: 18 }} onClick={async () => { const d = await sx.pickFolder({ title: "Dossier racine des archives", defaultPath: src || undefined }); if (d) setSrc(d); }}>Parcourir…</button>
+    <div className="ix-page" data-testid="indexation">
+      <section className="card topbar ix-top">
+        <div className="ix-title"><span className="eyebrow">Robot d'indexation</span><b>Indexation</b></div>
+        <div className="ix-vsep" />
+        <div className="fseg" role="tablist" aria-label="Vues de l'indexation (Ctrl+Tab)">
+          <button role="tab" aria-selected={nav.view === "etat"} className={nav.view === "etat" ? "on" : ""} onClick={() => go("etat")} data-testid="ix-view-etat" title="État du fonds (Ctrl+Tab)">
+            <Icon name="database" size={14} /> État du fonds</button>
+          <button role="tab" aria-selected={nav.view === "anomalies"} className={nav.view === "anomalies" ? "on" : ""} onClick={() => go("anomalies")} data-testid="ix-view-anomalies" title="Anomalies à traiter (Ctrl+Tab)">
+            <Icon name="alert" size={14} /> Anomalies<span className="n" data-testid="ix-anom-count">{ov ? fr(todo) : ""}</span></button>
         </div>
-        <div className="muted tiny">Lecture seule : aucune écriture, suppression ni renommage dans ce dossier. Index local : <span className="mono selectable">{app.info?.db_path || "—"}</span></div>
-        <div className="row wrap" data-testid="index-options">
-          <Switch blue checked={!!s?.differential} onChange={(v) => void app.saveSettings({ differential: v })} label="Réindexation différentielle" title="Ignore les fichiers inchangés depuis la dernière passe" />
-          <Switch blue checked={!!s?.ocr_enabled} onChange={(v) => void app.saveSettings({ ocr_enabled: v })} label="OCR des scans" title="Tesseract sur les PDF d'imprimante (plus lent)" />
-          <Switch blue checked={!!s?.ocr_preprocess} onChange={(v) => void app.saveSettings({ ocr_preprocess: v })} label="Deskew + contraste Otsu" title="Redresse les scans de travers avant l'OCR" />
-          <Switch blue checked={!!s?.word_com_enabled} onChange={(v) => void app.saveSettings({ word_com_enabled: v })} label="Passerelle COM Word" title="Lit les .doc 97-2003 avec Word (sinon LibreOffice)" />
-          <Switch blue checked={!!s?.docx_convert_at_index} onChange={(v) => void app.saveSettings({ docx_convert_at_index: v })} label="Préconvertir les .docx" title="Aperçu immédiat, mais indexation bien plus lente. Sinon : aperçu produit à la 1re consultation." />
-        </div>
-        <div className="row wrap">
-          <span className="muted small">Processus parallèles : {s?.index_workers ? s.index_workers : `automatique (${app.info?.default_workers ?? "?"})`}</span>
-          <button className="btn ghost sm" onClick={() => app.openSettings("indexation")} title={(s?.exclusions || []).join("\n") || "Aucun dossier ni motif exclu"} data-testid="index-exclusions">
-            <Icon name="filter" size={14} />{s?.exclusions?.length ? `Exclusions (${s.exclusions.length})…` : "Exclure des sous-dossiers…"}</button>
-          <button className="btn ghost sm" onClick={() => void integrity()} disabled={running} data-testid="index-integrity" title="Fichiers indexés déplacés, renommés ou supprimés"><Icon name="link" size={14} />Vérification d'intégrité (liens orphelins)</button>
-          <span className="grow" />
-          {running ? <button className="btn ink" onClick={() => void stop()} data-testid="index-stop"><Icon name="stop" />Arrêter</button>
-            : <button className="btn primary" onClick={() => void start()} data-testid="index-start"><Icon name="play" />Lancer l'indexation</button>}
-        </div>
-        <div className="progress"><div style={{ width: `${live.pct}%` }} /></div>
-        <div className="row small"><span className="h3">{live.pct} %</span><span className="muted grow">{live.detail}</span></div>
-        <div className="muted tiny ellipsis">{live.current}</div>
-        <div className="stats-grid">
-          {["Fichiers trouvés", "Pages extraites", "Blocs identifiés", "Relevés écrits"].map((l, i) => (
-            <div key={l} className="soft"><div className="eyebrow">{l}</div><div className="kpi"><span className="v">{live.stages[i].toLocaleString("fr-FR")}</span></div></div>
-          ))}
-        </div>
-      </section>
-      <div className="stats-grid five" data-testid="index-kpis">
-        {([["doc", "blue", "Relevés indexés", st?.releves], ["layers", "violet", "Étudiants distincts", st?.etudiants], ["eye", "green", "Pages analysées", st?.pages],
-          ["link", "amber", "Relevés sur plusieurs pages", st?.multi_pages], ["x", "red", "Fichiers en échec", st?.echecs]] as const).map(([icon, t, label, n]) => (
-          <div key={label} className="card kpi" style={{ flexDirection: "row", padding: 14 }}><Chip icon={icon} tone={t} size={36} />
-            <div style={{ minWidth: 0 }}><div className="eyebrow ellipsis" title={label}>{label}</div><div className="kpi"><span className="v" style={t === "red" && n ? { color: "var(--red)" } : undefined}>{st ? fr(n) : "—"}</span></div></div></div>
-        ))}
-      </div>
-      <div className="row" style={{ alignItems: "stretch", gap: 14 }}>
-        <section className="card" style={{ flex: 1 }}>
-          <div className="eyebrow">Fonds documentaire</div><h2 className="h3">Formats détectés</h2>
-          {Object.entries(st?.formats || {}).filter(([k]) => FORMATS[k]).map(([k, n], _i, arr) => {
-            const max = Math.max(1, ...arr.map(([, x]) => x));
-            return (<div key={k} className="col" style={{ gap: 3 }}>
-              <div className="row small"><span className="grow">{FORMATS[k][0]}</span><span className="muted">{fr(n)}</span></div>
-              <div style={{ height: 8, borderRadius: 4, background: "var(--line-3)" }}><div style={{ height: 8, borderRadius: 4, width: `${(n * 100) / max}%`, background: FORMATS[k][1] }} /></div>
-            </div>);
-          })}
-          {!Object.keys(st?.formats || {}).length && <div className="muted small">Aucun fichier indexé.</div>}
-        </section>
-        <section className="card" style={{ flex: 2 }}>
-          <div className="eyebrow">Relevés par année académique</div>
-          <h2 className="h3">{st?.annees?.length ? `${fr(st.releves)} relevés · ${st.annees[0][0].slice(0, 4)} → ${st.annees[st.annees.length - 1][0].slice(-4)}` : "—"}</h2>
-          <div className="row" style={{ alignItems: "flex-end", height: 110, gap: 6 }} data-testid="index-years">
-            {(st?.annees || []).map(([a, n]) => {
-              const max = Math.max(1, ...(st?.annees || []).map(([, x]) => x));
-              return (<div key={a} className="col" style={{ alignItems: "center", gap: 3, flex: 1 }} title={`${a} : ${fr(n)}`}>
-                <div style={{ height: (n * 80) / max, width: "100%", maxWidth: 30, borderRadius: 6, background: "#1D4ED8" }} />
-                <span className="tiny muted">{a.length >= 9 ? `${a.slice(2, 4)}-${a.slice(7, 9)}` : a}</span></div>);
-            })}
+        <span data-testid="index-status"><Badge text={chip.text} tone={chip.tone} big title={live.detail || undefined} /></span>
+        <span className="grow" />
+        {!running && (
+          <div className="fseg" role="radiogroup" aria-label="Mode de la prochaine passe" data-testid="index-mode">
+            <button role="radio" aria-checked={!full} className={!full ? "on" : ""} onClick={() => void app.saveSettings({ differential: true })}
+              title="Ne relit que les fichiers nouveaux ou modifiés (enregistré tout de suite)">Différentielle</button>
+            <button role="radio" aria-checked={full} className={full ? "on" : ""} onClick={() => void app.saveSettings({ differential: false })}
+              title="Relit tout le fonds : plusieurs heures (enregistré tout de suite)">Complète</button>
           </div>
-        </section>
-      </div>
-      <section className="card">
-        <div className="row"><h2 className="h2 grow">Base d'index</h2>
-          <span className="muted small">{st ? `${st.releves.toLocaleString("fr-FR")} relevés · ${st.etudiants.toLocaleString("fr-FR")} étudiants · ${st.fichiers.toLocaleString("fr-FR")} fichiers · dernière passe : ${st.derniere_indexation || "jamais"}` : ""}</span></div>
-        <div className="row soft">
-          <Icon name="refresh" />
-          <span className="grow small">Recommencer de zéro : retire tous les relevés indexés et les aperçus en cache, puis relit toutes les archives. Le journal, le registre des délivrances et les demandes sont conservés.</span>
-          <button className="btn danger" disabled={running} onClick={() => void reset()} data-testid="index-reset" title={running ? "Arrêtez d'abord l'indexation en cours" : ""}><Icon name="trash" />Vider l'index…</button>
-        </div>
+        )}
+        {running ? (
+          <>
+            {live.status === "ARRÊT…" && <span className="muted small ix-wide">{forceIn ? `arrêt forcé dans ${forceIn} s` : "arrêt forcé…"}</span>}
+            {live.status === "ARRÊT…"
+              ? <button className="btn danger" onClick={() => void run.stop(true)} data-testid="index-stop" title="Arrête tout de suite le robot (et Word)"><Icon name="stop" />Forcer l'arrêt</button>
+              : <button className="btn ink" onClick={() => void run.stop()} data-testid="index-stop" title="Finit les fichiers en cours puis s'arrête"><Icon name="stop" />Arrêter</button>}
+          </>
+        ) : (
+          <button className="btn primary ix-go" onClick={launch} data-testid="index-start" title={`Lancer une passe ${full ? "complète" : "différentielle"} (Ctrl+Entrée)`}>
+            <Icon name="play" size={16} />Lancer l'indexation<span className="kbd ix-wide">Ctrl+Entrée</span></button>
+        )}
       </section>
-      <section className="card" style={{ minHeight: 280 }}>
-        <div className="row"><h2 className="h2 grow">Anomalies</h2>
-          <Seg value={niveau} options={[["", "Toutes"], ["ERREUR", "Erreurs"], ["AVERTISSEMENT", "Avertissements"], ["INFO", "Infos"]]} onChange={setNiveau} /></div>
-        <div className="table-wrap" style={{ maxHeight: 360 }}>
-          <table className="grid">
-            <colgroup><col style={{ width: 130 }} /><col style={{ width: 120 }} /><col /><col style={{ width: 150 }} /></colgroup>
-            <thead><tr><th>Date</th><th>Niveau</th><th>Fichier · message</th><th /></tr></thead>
-            <tbody>
-              {anoms.map((a) => (
-                <tr key={a.id}>
-                  <td className="small">{a.horodatage.slice(0, 16)}</td>
-                  <td><Badge text={a.niveau} tone={a.niveau === "ERREUR" ? "red" : a.niveau === "AVERTISSEMENT" ? "amber" : "blue"} /></td>
-                  <td className="cell2"><div className="l1 ellipsis selectable" title={a.chemin || ""}>{a.chemin ? short(a.chemin, 80) : "—"}</div><div className="l2 selectable">{a.message}</div></td>
-                  <td>{a.chemin && <button className="btn ghost sm" onClick={() => void reveal(a.chemin!)} title="Ouvrir l'emplacement du fichier">{a.action || "Ouvrir le dossier"}</button>}</td>
-                </tr>
-              ))}
-              {!anoms.length && <tr><td colSpan={4} className="muted" style={{ textAlign: "center", padding: 20 }}>Aucune anomalie.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-      </section>
+      {nav.view === "etat"
+        ? <IndexDashboard ov={ov} run={run} running={running} forceIn={forceIn} go={go} refresh={refresh} onReset={() => void reset()} />
+        : <AnomalyTriage nav={nav} running={running} refreshOverview={refresh} />}
     </div>
   );
 }
