@@ -772,6 +772,413 @@ class Service:
         out, n = apply_text(text or "", compiled)
         return {"text": out, "count": n, "avertissements": rule_warnings(compiled)}
 
+    # ---- réglages / extraction ----
+    # Feuille des Réglages (outils du poste, diagnostic, aperçu AVANT / APRÈS des remplacements) et écrans
+    # Extraction / Journal des actions (toutes les lignes, filtres avec effectifs). Bloc délimité, en fin de classe.
+
+    # .................................................................. outils du poste, diagnostic
+    def tools_status(self, tesseract_cmd: str | None = None, soffice_cmd: str | None = None,
+                     probe_word: bool = False) -> dict:
+        """Tesseract / LibreOffice / Word : trouvés ou non (chemin, version) et ce que leur absence coûte, chiffré
+        d'après l'index. ``tesseract_cmd`` / ``soffice_cmd`` : chemins saisis mais pas encore enregistrés."""
+        from . import poste
+        c = self.db.conn
+        one = lambda sql: c.execute(sql).fetchone()[0] or 0  # noqa: E731
+        fmt = {k: n for k, n in c.execute("SELECT type_fichier, COUNT(*) FROM fichiers GROUP BY type_fichier")}
+        return {
+            "tesseract": poste.tesseract_status(self.s.tesseract_cmd if tesseract_cmd is None else tesseract_cmd),
+            "libreoffice": poste.soffice_status(self.s.soffice_cmd if soffice_cmd is None else soffice_cmd),
+            "word": poste.word_status(self.s.word_com_enabled, bool(probe_word)),
+            "ocr_enabled": bool(self.s.ocr_enabled),
+            "counts": {"scans_en_attente": one("SELECT COUNT(DISTINCT chemin) FROM anomalies "
+                                               "WHERE message LIKE 'PDF scanné non lu%'"),
+                       "scans": fmt.get("PDF_SCAN", 0), "doc": fmt.get("DOC", 0), "docx": fmt.get("DOCX", 0),
+                       "anomalies": one("SELECT COUNT(*) FROM anomalies")},
+        }
+
+    def diagnostic(self) -> dict:
+        """Versions, dossiers et fichiers du poste (à transmettre à la Cellule informatique)."""
+        from . import poste
+        from .config import data_dir
+        db_size = poste.file_size(self.db_path)
+        cache_bytes, cache_n = poste.dir_size(Path(self.cache_dir))
+        _b, previews = poste.dir_size(Path(self.cache_dir), ".pdf")
+        try:
+            exports_dir = str(self.s.exports_root_dir())
+        except OSError:
+            exports_dir = ""
+        st = self.db.stats()
+        return {"app": APP_NAME, "version": APP_VERSION, **poste.runtime(),
+                "data_dir": str(data_dir()), "logs_dir": str(data_dir() / "logs"), "config_path": str(config_path()),
+                "db_path": str(self.db_path), "db_bytes": db_size, "db_reseau": is_network_path(str(self.db_path)),
+                "cache_dir": str(self.cache_dir), "cache_bytes": cache_bytes, "cache_fichiers": cache_n,
+                "cache_apercus": previews, "exports_dir": exports_dir, "releves": st["releves"],
+                "fichiers": st["fichiers"], "derniere_indexation": self.db.get_meta("derniere_indexation"),
+                "convertisseur": self._rp_converter_name(), "regles_actives": self.rules_active,
+                "config_db_path": self.s.db_path, "config_cache_dir": self.s.cache_dir}
+
+    def cache_clear(self, confirm: str = "") -> dict:
+        """« Vider le cache d'aperçu » : les aperçus Word seront refaits à la consultation (l'index reste)."""
+        if confirm != "VIDER":
+            raise ServiceError("Confirmation manquante.")
+        import shutil
+        removed = kept = 0
+        cache = Path(self.cache_dir)
+        if cache.exists():
+            for f in cache.iterdir():
+                try:
+                    shutil.rmtree(f) if f.is_dir() else f.unlink()
+                    removed += 1
+                except OSError:
+                    kept += 1          # aperçu ouvert en ce moment : il sera remplacé plus tard
+        self._log("CACHE VIDÉ", None, f"{removed} élément(s) du cache d'aperçu supprimés"
+                                      + (f", {kept} en cours d'utilisation conservés" if kept else ""))
+        return {"supprimes": removed, "conserves": kept}
+
+    # .................................................................. remplacements : aperçu AVANT / APRÈS
+    def _rp_converter_name(self) -> str:
+        from .extractors import WordConverter
+        try:
+            return WordConverter(self.s).backend()
+        except Exception:
+            return "aucun"
+
+    def rules_preview_releves(self, q: str = "", limit: int = 40) -> list[dict]:
+        """Relevés Word proposés pour l'essai des règles : un par fichier (ou ceux du matricule / nom cherché)."""
+        sql = ("SELECT r.id, r.matricule, r.nom_complet, r.niveau, r.annee_academique, r.semestre, f.type_fichier, "
+               "f.chemin FROM etudiants_releves r JOIN fichiers f ON f.id = r.fichier_id "
+               "WHERE f.type_fichier IN ('DOC', 'DOCX')")
+        args: list = []
+        q = (q or "").strip()
+        if q:
+            sql += " AND (r.matricule LIKE ? OR r.nom_norm LIKE ?)"
+            args += [f"%{norm_matricule(q)}%", f"%{norm_text(q)}%"]
+        else:
+            sql += " AND r.id IN (SELECT MIN(r2.id) FROM etudiants_releves r2 GROUP BY r2.fichier_id)"
+        sql += " ORDER BY r.annee_academique DESC, r.matricule LIMIT ?"
+        args.append(max(1, min(int(limit), 200)))
+        out = []
+        for row in self.db.conn.execute(sql, args).fetchall():
+            ext = ".doc" if row["type_fichier"] == "DOC" else ".docx"
+            label = " · ".join(x for x in (row["matricule"], row["niveau"] or "", row["annee_academique"] or "") if x)
+            out.append({"id": row["id"], "label": f"{label} ({ext})", "nom": row["nom_complet"],
+                        "fichier": Path(row["chemin"]).name})
+        return out
+
+    def _rp_work(self, rel: Releve, converter=None) -> Path | None:
+        """.docx de travail du relevé : l'original (.docx) ou la conversion en cache d'un .doc ; None si elle
+        n'existe pas encore et qu'aucun convertisseur n'est fourni."""
+        from .preview import ensure_intermediate_docx, intermediate_docx
+        src = Path(rel.chemin)
+        if not src.exists():
+            raise ServiceError(f"Fichier source introuvable : {src.name}")
+        if rel.type_fichier == "DOCX":
+            return src
+        inter = intermediate_docx(rel.chemin, Path(self.cache_dir))
+        if converter is not None:
+            return ensure_intermediate_docx(rel.chemin, Path(self.cache_dir), converter)
+        return inter if inter.exists() else None
+
+    def _rp_word_thread(self, fn):
+        """Exécute ``fn(convertisseur)`` dans le fil des conversions de l'aperçu (Word exige toujours le même fil)."""
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
+        from .extractors import WordConverter
+        pv = self.previews
+
+        def job():
+            if pv._converter is None:
+                pv._converter = WordConverter(self.s)
+            return fn(pv._converter)
+        try:
+            return pv._pool.submit(job).result(timeout=pv.job_timeout)
+        except FuturesTimeout as exc:
+            raise ServiceError("Le convertisseur ne répond plus : aperçu des règles abandonné.") from exc
+
+    def rules_preview(self, rules: list, releve_id: int | None = None, text: str | None = None,
+                      rendu: bool = False, req: int = 0) -> dict:
+        """Aperçu AVANT / APRÈS des règles (rien n'est enregistré). Sans ``releve_id`` : sur le texte libre.
+        Avec : sur l'en-tête du relevé Word — rendu typographique immédiat, puis (``rendu``) rendu du moteur :
+        copie corrigée convertie par Word / LibreOffice, haut de la page en image, textes retirés / ajoutés situés,
+        et verdict du contrôle de fidélité de l'aperçu réel. ``req`` croissant : un rendu dépassé est abandonné."""
+        from . import rules_preview as rp
+        compiled = self._check_rules(rules)
+        warnings = rule_warnings(compiled)
+        active = len(compiled)
+        if releve_id in (None, "", 0):
+            avant, apres, out, n = rp.typographic_text(text or "", compiled)
+            return {"mode": "texte", "avant": avant, "apres": apres, "text": out, "count": n, "regles": active,
+                    "avertissements": warnings, "ecartees": []}
+        rel = self._get(int(releve_id))
+        if not rel.is_word:
+            raise ServiceError("L'essai des règles se fait sur un relevé Word (.doc / .docx).")
+        label = f"{rel.matricule} · {rel.niveau or '?'} · {rel.annee_academique or '?'}"
+        base = {"mode": "releve", "releve_id": rel.id, "releve": label, "fichier": Path(rel.chemin).name,
+                "regles": active, "avertissements": warnings}
+        if not rendu:
+            work = self._rp_work(rel)
+            if work is None:
+                return dict(base, count=None, avant=[], apres=[], ecartees=[],
+                            attente="Fichier .doc pas encore converti : l'en-tête apparaît avec le rendu du moteur.")
+            copy, report, n = rp.rewrite_copy(work, compiled)
+            try:
+                avant, apres = rp.typographic_releve(work, copy, rel.matricule, rel.numero_page)
+            finally:
+                copy.unlink(missing_ok=True)
+            return dict(base, count=n, avant=avant, apres=apres, ecartees=report.skipped)
+        # ---- rendu du moteur
+        self._rp_latest = max(int(req or 0), getattr(self, "_rp_latest", 0))
+        if self.previews is None or not self._rp_converter_name() or self._rp_converter_name() == "aucun":
+            return dict(base, rendu=None, sans_convertisseur=True)
+        from . import layout_check
+        from .preview import _signature, remap_pages, render_original
+
+        def job(conv):
+            if int(req or 0) < getattr(self, "_rp_latest", 0):
+                return None                                  # réglage déjà modifié : rendu inutile
+            work = self._rp_work(rel, conv)
+            copy, report, n = rp.rewrite_copy(work, compiled)
+            try:
+                before = render_original(rel.chemin, rel.type_fichier, self.s, conv, work)
+                key = rp.render_key(rel.chemin, _signature(Path(work)), rules)
+                after = rp.cached_render(conv, copy, key, Path(rel.chemin).name) if n else before
+            finally:
+                copy.unlink(missing_ok=True)
+            return before, after, report, n
+        res = self._rp_word_thread(job)
+        if res is None:
+            return dict(base, stale=True)
+        before, after, report, n = res
+        siblings = self.db.releves_of_file(rel.fichier_id)
+        pb = remap_pages(before, siblings, rel.chemin)[0].get(rel.id, (rel.numero_page, rel.page_fin))[0]
+        pa = remap_pages(after, siblings, rel.chemin)[0].get(rel.id, (pb, pb))[0] if n else pb
+        removed, added = rp.changed_texts(report.replacements)
+        img_b = rp.crop_page(before, pb, rel.matricule, removed, [])
+        img_a = rp.crop_page(after, pa, rel.matricule, [], added, frac=img_b["frac"], top=img_b["top"])
+        motif = None
+        if n:
+            try:
+                motif = layout_check.compare(before, after, report.replacements)
+            except Exception as exc:
+                motif = f"contrôle du rendu impossible ({exc.__class__.__name__})"
+        return dict(base, count=n, ecartees=report.skipped, motif=motif, convertisseur=self._rp_converter_name(),
+                    rendu={"avant": img_b, "apres": img_a})
+
+    # .................................................................. extraction : toutes les lignes, effectifs
+    EXT_MENTIONS = ("Excellent", "Très bien", "Bien", "Assez bien", "Passable", "Médiocre", "Éliminé")
+    EXT_COLS = ("id", "matricule", "nom", "fil", "annee", "periode", "moyenne", "mention", "statut", "niveau")
+    EXT_EXTRA = {"session": lambda r: r.session or "", "decision": lambda r: r.decision or "",
+                 "credits": lambda r: r.credits if r.credits is not None else "", "grade": lambda r: r.grade or "",
+                 "mgp": lambda r: r.mgp or "", "naissance": lambda r: r.date_connue or ""}
+
+    def _ext_base(self) -> list[tuple]:
+        """Tous les relevés (un exemplaire par relevé, ordre de Database.extraction), avec ce qu'il faut pour
+        filtrer vite : (relevé, année, mention, filière, admis). Gardé tant que l'index ne change pas."""
+        from . import exporter
+        sig = tuple(self.db.conn.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM etudiants_releves").fetchone()) \
+            + (self.db.get_meta("derniere_indexation"),)
+        lock = self.__dict__.setdefault("_ext_lock", threading.Lock())
+        with lock:
+            cache = getattr(self, "_ext_cache", None)
+            if cache and cache[0] == sig:
+                return cache[1]
+            out = []
+            for r in self.db.extraction(None, None, None, "tous", False):
+                a = r.annee_academique or ""
+                y = int(a[:4]) if a[:4].isdigit() else None
+                out.append((r, y, exporter.mention(r.moyenne, r.grade), r.filiere_code, r.is_success))
+            self._ext_cache = (sig, out)
+            return out
+
+    @staticmethod
+    def _ext_last(items: list[tuple]) -> list[tuple]:
+        """« Dernier niveau atteint » : même choix que Database.extraction (dernier relevé de chaque étudiant)."""
+        best: dict[str, tuple] = {}
+        for it in items:
+            r = it[0]
+            cur = best.get(r.matricule)
+            if cur is None or (r.niveau_num, r.semestre or 0, r.annee_academique or "", it[4]) > \
+                    (cur[0].niveau_num, cur[0].semestre or 0, cur[0].annee_academique or "", cur[4]):
+                best[r.matricule] = it
+        return sorted(best.values(), key=lambda it: (it[0].annee_academique or "", it[0].nom_norm))
+
+    def _ext_rows(self, filiere=None, year_from=None, year_to=None, statut="tous", dernier_niveau=True,
+                  niveaux=None, mentions=None, base=None, skip: str = "") -> list[tuple]:
+        base = self._ext_base() if base is None else base
+        y1, y2 = (year_from or None), (year_to or None)
+        items = [it for it in base if (not filiere or it[3] == filiere)
+                 and (y1 is None or (it[1] is not None and it[1] >= y1))
+                 and (y2 is None or (it[1] is not None and it[1] <= y2))]
+        if dernier_niveau:
+            items = self._ext_last(items)
+        return self._ext_post(items, statut, niveaux, mentions, skip)
+
+    @staticmethod
+    def _ext_post(items, statut, niveaux, mentions, skip: str = "") -> list[tuple]:
+        nv = set(int(x) for x in niveaux) if niveaux and skip != "niveaux" else None
+        mt = set(mentions) if mentions is not None and skip != "mentions" else None
+        st = statut if skip != "statut" else "tous"
+        return [it for it in items
+                if (st == "tous" or (st == "admis") == it[4])
+                and (nv is None or it[0].niveau_num in nv)
+                and (mt is None or (it[2] or "Sans mention") in mt)]
+
+    def extraction_view(self, filiere: str | None = None, year_from: int | None = None, year_to: int | None = None,
+                        statut: str = "tous", dernier_niveau: bool = True, niveaux: list | None = None,
+                        mentions: list | None = None, extra_cols: list | None = None) -> dict:
+        """Extraction Décanat sans plafond : toutes les lignes (colonnes compactes), effectifs de chaque filtre
+        (filière, année, niveau, statut, mention : calculés sans ce filtre-là, avec les autres)."""
+        t0 = time.perf_counter()
+        base = self._ext_base()
+        f = dict(filiere=filiere or None, year_from=year_from, year_to=year_to, statut=statut or "tous",
+                 dernier_niveau=bool(dernier_niveau), niveaux=niveaux or None, mentions=mentions)
+        y1, y2 = (year_from or None), (year_to or None)
+        in_years = [it for it in base if (y1 is None or (it[1] is not None and it[1] >= y1))
+                    and (y2 is None or (it[1] is not None and it[1] <= y2))]
+        last = self._ext_last if f["dernier_niveau"] else (lambda items: items)
+        # effectifs par filière : le « dernier niveau atteint » est choisi DANS chaque filière (Database.extraction)
+        by_fil: dict = {}
+        for it in in_years:
+            by_fil.setdefault(it[3], []).append(it)
+        post = lambda items, skip="": self._ext_post(items, f["statut"], f["niveaux"], mentions, skip)  # noqa: E731
+        fil_counts = {code or "?": len(post(last(items))) for code, items in by_fil.items()}
+        everyone = last(in_years)
+        scoped = last(by_fil.get(f["filiere"], [])) if f["filiere"] else everyone
+        rows = post(scoped)
+        # effectifs par année : sans le filtre des années
+        per_year: dict[str, int] = {}
+        for it in self._ext_rows(**dict(f, year_from=None, year_to=None), base=base):
+            a = it[0].annee_academique or "?"
+            per_year[a] = per_year.get(a, 0) + 1
+        niv: dict[int, int] = {}
+        for it in post(scoped, "niveaux"):
+            niv[it[0].niveau_num] = niv.get(it[0].niveau_num, 0) + 1
+        men: dict[str, int] = {}
+        for it in post(scoped, "mentions"):
+            men[it[2] or "Sans mention"] = men.get(it[2] or "Sans mention", 0) + 1
+        sts = post(scoped, "statut")
+        n_ok = sum(1 for it in sts if it[4])
+        extra = [c for c in (extra_cols or []) if c in self.EXT_EXTRA]
+        mi = {m: i for i, m in enumerate(self.EXT_MENTIONS)}
+        data = [[r.id, r.matricule, r.nom_complet, r.filiere_code or "", r.annee_academique or "", r.periode,
+                 r.moyenne or "", mi.get(m, -1), r.statut or "", r.niveau_num]
+                + [self.EXT_EXTRA[c](r) for c in extra] for r, _y, m, _f, _ok in rows]
+        today = datetime.now()
+        dest = str(Path(exports.EXTRACTIONS) / f"{today:%Y}" / f"{today:%m}")   # sans créer le dossier
+        return {"count": len(rows), "cols": list(self.EXT_COLS) + extra, "rows": data,
+                "mentions": men, "mention_order": list(self.EXT_MENTIONS), "per_year": sorted(per_year.items()),
+                "filieres": fil_counts, "filieres_total": len(post(everyone)), "niveaux": niv,
+                "statuts": {"tous": len(sts), "admis": n_ok, "non_valides": len(sts) - n_ok},
+                "destination": dest, "ms": round((time.perf_counter() - t0) * 1000)}
+
+    def extraction_view_export(self, kind: str, path: str | None, scope: str, filiere: str | None = None,
+                               year_from: int | None = None, year_to: int | None = None, statut: str = "tous",
+                               dernier_niveau: bool = True, niveaux: list | None = None,
+                               mentions: list | None = None) -> dict:
+        """Export Excel / CSV des lignes affichées (mêmes filtres, mentions et niveaux compris), journalisé."""
+        from . import exporter
+        rows = [it[0] for it in self._ext_rows(filiere or None, year_from, year_to, statut or "tous",
+                                               bool(dernier_niveau), niveaux or None, mentions)]
+        if not rows:
+            raise ServiceError("Aucune ligne à exporter avec ces filtres.")
+        if not path:
+            name = f"Decanat_{filiere or 'Toutes'}_{statut}_{year_from or 'debut'}-{(year_to + 1) if year_to else 'fin'}.{kind}"
+            path = str(exports.dest_for(self.s, exports.EXTRACTIONS, name))
+        if kind == "xlsx":
+            exporter.export_xlsx(rows, path, f"Extraction FMSP — {scope}")
+        else:
+            exporter.export_csv(rows, path)
+        self.db.log("EXTRACTION", self.s.operateur, self.s.poste, None, None,
+                    f"{scope} · {statut} · {len(rows)} lignes · {path} · SHA-256 {exports.sha256_file(path)[:16]}…")
+        return {"path": path, "name": Path(path).name, "count": len(rows),
+                "location": exports.short_location(self.s, Path(path))}
+
+    def extraction_recent(self, limit: int = 4) -> list[dict]:
+        """« Dernières extractions » (journal EXTRACTION) : périmètre, date, lignes, format, fichier."""
+        import re
+        rx = re.compile(r"^(.*) · ([^·]+) · (\d+) lignes · (.+?) · SHA-256")
+        out = []
+        for row in self.db.conn.execute("SELECT horodatage, operateur, detail FROM journal WHERE action = 'EXTRACTION' "
+                                        "ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 20)),)):
+            m = rx.match(row["detail"] or "")
+            if not m:
+                continue
+            path = m.group(4)
+            out.append({"horodatage": row["horodatage"], "operateur": row["operateur"], "scope": m.group(1),
+                        "statut": m.group(2), "lignes": int(m.group(3)), "path": path,
+                        "format": "Excel" if path.lower().endswith(".xlsx") else "CSV",
+                        "existe": Path(path).exists()})
+        return out
+
+    # .................................................................. journal des actions : filtres, pages
+    def _journal_where(self, period: str | None, date_from: str | None, date_to: str | None,
+                       actions: list | None, operateur: str | None, q: str | None, skip: str = "",
+                       sans_actions: list | None = None) -> tuple[str, list]:
+        where, args = ["1=1"], []
+        if skip != "period":
+            if date_from or date_to:
+                if date_from:
+                    where.append("horodatage >= ?")
+                    args.append(str(date_from)[:10])
+                if date_to:
+                    where.append("horodatage <= ?")
+                    args.append(str(date_to)[:10] + " 23:59:59")
+            elif period not in (None, ""):
+                from datetime import timedelta
+                where.append("horodatage >= ?")
+                args.append((datetime.now() - timedelta(days=int(period))).strftime("%Y-%m-%d"))
+        if actions is not None and skip != "actions":
+            where.append(f"action IN ({','.join('?' * len(actions))})" if actions else "0")
+            args.extend(actions)
+        if sans_actions and skip != "actions":      # types décochés : un type nouveau (INDEX VIDÉ…) reste affiché
+            where.append(f"action NOT IN ({','.join('?' * len(sans_actions))})")
+            args.extend(sans_actions)
+        if operateur and skip != "operateur":
+            where.append("(COALESCE(operateur, '') || ' · ' || COALESCE(poste, '')) = ?")
+            args.append(operateur)
+        if (q or "").strip():
+            like = f"%{q.strip()}%"
+            where.append("(matricule LIKE ? OR operateur LIKE ? OR poste LIKE ? OR detail LIKE ? OR action LIKE ?)")
+            args += [f"%{norm_matricule(q)}%", like, like, like, like]
+        return " AND ".join(where), args
+
+    def journal_view(self, period: str | None = "7", date_from: str | None = None, date_to: str | None = None,
+                     actions: list | None = None, operateur: str | None = None, q: str | None = None,
+                     offset: int = 0, limit: int = 500, facets: bool = True, sans_actions: list | None = None) -> dict:
+        """Journal des actions par pages (aucun plafond) ; effectifs par période, action et opérateur."""
+        c = self.db.conn
+        where, args = self._journal_where(period, date_from, date_to, actions, operateur, q, sans_actions=sans_actions)
+        total = c.execute(f"SELECT COUNT(*) FROM journal WHERE {where}", args).fetchone()[0]
+        rows = [_row(r) for r in c.execute(f"SELECT * FROM journal WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                                           args + [max(1, min(int(limit), 5000)), max(0, int(offset))])]
+        res = {"total": total, "offset": int(offset), "rows": rows}
+        if facets:
+            w, a = self._journal_where(period, date_from, date_to, actions, operateur, q, "actions", sans_actions)
+            res["actions"] = [list(x) for x in c.execute(
+                f"SELECT action, COUNT(*) FROM journal WHERE {w} GROUP BY action ORDER BY 2 DESC", a)]
+            w, a = self._journal_where(period, date_from, date_to, actions, operateur, q, "operateur", sans_actions)
+            res["operateurs"] = [list(x) for x in c.execute(
+                f"SELECT COALESCE(operateur, '') || ' · ' || COALESCE(poste, ''), COUNT(*) FROM journal WHERE {w} "
+                "GROUP BY 1 ORDER BY 2 DESC", a)]
+            periods = {}
+            for p in ("0", "7", "30", ""):
+                w, a = self._journal_where(p, None, None, actions, operateur, q, sans_actions=sans_actions)
+                periods[p] = c.execute(f"SELECT COUNT(*) FROM journal WHERE {w}", a).fetchone()[0]
+            res["periodes"] = periods
+        return res
+
+    def journal_view_export(self, path: str, period: str | None = "7", date_from: str | None = None,
+                            date_to: str | None = None, actions: list | None = None, operateur: str | None = None,
+                            q: str | None = None, sans_actions: list | None = None) -> dict:
+        """« Exporter (CSV) » du journal : toutes les lignes de la période et des filtres affichés."""
+        from . import exporter
+        if not path:
+            path = str(exports.dest_for(self.s, exports.JOURNAL, "Journal.csv"))
+        where, args = self._journal_where(period, date_from, date_to, actions, operateur, q, sans_actions=sans_actions)
+        rows = self.db.conn.execute(f"SELECT * FROM journal WHERE {where} ORDER BY id DESC", args).fetchall()
+        exporter.export_journal_csv(rows, path)
+        return {"path": str(path), "name": Path(path).name, "count": len(rows)}
+
 
 def _unlink_temp(file: str | None) -> None:
     """Fichier temporaire d'impression : supprimé seulement s'il est dans le dossier temporaire de Scolarix."""

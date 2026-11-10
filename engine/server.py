@@ -98,6 +98,7 @@ class Engine:
                  "verify_compare", "verify_report", "settings_get", "settings_save", "rules_defaults", "rules_test",
                  "visual_refused", "demande_add_cursus", "journal_export", "suggest_path", "exports_dir",
                  "check_integrity", "verify_print_prepare", "verify_printed", "preview_original"]
+        names += ["tools_status", "diagnostic", "cache_clear", "rules_preview_releves", "rules_preview", "extraction_view", "extraction_view_export", "extraction_recent", "journal_view", "journal_view_export"]  # réglages / extraction
         table = {n: getattr(s, n) for n in names}
         table.update({"index_start": self.index_start, "index_stop": self.index_stop,
                       "index_reset": self.index_reset, "index_impact": s.index_impact,

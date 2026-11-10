@@ -1,5 +1,6 @@
 import { createRoot } from "react-dom/client";
 import "./styles.css";
+import "./styles/reglages-extraction.css";
 import { App } from "./App";
 import { sx } from "./api";
 
