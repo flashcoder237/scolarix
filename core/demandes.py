@@ -135,7 +135,31 @@ def mark(db: Database, settings: Settings, did: int, statut: str, detail: str = 
            f"{d['numero'] if d else did} : {statut.lower()}" + (f" · {detail}" if detail else ""))
 
 
-def _bordereau(prep: Preparation, d, settings: Settings) -> None:
+def bordereau_provisoire(db: Database, settings: Settings, did: int, dest: Path) -> Path:
+    """Aperçu du bordereau AVANT la préparation (revue de la demande) : mêmes lignes, dans l'ordre actuel,
+    numéros de délivrance « à attribuer » et filigrane PROVISOIRE. Rien n'est réservé ni journalisé."""
+    d = db.demande(did)
+    if d is None:
+        raise ValueError("Demande introuvable.")
+    prep = Preparation(Path(dest).parent, None, Path(dest))
+    for _item, rel in db.demande_items(did):
+        if rel is None:
+            prep.bloques.append((None, "relevé retiré de l'index depuis l'ajout"))
+        else:
+            prep.prets.append((rel, "à attribuer", rel.nb_pages))
+    _bordereau(prep, d, settings, provisoire=True)
+    reader = PdfReader(str(dest))
+    writer = PdfWriter()
+    for page in reader.pages:
+        page = writer.add_page(page)
+        page.merge_page(pdf_tools._stamp_page(float(page.mediabox.width), float(page.mediabox.height), "PROVISOIRE",
+                                              "numéros de délivrance attribués à la préparation"))
+    with open(dest, "wb") as fh:
+        writer.write(fh)
+    return Path(dest)
+
+
+def _bordereau(prep: Preparation, d, settings: Settings, provisoire: bool = False) -> None:
     """Feuille de route de l'agent : qui, quoi, combien de pages, numéros de délivrance, cases à cocher."""
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -148,7 +172,8 @@ def _bordereau(prep: Preparation, d, settings: Settings) -> None:
         c.drawString(40, h - 42, "UNIVERSITÉ DE DOUALA — FMSP · Scolarité")
         c.setFont("Helvetica", 9)
         c.setFillColor(muted)
-        c.drawRightString(w - 40, h - 42, f"Bordereau de demande · édité le {datetime.now():%d/%m/%Y %H:%M}")
+        c.drawRightString(w - 40, h - 42, ("Bordereau PROVISOIRE · aperçu du" if provisoire else "Bordereau de demande · édité le")
+                          + f" {datetime.now():%d/%m/%Y %H:%M}")
 
     header()
     c.setFillColor(ink)

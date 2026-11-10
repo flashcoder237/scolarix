@@ -376,18 +376,22 @@ async function search(q) {
     await page.getByTestId("demande-menu").waitFor();
     await shot("menu_demande");
     await page.getByTestId("demande-open").click();
-    await page.getByRole("dialog").first().waitFor();
+    const review = page.getByTestId("demande-review");             // revue plein cadre (2.1) à la place de la fenêtre
+    await review.waitFor();
+    await review.locator('[data-testid="viewer"][data-ready="1"] canvas').first().waitFor({ timeout: 60000 });
     await shot("demande");
+    for (let k = 0; k < 3; k++) { await page.keyboard.press("Space"); await page.waitForTimeout(250); }   // contrôlé + suivant
+    await page.getByTestId("checks-count").filter({ hasText: "3 / 3" }).waitFor({ timeout: 5000 });
     const before = printedCount();
-    await page.getByTestId("demande-print").click();
+    await page.getByTestId("demande-print").click();             // tout est contrôlé : aucune question
     await waitToast(/Envoyé à l'imprimante/, 120000);
     await waitPrinted(before + 2, 60000);          // bordereau + dossier
+    await page.getByTestId("remis-a").waitFor();
     await shot("demande_imprimee");
-    await page.getByTestId("demande-done").click();
-    await page.getByRole("dialog", { name: "Remise" }).waitFor();
-    await page.keyboard.press("Enter");
+    await page.getByTestId("demande-done").click();               // « Remis à » prérempli (demandeur)
     await waitToast(/remise et close/);
     await page.keyboard.press("Escape");
+    await review.waitFor({ state: "detached" });
     await page.waitForTimeout(400);
   });
 
@@ -429,7 +433,7 @@ async function search(q) {
     await search("18M042");
     await page.locator(ROWS).first().waitFor();
     await page.keyboard.press("Control+Shift+E");
-    await page.getByRole("dialog", { name: "Cursus complet" }).waitFor();
+    await page.getByTestId("cursus-review").waitFor();
     await page.waitForTimeout(400);
     await shot("cursus");
     await startProbe();
@@ -440,6 +444,7 @@ async function search(q) {
     console.log(`    retard maximal de l'interface pendant la fusion : ${lag} ms`);
     if (lag > 400) throw new Error(`interface figée ${lag} ms pendant la fusion`);
     await page.keyboard.press("Escape");
+    await page.getByTestId("cursus-review").waitFor({ state: "detached" });
   });
 
   await scenario("Recherche sans résultat : pistes affichées", async () => {
@@ -482,7 +487,7 @@ async function search(q) {
     await page.getByTestId("demande-open").click();
     await page.getByTestId("demande-cursus").click();
     await waitToast(/ajoutés? \(cursus/);
-    const n = await page.locator('[role="dialog"] table.grid tbody tr').count();
+    const n = await page.locator('[data-testid="demande-review"] [data-testid="piece"]:not([data-key="b"])').count();
     if (n < 3) throw new Error(`cursus validé : ${n} relevé(s) dans la demande`);
     await shot("demande_cursus");
     await page.keyboard.press("Escape");
@@ -491,13 +496,13 @@ async function search(q) {
 
   await scenario("Écran Demandes (Ctrl+2)", async () => {
     await page.keyboard.press("Control+2");
-    await page.getByRole("heading", { name: "Demandes de relevés" }).waitFor();
+    await page.getByTestId("demandes-topbar").waitFor();
     await page.waitForTimeout(400);
     await shot("demandes");
-    await page.locator('[data-page="demandes"]').getByText("Toutes", { exact: true }).click();
+    await page.getByTestId("demandes-statuts").getByRole("radio", { name: /^Toutes/ }).click();
     await page.getByTestId("demandes-filter").fill("kouame");
     await page.waitForTimeout(300);
-    const rows = await page.locator('[data-page="demandes"] table.grid tbody tr').allInnerTexts();
+    const rows = await page.locator('[data-page="demandes"] [data-testid="demande-item"]').allInnerTexts();
     if (!rows.length || rows.some((r) => !/KOUAME/i.test(r))) throw new Error(`filtre : ${rows.join(" / ")}`);
     await page.getByTestId("demandes-filter").fill("");
   });
@@ -663,6 +668,193 @@ async function search(q) {
     await page.getByTestId("settings-save").click();
     await waitToast(/Réglages enregistrés/);
     await dlg.waitFor({ state: "detached" });
+  });
+
+  // ------------------------------------------------------------------ revue de la demande, page Demandes, cursus (2.1)
+  const resizeTo = (w, h) => electronApp.evaluate(({ BrowserWindow }, [w, h]) => BrowserWindow.getAllWindows()[0].setContentSize(w, h), [w, h]);
+  /** Mesures de l'aperçu d'une revue (zone, échelle, part de la page visible). */
+  const measureIn = (root) => page.evaluate((sel) => {
+    const v = document.querySelector(`${sel} [data-testid="viewer"]`);
+    const c = v.querySelector("canvas");
+    const r = v.getBoundingClientRect();
+    const ch = c ? c.clientHeight : 0, cw = c ? c.clientWidth : 0;
+    return { viewer: [Math.round(r.width), Math.round(r.height)], stage: [Math.round(r.width), Math.round(r.height)], win: [innerWidth, innerHeight],
+      fit: v.dataset.fit, scale: Number(v.dataset.scale), canvas: [cw, ch], visible: ch ? Math.min(1, (v.clientHeight - 12) / ch) : 0,
+      scrollTop: v.scrollTop, surface: (r.width * r.height) / (innerWidth * innerHeight) };
+  }, root);
+  const fmtR = (m) => `zone d'aperçu ${m.viewer[0]}×${m.viewer[1]} px (${Math.round(m.surface * 100)} % de la fenêtre ${m.win[0]}×${m.win[1]}) · mode ${m.fit} · échelle ${Math.round(m.scale * 100)} % · ${Math.round(m.visible * 100)} % de la page visible`;
+  const RV = '[data-testid="demande-review"]';
+  const readyIn = (root) => page.locator(`${root} [data-testid="viewer"][data-ready="1"] canvas`).first().waitFor({ timeout: 90000 });
+  const selKey = () => page.locator(`${RV} [data-testid="piece"].sel`).getAttribute("data-key");
+  const order = () => page.locator(`${RV} [data-testid="piece"]`).evaluateAll((els) => els.map((e) => e.dataset.key));
+
+  await scenario("Revue de la demande : aperçu avant préparation, contrôle à l'écran, vues, ordre, duplicata", async () => {
+    await page.keyboard.press("Control+1");
+    await search("18M042");
+    await page.locator(ROWS).first().waitFor({ timeout: 30000 });
+    await page.keyboard.press("Control+n");
+    await page.getByRole("dialog", { name: "Nouvelle demande" }).waitFor();
+    await page.locator('[role="dialog"] input').fill("Sa mère");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(400);
+    for (let k = 0; k < 3; k++) {                         // N1, N2, N3… (relevés PDF et Word)
+      await page.keyboard.press("Control+d");
+      await page.waitForTimeout(350);
+      await page.getByTestId("search").press("ArrowDown");
+      await page.waitForTimeout(250);
+    }
+    await page.getByTestId("demande-chip").click();
+    await page.getByTestId("demande-open").click();
+    await page.locator(RV).waitFor();
+    await readyIn(RV);
+    await page.waitForTimeout(500);
+    const m = await measureIn(RV);
+    console.log(`    revue ${SIZE.join("×")} : ${fmtR(m)}`);
+    if (m.viewer[1] < 0.75 * m.win[1]) throw new Error(`aperçu de la revue trop bas : ${m.viewer[1]} px`);
+    if (m.fit !== "auto" || m.scale < 0.68) throw new Error(`mode Auto illisible : ${JSON.stringify(m)}`);
+    if (!/Relevé 1\/3/.test(await page.getByTestId("piece-strip").innerText())) throw new Error("bandeau : relevé 1/3 attendu");
+    await shot("revue_demande");
+    // Espace : contrôlé + suivant, tracé au journal
+    const k0 = await selKey();
+    await page.keyboard.press("Space");
+    await page.getByTestId("checks-count").filter({ hasText: "1 / 3" }).waitFor({ timeout: 5000 });
+    if ((await selKey()) === k0) throw new Error("Espace n'est pas passé au relevé suivant");
+    // Alt+↑ : la pièce affichée remonte d'un cran (ordre d'impression)
+    const o0 = await order();
+    const cur = await selKey();
+    await page.keyboard.press("Alt+ArrowUp");
+    await page.waitForFunction(([k, before]) => {
+      const now = [...document.querySelectorAll('[data-testid="demande-review"] [data-testid="piece"]')].map((e) => e.dataset.key);
+      return now.indexOf(k) === before.indexOf(k) - 1;
+    }, [cur, o0], { timeout: 5000 });
+    // vues Dossier puis Planche (V), puis retour à la pièce
+    await page.keyboard.press("v");
+    await page.locator(`${RV} .pdoc`).nth(3).waitFor({ timeout: 90000 });          // bordereau + 3 relevés à la suite
+    await readyIn(RV);
+    await shot("revue_dossier");
+    await page.keyboard.press("v");
+    await page.locator(`${RV} [data-testid="planche"] [data-testid="thumb"] img`).nth(3).waitFor({ timeout: 60000 });
+    await shot("revue_planche");
+    await page.keyboard.press("v");
+    // bordereau provisoire : en tête, visible avant toute préparation
+    for (let i = 0; i < 4; i++) await page.keyboard.press("ArrowUp");
+    if ((await selKey()) !== "b") throw new Error("bordereau absent de la tête de liste");
+    await readyIn(RV);
+    if (!/PROVISOIRE/.test(await page.getByTestId("piece-strip").innerText())) throw new Error("bordereau provisoire non signalé");
+    // grand écran
+    try {
+      await resizeTo(1920, 1080);
+      await page.waitForTimeout(700);
+      await page.keyboard.press("ArrowDown");
+      await readyIn(RV);
+      await page.waitForTimeout(500);
+      const g = await measureIn(RV);
+      console.log(`    revue 1920×1080 : ${fmtR(g)}`);
+      if (g.visible < 0.999 || g.scale < 0.68) throw new Error(`page entière attendue à 1920×1080 : ${JSON.stringify(g)}`);
+      await shot("revue_demande_1920");
+    } finally { await resizeTo(SIZE[0], SIZE[1]); await page.waitForTimeout(600); }
+    // préparation : fichiers préparés (pied de page, n° de délivrance) affichés, étape Imprimer
+    await page.getByTestId("demande-prepare").click();
+    await waitToast(/Dossier prêt|Préparation impossible/, 180000);
+    await page.getByTestId("piece-strip").filter({ hasText: /PRÊT|BORDEREAU|Bordereau/ }).waitFor({ timeout: 10000 });
+    if (!/Imprimer/.test(await page.locator(`${RV} [data-testid="stepper"] .st.cur`).innerText())) throw new Error("étape courante : Imprimer attendu");
+    await shot("revue_prete");
+    // Duplicata sur une demande PRÊTE : question explicite, puis dossier à refaire (EN COURS)
+    await page.locator(`${RV} [data-testid="dock"] .switch`).filter({ hasText: "Duplicata" }).click();
+    const dq = page.getByRole("dialog", { name: "Apposer le timbre Duplicata" });
+    await dq.waitFor();
+    await shot("revue_duplicata_question");
+    await dq.getByRole("button", { name: /Apposer et refaire/ }).click();
+    await waitToast(/dossier à refaire/);
+    await page.locator(`${RV} [data-testid="stepper"] .st.cur`).filter({ hasText: "Préparer" }).waitFor({ timeout: 5000 });
+    // Imprimer tout avec des relevés non contrôlés : question, confirmation tracée
+    const before = printedCount();
+    await page.keyboard.press("Control+p");
+    const uq = page.getByRole("dialog", { name: "Relevés non contrôlés à l'écran" });
+    await uq.waitFor();
+    await uq.getByRole("button", { name: "Imprimer quand même" }).click();
+    await waitToast(/Envoyé à l'imprimante|Impression impossible/, 180000);
+    await waitPrinted(before + 2, 60000);
+    await page.getByTestId("remis-a").waitFor();                  // IMPRIMÉE : « Remis à » prérempli, Remettre en action principale
+    if ((await page.getByTestId("remis-a").inputValue()) !== "Sa mère") throw new Error("« Remis à » non prérempli");
+    await shot("revue_imprimee");
+    await page.keyboard.press("Escape");
+    await page.locator(RV).waitFor({ state: "detached" });
+  });
+
+  await scenario("Page Demandes : maître–détail, pièces dépliées, Entrée = revue, Ctrl+Entrée = remise", async () => {
+    await page.keyboard.press("Control+2");
+    await page.getByTestId("demandes-topbar").waitFor();
+    await page.getByTestId("demandes-statuts").getByRole("radio", { name: /^À remettre/ }).click();
+    const item = page.locator('[data-page="demandes"] [data-testid="demande-item"].sel');
+    await item.waitFor({ timeout: 10000 });
+    if (!/Sa mère/.test(await item.innerText())) throw new Error(`demande sélectionnée : ${await item.innerText()}`);
+    await page.locator('[data-page="demandes"] [data-testid="demande-piece"]').nth(3).waitFor();     // bordereau + 3 relevés
+    await readyIn('[data-page="demandes"]');
+    await page.waitForTimeout(500);
+    console.log(`    page Demandes ${SIZE.join("×")} : ${fmtR(await measureIn('[data-page="demandes"]'))}`);
+    await shot("demandes_detail");
+    await page.keyboard.press("ArrowDown");                      // ↓ : pièces de la demande dépliée, l'aperçu suit
+    await page.waitForTimeout(300);
+    if (!(await page.locator('[data-page="demandes"] [data-testid="demande-piece"].sel').count())) throw new Error("↓ n'a pas sélectionné de pièce");
+    try {
+      await resizeTo(1920, 1080);
+      await page.waitForTimeout(700);
+      await readyIn('[data-page="demandes"]');
+      await page.waitForTimeout(400);
+      console.log(`    page Demandes 1920×1080 : ${fmtR(await measureIn('[data-page="demandes"]'))}`);
+      await shot("demandes_detail_1920");
+    } finally { await resizeTo(SIZE[0], SIZE[1]); await page.waitForTimeout(600); }
+    await page.getByTestId("demandes-filter").focus();
+    await page.getByTestId("demandes-filter").press("Enter");     // Entrée : revue plein cadre
+    await page.locator(RV).waitFor();
+    await page.keyboard.press("Escape");                          // retour à la liste, sélection conservée
+    await page.locator(RV).waitFor({ state: "detached" });
+    await item.waitFor();
+    await page.keyboard.press("Control+Enter");                   // remise (« Remis à » prérempli)
+    await waitToast(/remise et close/);
+  });
+
+  await scenario("Cursus : aperçu du PDF fusionné page par page, page de garde, Ctrl+P", async () => {
+    await page.keyboard.press("Control+1");
+    await search("18M042");
+    await page.locator(ROWS).first().waitFor({ timeout: 30000 });
+    await page.keyboard.press("Control+Shift+E");
+    const CR = '[data-testid="cursus-review"]';
+    await page.locator(CR).waitFor();
+    await readyIn(CR);
+    await page.waitForTimeout(600);
+    const sum = await page.getByTestId("cursus-summary").innerText();
+    const pages = Number((sum.match(/(\d+) pages/) || [])[1]);
+    const thumbs = await page.locator('[data-testid="cursus-thumbs"] [data-testid="thumb"]').count();
+    if (!pages || thumbs !== pages) throw new Error(`vignettes ${thumbs} pour ${sum}`);
+    if (!/Page 1 \/ \d+ · Page de garde/.test(await page.getByTestId("cursus-strip").innerText())) throw new Error("page de garde non affichée en premier");
+    const m = await measureIn(CR);
+    console.log(`    cursus ${SIZE.join("×")} : ${fmtR(m)}`);
+    await shot("cursus_apercu");
+    await page.locator('[data-testid="cursus-thumbs"] [data-testid="thumb"]').nth(1).click();
+    await page.getByTestId("cursus-strip").filter({ hasText: /Page 2 \// }).waitFor({ timeout: 5000 });
+    // décocher un relevé : l'aperçu est refait sans lui
+    await page.locator(`${CR} [data-testid="cursus-row"] input[type="checkbox"]:checked`).nth(1).click();
+    await page.getByTestId("cursus-summary").filter({ hasText: new RegExp(`${pages - 1} pages|${pages - 2} pages`) }).waitFor({ timeout: 60000 });
+    await readyIn(CR);
+    try {
+      await resizeTo(1920, 1080);
+      await page.waitForTimeout(700);
+      await readyIn(CR);
+      await page.waitForTimeout(400);
+      console.log(`    cursus 1920×1080 : ${fmtR(await measureIn(CR))}`);
+      await shot("cursus_apercu_1920");
+    } finally { await resizeTo(SIZE[0], SIZE[1]); await page.waitForTimeout(600); }
+    await page.keyboard.press("v");                               // vue Relevé : le relevé source
+    await page.getByTestId("cursus-strip").filter({ hasText: /RELEVÉ SOURCE/ }).waitFor();
+    await page.keyboard.press("v");
+    const before = printedCount();
+    await page.keyboard.press("Control+p");
+    await waitToast(/Cursus envoyé à l'imprimante|dès qu'il sera prêt/, 120000);
+    await waitPrinted(before + 1, 120000);
+    await page.keyboard.press("Escape");
+    await page.locator(CR).waitFor({ state: "detached" });
   });
 
   await electronApp.close();

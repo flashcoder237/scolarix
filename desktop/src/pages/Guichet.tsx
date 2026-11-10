@@ -7,8 +7,8 @@ import { useApp, useShortcuts } from "../state";
 import { Alert, Badge, Icon, Popover, Switch, highlight, play, useDebounced, useDialogs, useToast } from "../components/ui";
 import { FIT_LABELS, PdfView, ZONES, forget, type PdfViewHandle, type PdfViewState } from "../components/PdfView";
 import { PreviewVariantToggle, useOriginalPreview, type PreviewVariant } from "../components/PreviewVariantToggle";
-import { DemandeDialog, STATUT_AIDE, STATUT_TONE } from "./DemandeDialog";
-import { CursusDialog } from "./CursusDialog";
+import { DemandeReview, STATUT_AIDE, STATUT_TONE } from "./DemandeReview";
+import { CursusReview } from "./CursusReview";
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -451,8 +451,8 @@ export function Guichet() {
           </div>
         </section>
       </div>
-      {cursusFor && <CursusDialog matricule={cursusFor} onClose={() => { setCursusFor(null); app.refreshStats(); }} />}
-      {demandeOpen && <DemandeDialog did={demandeOpen} onClose={() => { setDemandeOpen(null); app.bumpDemandes(); app.refreshStats(); }} />}
+      {cursusFor && <CursusReview matricule={cursusFor} onClose={() => { setCursusFor(null); app.refreshStats(); }} />}
+      {demandeOpen && <DemandeReview did={demandeOpen} onClose={() => { setDemandeOpen(null); app.bumpDemandes(); app.refreshStats(); }} />}
     </>
   );
 }
