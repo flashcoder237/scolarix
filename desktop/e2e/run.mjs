@@ -7,6 +7,7 @@
 // la boucle d'événements ne doit jamais être bloquée (aucun gel), même pendant les opérations lourdes.
 import { _electron as electron } from "playwright-core";
 import { mkdirSync, readdirSync, existsSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -519,26 +520,181 @@ async function search(q) {
     if (!existsSync(dest)) throw new Error("journal CSV non écrit");
   });
 
-  await scenario("Vérification : original retrouvé tout seul (Ctrl+5)", async () => {
+  // ---------------------------------------------------------------- Vérification (2.1) : deux grands volets liés
+  const VF = '[data-page="verification"]';
+  const vfPick = (file) => electronApp.evaluate(({ dialog }, f) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [f] }); }, file);
+  const vfReady = async (pane) => page.locator(`${VF} [data-testid="${pane}"] [data-testid="vf-view"][data-ready="1"]`).waitFor({ timeout: 60000 });
+  /** Zone de chaque volet, échelle, part de la page visible sans défiler (sous l'étiquette du volet). */
+  const vfMeasure = () => page.evaluate(() => [...document.querySelectorAll('[data-page="verification"] [data-testid="vf-view"]')].map((v) => {
+    const r = v.getBoundingClientRect(), pg = v.querySelector(".vf-pg");
+    const top = parseFloat(getComputedStyle(v).getPropertyValue("--vf-top")) || 44;
+    return { pane: v.parentElement.dataset.testid, w: Math.round(r.width), h: Math.round(r.height), scale: Number(v.dataset.scale), fit: v.dataset.fit,
+      page: pg ? [pg.clientWidth, pg.clientHeight] : null, visible: pg ? Math.min(1, (v.clientHeight - top - 12) / pg.clientHeight) : 0 };
+  }));
+  const vfFmt = (ms) => ms.map((m) => `${m.pane.replace("vf-pane-", "")} ${m.w}×${m.h} px · A4 ${m.page?.join("×")} · ${Math.round(m.scale * 100)} % (${m.fit}) · ${Math.round(m.visible * 100)} % de la page visible`).join(" | ");
+  const soumisDir = join(work, "soumis");
+  let soumis = null;
+  const tesseract = (() => { try { return !!execFileSync(process.platform === "win32" ? "where" : "which", ["tesseract"]).toString().trim(); } catch { return false; } })();
+
+  await scenario("Vérification : original retrouvé tout seul (Ctrl+5), registre, impression « Vérifié »", async () => {
     await page.keyboard.press("Control+5");
+    await page.getByTestId("vf-empty").waitFor();
+    await shot("verification_vide");
     const exportsDir = join(work, "Exports Scolarix");
     const pdfs = [];
     const walk = (d) => { for (const f of readdirSync(d, { withFileTypes: true })) { const p = join(d, f.name); if (f.isDirectory()) walk(p); else if (f.name.startsWith("FMSP_") && f.name.endsWith(".pdf") && !/Cursus/.test(f.name)) pdfs.push(p); } };
     walk(exportsDir);
     if (!pdfs.length) throw new Error("aucun relevé exporté à vérifier");
-    await electronApp.evaluate(({ dialog }, file) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [file] }); }, pdfs[0]);
+    await vfPick(pdfs[0]);
     await page.getByTestId("verify-load").click();
     await page.getByTestId("verdict").waitFor({ timeout: 120000 });
     const v = await page.getByTestId("verdict").innerText();
     const mat = await page.getByTestId("verify-mat").inputValue();
-    if (!/conforme/i.test(v) || !mat) throw new Error(`verdict « ${v} », matricule « ${mat} »`);
-    await page.locator('[data-page="verification"] [data-testid="viewer"] canvas').first().waitFor({ timeout: 30000 });
-    await page.locator('[data-testid="verify-submitted"] canvas').first().waitFor({ timeout: 30000 });
+    if (!/^Conforme/.test(v) || !mat) throw new Error(`verdict « ${v} », matricule « ${mat} »`);
+    if ((await page.getByTestId("vf-mat-badge").innerText()) !== "LU") throw new Error("matricule non signalé « LU »");
+    if (!/Délivré par le guichet|Au registre/.test(await page.getByTestId("vf-registre").innerText())) throw new Error("registre des délivrances non affiché");
+    await vfReady("vf-pane-soumis");
+    await vfReady("vf-pane-original");
+    await page.locator(`${VF} [data-testid="verify-submitted"] canvas`).first().waitFor({ timeout: 30000 });
+    if (await page.locator(`${VF} [data-testid="vf-chip"].ko`).count()) throw new Error("divergence sur un document délivré tel quel");
     await shot("verification");
     const before = printedCount();
-    await page.getByTestId("verify-print").click();
+    await page.keyboard.press("Control+p");
     await waitToast(/timbre « Vérifié »/, 60000);
     await waitPrinted(before + 1);
+  });
+
+  await scenario("Vérification : document falsifié, divergences surlignées, F8, Tableau, Ctrl+R", async () => {
+    await page.keyboard.press("Control+5");      // un scénario précédent en échec a pu revenir au guichet (Échap)
+    execFileSync(py, [join(app, "..", "tools", "verif_samples.py"), soumisDir]);
+    soumis = { pdf: join(soumisDir, "soumis_falsifie.pdf"), png: join(soumisDir, "soumis_falsifie_scan.png"), tif: join(soumisDir, "soumis_falsifie_scan.tif") };
+    await vfPick(soumis.pdf);
+    await page.keyboard.press("Control+o");
+    await page.getByTestId("verdict").filter({ hasText: "Non conforme" }).waitFor({ timeout: 120000 });
+    const v = await page.getByTestId("verdict").innerText();
+    if (!/2 divergences/.test(v)) throw new Error(`verdict : ${v}`);
+    if (!/Absent du registre|Hors registre/.test(await page.getByTestId("vf-registre").innerText())) throw new Error("document modifié présenté comme délivré");
+    const ko = page.locator(`${VF} [data-testid="vf-chip"].ko`);
+    if ((await ko.count()) !== 2) throw new Error(`${await ko.count()} puce(s) en rouge`);
+    if (!/MED502.*16,90.*14,90/s.test(await ko.first().innerText())) throw new Error(`puce : ${await ko.first().innerText()}`);
+    await vfReady("vf-pane-soumis");
+    await vfReady("vf-pane-original");
+    // divergences posées sur les deux documents (rouge : soumis, bleu : original) ; ouverture sur la 1re, bulle des valeurs
+    await page.locator(`${VF} [data-testid="vf-pane-soumis"] [data-testid="vf-mark"][data-tone="red"]`).nth(1).waitFor();
+    await page.locator(`${VF} [data-testid="vf-pane-original"] [data-testid="vf-mark"][data-tone="blue"]`).nth(1).waitFor();
+    await page.getByTestId("vf-tip").filter({ hasText: "16,90" }).waitFor({ timeout: 5000 });
+    console.log(`    ${SIZE.join("×")} : ${vfFmt(await vfMeasure())}`);
+    await shot("verification_divergences");
+    await page.keyboard.press("F8");
+    await page.getByTestId("vf-tip").filter({ hasText: "Moyenne" }).waitFor({ timeout: 5000 });
+    if (!/Moyenne/.test(await page.locator(`${VF} [data-testid="vf-chip"].sel`).innerText())) throw new Error("F8 : la puce Moyenne n'est pas sélectionnée");
+    await page.locator(`${VF} [data-testid="vf-chip"][data-cle="nom"]`).click();      // champ identique : surligné en vert
+    await page.locator(`${VF} [data-testid="vf-mark"][data-tone="green"]`).first().waitFor();
+    // défilement lié : le volet de l'original suit le soumis
+    await page.getByTestId("vf-fit-1:1").click();
+    await page.waitForTimeout(700);
+    await page.locator(`${VF} [data-testid="vf-pane-soumis"] [data-testid="vf-view"]`).evaluate((el) => el.scrollTo({ top: 260 }));
+    await page.waitForTimeout(400);
+    const tops = await page.locator(`${VF} [data-testid="vf-view"]`).evaluateAll((els) => els.map((e) => Math.round(e.scrollTop)));
+    if (Math.abs(tops[0] - tops[1]) > 30 || tops[1] < 100) throw new Error(`défilement lié : ${tops}`);
+    await page.getByTestId("vf-fit-auto").click();
+    // tableau complet en tiroir (T), Échap le referme
+    await page.keyboard.press("t");
+    const table = page.getByTestId("verify-table");
+    await table.waitFor();
+    if ((await table.getByText("DIFFÉRENT").count()) !== 2) throw new Error("tableau : 2 lignes DIFFÉRENT attendues");
+    await shot("verification_tableau");
+    await page.keyboard.press("Escape");
+    await table.waitFor({ state: "detached" });
+    // Ctrl+R sans demandeur : le curseur va au champ ; puis rapport généré
+    await page.keyboard.press("Control+r");
+    await page.waitForTimeout(200);
+    if (await page.evaluate(() => document.activeElement?.getAttribute("data-testid")) !== "verify-demandeur") throw new Error("Ctrl+R : le curseur n'est pas allé au demandeur");
+    await page.getByTestId("verify-demandeur").fill("Ambassade (fictif)");
+    await page.getByTestId("verify-reference").fill("N° 2026/0412");
+    await page.keyboard.press("Control+r");
+    await waitToast(/Rapport généré : Verification_18M042/);
+  });
+
+  await scenario("Vérification : matricule saisi, recherche exacte (message rouge), choix de l'original", async () => {
+    await page.keyboard.press("Control+5");      // un scénario précédent en échec a pu revenir au guichet (Échap)
+    const box = page.getByTestId("verify-mat");
+    await box.fill("99X999");
+    if ((await page.getByTestId("vf-mat-badge").innerText()) !== "SAISI") throw new Error("matricule retapé non signalé « SAISI »");
+    await box.press("Enter");
+    await waitToast(/Aucun relevé indexé pour ce matricule/);
+    if (!/—/.test(await page.getByTestId("vf-orig-label").innerText())) throw new Error("original encore affiché");
+    await box.fill("18M042");
+    await box.press("Enter");
+    await page.getByTestId("verdict").waitFor({ timeout: 60000 });
+    const n = await page.getByTestId("verify-orig").locator("option").count();
+    if (n < 4) throw new Error(`${n - 1} original(aux) proposé(s) pour 18M042`);
+    // choix de l'original N5 (2022-2023) : comparaison relancée, 2 divergences
+    const n5 = await page.getByTestId("verify-orig").locator("option", { hasText: "2022-2023" }).first().getAttribute("value");
+    await page.getByTestId("verify-orig").selectOption(n5);
+    await page.getByTestId("verdict").filter({ hasText: "2 divergences" }).waitFor({ timeout: 60000 });
+    if (!/ sur \d/i.test(await page.locator(`${VF} .vf-sel .eyebrow`).innerText())) throw new Error("« n sur N » absent");
+  });
+
+  await scenario("Vérification : grands volets à 1366×768 et 1920×1080, plein écran F11", async () => {
+    await page.keyboard.press("Control+5");      // un scénario précédent en échec a pu revenir au guichet (Échap)
+    const resize = (w, h) => electronApp.evaluate(({ BrowserWindow }, [w, h]) => BrowserWindow.getAllWindows()[0].setContentSize(w, h), [w, h]);
+    try {
+      for (const [w, h] of [[1366, 768], [1920, 1080]]) {
+        await resize(w, h);
+        await page.waitForTimeout(900);
+        await vfReady("vf-pane-original");
+        await page.waitForTimeout(500);
+        const m = await vfMeasure();
+        console.log(`    ${w}×${h} : ${vfFmt(m)}`);
+        if (m.length !== 2 || Math.abs(m[0].scale - m[1].scale) > 0.001) throw new Error(`zoom non lié : ${JSON.stringify(m)}`);
+        if (w === 1920 && m.some((x) => x.visible < 0.999)) throw new Error(`pages entières attendues à 1920 : ${JSON.stringify(m)}`);
+        if (w === 1366 && m.some((x) => x.w < 520 || x.h < 560 || x.visible < 0.75)) throw new Error(`volets trop petits à 1366 : ${JSON.stringify(m)}`);
+        await shot(`verification_${w}`);
+        await page.keyboard.press("F11");
+        await page.getByTestId("vf-focus-bar").waitFor();
+        await page.waitForTimeout(900);
+        console.log(`    plein écran ${w}×${h} : ${vfFmt(await vfMeasure())}`);
+        await shot(`verification_plein_ecran_${w}`);
+        await page.keyboard.press("Escape");
+        await page.getByTestId("vf-focus-bar").waitFor({ state: "detached" });
+      }
+    } finally {
+      await resize(SIZE[0], SIZE[1]);
+      await page.waitForTimeout(600);
+    }
+  });
+
+  if (tesseract) await scenario("Vérification : photo d'un scan (OCR) — boîtes des mots, mode Calque, TIFF sans aperçu", async () => {
+    await page.keyboard.press("Control+5");      // un scénario précédent en échec a pu revenir au guichet (Échap)
+    await vfPick(soumis.png);
+    await page.keyboard.press("Control+o");
+    await page.getByTestId("verdict").filter({ hasText: "Non conforme" }).waitFor({ timeout: 180000 });
+    if (!/image · 1 p\. · OCR \d+ %/.test(await page.locator(`${VF} [data-testid="vf-pane-soumis"] .vf-tag`).innerText())) throw new Error("nature / OCR absents de l'étiquette");
+    await vfReady("vf-pane-soumis");
+    await page.locator(`${VF} [data-testid="vf-pane-soumis"] img`).waitFor();
+    await page.locator(`${VF} [data-testid="vf-pane-soumis"] [data-testid="vf-mark"][data-tone="red"]`).first().waitFor();
+    await shot("verification_scan_ocr");
+    await page.getByTestId("vf-view-calque").click();
+    await vfReady("vf-pane-calque");
+    const knob = page.getByTestId("vf-knob");
+    await knob.waitFor();
+    const kb = await knob.boundingBox();
+    await page.mouse.move(kb.x + 2, kb.y + kb.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(kb.x - 120, kb.y + kb.height / 2, { steps: 5 });
+    await page.mouse.up();
+    const val = Number(await knob.getAttribute("aria-valuenow"));
+    if (!(val < 45)) throw new Error(`rideau non déplacé : ${val}`);
+    console.log(`    calque ${SIZE.join("×")} : ${vfFmt(await vfMeasure())}`);
+    await shot("verification_calque");
+    await page.keyboard.press("ArrowRight");
+    if (Number(await knob.getAttribute("aria-valuenow")) <= val) throw new Error("→ ne déplace pas le rideau");
+    await page.getByTestId("vf-view-cote").click();
+    await vfPick(soumis.tif);
+    await page.keyboard.press("Control+o");
+    await page.locator(`${VF} [data-testid="vf-pane-soumis"]`).getByText(/TIFF/).waitFor({ timeout: 30000 });
+    await page.getByTestId("verdict").filter({ hasText: "Non conforme" }).waitFor({ timeout: 180000 });
   });
 
   await scenario("Indexation (Ctrl+3) : relance différentielle", async () => {
