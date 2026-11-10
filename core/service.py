@@ -1584,7 +1584,13 @@ class Service:
             finally:
                 copy.unlink(missing_ok=True)
             return before, after, report, n
-        res = self._rp_word_thread(job)
+        try:
+            res = self._rp_word_thread(job)
+        except ExtractionError as exc:
+            # Word annoncé mais absent ou inutilisable (pywin32 présent, Word non installé…) : l'en-tête reste
+            # en rendu typographique, et l'agent sait pourquoi.
+            _log.warning("aperçu des règles : rendu du moteur impossible : %s", exc)
+            return dict(base, rendu=None, sans_convertisseur=True, motif=str(exc))
         if res is None:
             return dict(base, stale=True)
         before, after, report, n = res
