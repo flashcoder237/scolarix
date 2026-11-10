@@ -668,14 +668,15 @@ class Service:
         except OSError as exc:
             raise ServiceError(f"Fichier illisible : {exc}") from exc
         delivered = _row(row)
-        ident = verification.identify(verification.read_submitted(path, self.s))
+        lecture = self._verify_read(path)
+        ident = verification.identify(lecture.text)
         mat = (delivered or {}).get("matricule") or ident.get("matricule")
         rels = self.db.cursus(mat) if mat else []
         target = None
         if delivered and delivered.get("releve_id"):
             target = next((r for r in rels if r.id == delivered["releve_id"]), None)
         target = target or verification.best_match(rels, ident)
-        return {"delivered": delivered, "ident": ident, "matricule": mat,
+        return {"delivered": delivered, "ident": ident, "matricule": mat, "soumis": lecture.info(),
                 "releves": [releve_dict(r) for r in rels], "best": target.id if target else None}
 
     def verify_compare(self, path: str, releve_id: int, demandeur: str = "", reference: str = "") -> dict:
@@ -690,11 +691,13 @@ class Service:
         orig = self._get(releve_id)
         if self.previews is not None and self.previews.needs_render(orig):
             orig = self.previews.ensure(orig)
-        sub_text = verification.read_submitted(path, self.s)
+        lecture = self._verify_read(path)
         pages = pdf_pages_text(Path(orig.preview_pdf)) if orig.preview_pdf else []
         orig_text = "\n".join(p.text for p in pages[orig.numero_page - 1:orig.page_fin])
-        rows = verification.compare(sub_text, orig_text, orig)
-        res = {"original": releve_dict(orig), "rows": [dict(dataclasses.asdict(r), conforme=r.conforme) for r in rows],
+        rows = verification.compare(lecture.text, orig_text, orig)
+        pos = self._verify_positions(rows, lecture, orig)
+        res = {"original": releve_dict(orig), "soumis": lecture.info(),
+               "rows": [dict(dataclasses.asdict(r), conforme=r.conforme, pos=p) for r, p in zip(rows, pos)],
                "conformes": sum(1 for r in rows if r.conforme), "total": len(rows)}
         return res, rows, orig
 
@@ -771,6 +774,44 @@ class Service:
         compiled = self._check_rules(rules)
         out, n = apply_text(text or "", compiled)
         return {"text": out, "count": n, "avertissements": rule_warnings(compiled)}
+
+    # ---- vérification ----
+    # Lecture du document soumis gardée en mémoire (identification puis comparaison : un seul OCR), et
+    # positions des champs comparés sur les deux documents (surlignage, défilement vers la divergence).
+    _VERIFY_CACHE_MAX = 4
+
+    def _verify_read(self, path: str) -> "verification.Lecture":
+        p = Path(path)
+        try:
+            st = p.stat()
+        except OSError as exc:
+            raise ServiceError(f"Fichier illisible : {exc}") from exc
+        key = (str(p), st.st_mtime_ns, st.st_size, bool(self.s.ocr_preprocess), self.s.ocr_lang or "fra")
+        lock = self.__dict__.setdefault("_verify_lock", threading.Lock())
+        cache: dict = self.__dict__.setdefault("_verify_cache", {})
+        with lock:
+            hit = cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            lecture = verification.read_layout(p, self.s)
+        except (RuntimeError, ExtractionError) as exc:
+            raise ServiceError(str(exc)) from exc
+        with lock:
+            cache[key] = lecture
+            while len(cache) > self._VERIFY_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+        return lecture
+
+    def _verify_positions(self, rows: list, lecture: "verification.Lecture", orig: Releve) -> list[dict]:
+        """Ligne de chaque champ sur le soumis (couche texte ou boîtes OCR) et sur l'original (couche texte)."""
+        try:
+            lignes_orig = (verification.pdf_lines(orig.preview_pdf, orig.numero_page, orig.page_fin)
+                           if orig.preview_pdf else [])
+            return verification.locate(rows, lecture.lignes, lignes_orig)
+        except Exception:                      # jamais une raison de refuser la comparaison elle-même
+            _log.exception("positions de la vérification")
+            return [{"soumis": None, "original": None} for _ in rows]
 
 
 def _unlink_temp(file: str | None) -> None:

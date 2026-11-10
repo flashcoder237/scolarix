@@ -1,0 +1,147 @@
+/* Écran Vérification (2.1) : barre unique, bandeau des champs, deux grands volets liés, dock de conclusion.
+   Mêmes jetons que styles.css (.card .topbar .fseg .dock .fitgrid .fbar) : aucune nouvelle charte. */
+
+/* ------------------------------------------------------------- barre unique */
+.vf-top { gap: 8px; }
+.vf-vsep { width: 1px; align-self: stretch; background: var(--line-2); margin: 4px 2px; flex: none; }
+.vf-title { display: flex; flex-direction: column; line-height: 1.15; padding: 0 6px 0 4px; flex: none; }
+.vf-title .eyebrow { font-size: 9.5px; }
+.vf-title b { font: 700 17px var(--display); }
+.compact .vf-title b { font-size: 15.5px; }
+.vf-top .eyebrow { font-size: 9.5px; }
+.vf-doc { display: flex; align-items: center; gap: 9px; border: 1px solid var(--line-2); background: var(--soft); border-radius: 12px;
+  padding: 4px 6px 4px 10px; height: 42px; min-width: 0; flex: 0 1 auto; }
+.vf-doc .dtxt, .vf-sel .dtxt { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
+.vf-doc .dn { font-weight: 700; font-size: 12.5px; max-width: 270px; }
+.vf-doc .badge { padding: 2px 8px; font-size: 10.5px; letter-spacing: 0; }
+.vf-mat { display: flex; align-items: center; gap: 6px; border: 2px solid var(--blue); border-radius: 12px; padding: 0 8px; height: 42px;
+  background: #fff; flex: none; cursor: text; }
+.vf-mat.vf-nomat { border-color: var(--line-2); }
+.vf-mat:focus-within { box-shadow: 0 0 0 2px var(--blue-line); }
+.vf-mat input { border: none; outline: none; width: 92px; font: 700 15px var(--mono); background: transparent; }
+.vf-mat .badge { padding: 1px 7px; font-size: 9.5px; }
+.vf-sel { position: relative; display: flex; align-items: center; gap: 8px; border: 1px solid var(--line-2); border-radius: 12px; padding: 4px 10px;
+  height: 42px; background: #fff; flex: 0 1 auto; min-width: 0; max-width: 360px; }
+.vf-sel:hover:not(.off) { border-color: var(--blue-line); }
+.vf-sel:focus-within { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+.vf-sel b { font-size: 12.5px; }
+.vf-sel.off { opacity: .6; }
+.vf-sel select { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+.vf-sel select:disabled { cursor: default; }
+.vf-top .badge.big .sh { display: none; }
+.vf-top .fseg button { display: inline-flex; align-items: center; gap: 5px; }
+.compact .vf-doc, .compact .vf-mat, .compact .vf-sel { height: 38px; }
+
+/* ------------------------------------------------------------- bandeau des champs */
+.vf-body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+.vf-strip { flex: none; flex-direction: row; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 14px; }
+.compact .vf-strip { padding: 5px 8px; gap: 8px; }
+.vf-verdict { display: flex; align-items: center; gap: 9px; border-radius: 11px; padding: 5px 12px 5px 8px; flex: none; min-width: 170px; }
+.vf-verdict .vt { display: flex; flex-direction: column; line-height: 1.15; }
+.vf-verdict b { font: 700 14.5px var(--display); }
+.vf-verdict span { font-size: 11px; font-weight: 600; opacity: .9; white-space: nowrap; }
+.vf-chips { display: flex; gap: 5px; align-items: center; min-width: 0; flex: 1; overflow-x: auto; scrollbar-width: none; padding: 2px; }
+.vf-chips::-webkit-scrollbar { height: 0; }
+.vf-chip { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; border: 1px solid var(--line-2); background: #fff;
+  padding: 3px 9px 3px 6px; font-size: 11.5px; font-weight: 700; white-space: nowrap; color: var(--ink-2); flex: none; cursor: pointer; }
+.vf-chip:hover { border-color: var(--faint); }
+.vf-chip.ok svg { color: var(--green); }
+.vf-chip.ko { background: var(--red-bg); border-color: #F5C2C2; color: var(--red); }
+.vf-chip.ko .vals { font: 600 11px var(--mono); color: var(--ink); }
+.vf-chip.ko .vals s { color: var(--red); text-decoration: none; }
+.vf-chip.sel { box-shadow: 0 0 0 2px var(--blue); }
+.vf-chip.ko.sel { box-shadow: 0 0 0 2px var(--red); }
+.vf-chip.grp { background: var(--soft); }
+.vf-strip .btn.on { background: var(--blue-soft); border-color: var(--blue-line); color: var(--blue); }
+
+/* ------------------------------------------------------------- volets */
+.vf-stage { flex: 1; min-height: 0; display: flex; background: #E3E8EF; border-radius: 16px; position: relative; overflow: hidden; }
+.vf-panes { flex: 1; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); position: relative; }
+.vf-panes.one { grid-template-columns: minmax(0, 1fr); }
+.vf-pane { position: relative; min-width: 0; min-height: 0; }
+.vf-pane + .vf-pane { border-left: 2px solid #CBD5E1; }
+.vf-tag { position: absolute; z-index: 3; left: 10px; top: 8px; display: flex; align-items: center; gap: 7px; background: rgba(255, 255, 255, .96);
+  border-radius: 10px; padding: 4px 9px 4px 7px; box-shadow: 0 2px 10px rgba(15, 23, 42, .10); font-size: 12px; font-weight: 700;
+  max-width: calc(100% - 20px); pointer-events: none; }
+.vf-tag .sw { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.vf-tag .sw.s { background: var(--amber); }
+.vf-tag .sw.o { background: var(--blue); }
+.vf-tag .meta { font-weight: 600; color: var(--muted); font-size: 11px; min-width: 0; }
+.vf-tag .badge { padding: 1px 7px; font-size: 9.5px; }
+.vf-view { position: absolute; inset: 0; overflow: auto; scrollbar-gutter: stable; --vf-top: 44px; outline: none; }
+.compact .vf-view { --vf-top: 40px; }
+.vf-pages { min-height: 100%; min-width: 100%; width: max-content; display: flex; flex-direction: column; align-items: center;
+  padding: var(--vf-top) 12px 12px; }
+.vf-stack { position: relative; flex: none; }
+.vf-layer { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.vf-layer.over { position: absolute; left: 0; top: 0; }
+.vf-pg { position: relative; flex: none; background: #fff; box-shadow: 0 2px 10px rgba(15, 23, 42, .14); border-radius: 2px; }
+.vf-pg .cv, .vf-pg .cv canvas, .vf-pg img { display: block; width: 100%; height: 100%; }
+.vf-view .msg { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; padding: 20px; color: var(--muted); font-weight: 600; }
+
+/* surlignage posé sur le document : rouge sur le soumis, bleu sur l'original, vert pour un champ identique */
+.vf-hl { position: absolute; border-radius: 4px; pointer-events: none; border: 2px solid; }
+.vf-hl.t-red { border-color: var(--red); background: rgba(185, 28, 28, .13); }
+.vf-hl.t-blue { border-color: var(--blue); background: rgba(29, 78, 216, .10); }
+.vf-hl.t-green { border-color: var(--green); background: rgba(21, 128, 61, .10); }
+.vf-hl.t-zone { border-color: var(--blue); background: rgba(29, 78, 216, .08); animation: zone-hl 1.9s ease-out forwards; left: -6px !important; width: calc(100% + 12px) !important; }
+.vf-hl.sel { border-width: 3px; box-shadow: 0 0 0 3px rgba(255, 255, 255, .7); }
+.vf-hl.est { border-style: dashed; }
+.vf-tip { position: absolute; left: 10px; top: calc(100% + 9px); z-index: 4; background: #fff; border: 2px solid var(--red); border-radius: 10px;
+  padding: 5px 9px; font-size: 11.5px; font-weight: 600; color: var(--ink); box-shadow: 0 8px 24px rgba(15, 23, 42, .18); white-space: nowrap; }
+.vf-hl.t-blue .vf-tip { border-color: var(--blue); }
+.vf-hl.t-green .vf-tip { border-color: var(--green); }
+.vf-tip b, .vf-tip s { font-family: var(--mono); text-decoration: none; }
+.vf-tip s { color: var(--red); font-weight: 700; }
+.vf-tip b.nm { font-family: inherit; }
+.vf-tip::before { content: ""; position: absolute; left: 18px; top: -7px; width: 10px; height: 10px; background: #fff;
+  border-left: 2px solid; border-top: 2px solid; border-color: inherit; transform: rotate(45deg); }
+
+/* rideau du calque */
+.vf-knob { position: absolute; top: 0; bottom: 0; width: 0; border-left: 3px solid var(--blue); z-index: 5; cursor: ew-resize; touch-action: none; }
+.vf-knob::after { content: ""; position: absolute; top: 0; bottom: 0; left: -10px; width: 18px; }
+.vf-knob i { position: absolute; top: 50%; left: -19px; width: 36px; height: 36px; margin-top: -18px; border-radius: 50%; background: var(--blue); color: #fff;
+  display: grid; place-items: center; font-style: normal; font-weight: 800; box-shadow: 0 4px 14px rgba(29, 78, 216, .4); z-index: 1; }
+
+/* état vide */
+.vf-empty { display: grid; place-items: center; padding: 20px; }
+.vf-empty-card { background: var(--surface); border-radius: 20px; box-shadow: var(--shadow); padding: 28px 30px; max-width: 520px; display: flex;
+  flex-direction: column; align-items: center; gap: 10px; text-align: center; }
+.vf-empty-card p { margin: 0 0 6px; line-height: 1.5; }
+
+/* tiroir « Tableau » */
+.vf-drawer { position: absolute; top: 8px; right: 8px; bottom: 8px; width: min(600px, calc(100% - 16px)); z-index: 6; background: var(--surface);
+  border-radius: 16px; box-shadow: 0 12px 40px rgba(15, 23, 42, .22); padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.vf-drawer tr.ko td { background: #FFF6F6; }
+.vf-drawer tr.sel td { box-shadow: inset 0 1px 0 var(--blue), inset 0 -1px 0 var(--blue); }
+
+/* dock */
+.vf-stage .dock { padding: 10px 10px 10px 8px; }
+.vf-dock .field { padding: 6px 8px; font-size: 12px; border-radius: 9px; width: 100%; }
+.vf-dock .mini-l { font-size: 10.5px; font-weight: 600; color: var(--muted); margin: 1px 2px -2px; }
+.compact .vf-dock .mini-l { display: none; }
+.vf-dock .btn.two { flex-direction: column; align-items: flex-start; gap: 1px; padding: 7px 10px; }
+.vf-dock .btn.two .r { display: flex; align-items: center; gap: 7px; width: 100%; }
+.vf-dock .btn.two .sub { font-size: 10.5px; font-weight: 600; opacity: .85; }
+.vf-dock .btn.two .kbd { margin-left: auto; }
+.vf-dock .vf-off { opacity: .45; pointer-events: none; }
+
+/* plein écran (F11) : les deux volets et le dock prennent toute la fenêtre */
+.vf-stage.focus { position: fixed; inset: 0; z-index: 30; border-radius: 0; background: #DDE3EB; padding-top: 56px; }
+.vf-fbar { top: 9px; }
+
+@media (max-width: 1500px) {
+  .vf-doc .dn { max-width: 150px; }
+  .vf-sel { max-width: 250px; }
+  .vf-chip .lbl13 { display: none; }
+  .vf-top .badge.big .lg { display: none; }
+  .vf-top .badge.big .sh { display: inline; }
+  .vf-dock .btn.two .kbd { display: none; }
+  .vf-verdict { min-width: 0; }
+  .vf-wide { display: none !important; }
+}
+@media (max-width: 1250px) {
+  .vf-title { display: none; }
+  .vf-top .vf-vsep { display: none; }
+}
+.vf-dock .btn svg, .vf-top svg, .vf-chip svg { flex: none; }

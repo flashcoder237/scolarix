@@ -28,6 +28,8 @@ class Comparison:
     champ: str
     soumis: str
     original: str
+    cle: str = ""        # matricule, nom, annee, ue, moyenne, decision : sert à situer le champ sur les documents
+    code: str = ""       # code de l'unité d'enseignement (MED355…), s'il est écrit sur l'original
 
     @property
     def conforme(self) -> bool:
@@ -80,19 +82,23 @@ def best_match(rels: list, ident: dict):
     return max(rels, key=lambda r: (score(r), r.annee_academique or ""))
 
 
-def _grades(text: str) -> dict[str, tuple[str, str]]:
-    """{clé normalisée: (libellé, note)} pour chaque ligne de note."""
-    out: dict[str, tuple[str, str]] = {}
+UE_CODE = re.compile(r"^([A-Z]{2,4}\s?\d{2,4})\s+")
+
+
+def _grades(text: str) -> dict[str, tuple[str, str, str]]:
+    """{clé normalisée: (libellé, note, code UE)} pour chaque ligne de note."""
+    out: dict[str, tuple[str, str, str]] = {}
     for line in text.splitlines():
         if re.search(r"moyenne", line, re.I):
             continue
         m = GRADE_LINE.match(line.strip())
         if m:
-            label = re.sub(r"^[A-Z]{2,4}\s?\d{2,4}\s+", "", m.group("label")).strip()
+            code = UE_CODE.match(m.group("label"))
+            label = UE_CODE.sub("", m.group("label")).strip()
             label = re.sub(r"\s+\d+$", "", label)
             key = norm_text(label)[:28]
             if key and key not in out:
-                out[key] = (label, m.group("note").replace(".", ","))
+                out[key] = (label, m.group("note").replace(".", ","), code.group(1).replace(" ", "") if code else "")
     return out
 
 
@@ -107,24 +113,25 @@ def _moyenne(text: str) -> str | None:
 def compare(submitted_text: str, original_text: str, original: Releve) -> list[Comparison]:
     rows: list[Comparison] = []
     sub_mats = find_matricules(submitted_text)
-    rows.append(Comparison("Matricule", sub_mats[0] if sub_mats else "—", original.matricule))
+    rows.append(Comparison("Matricule", sub_mats[0] if sub_mats else "—", original.matricule, "matricule"))
     sub_norm = norm_text(submitted_text)
     rows.append(Comparison("Nom et prénom",
                            original.nom_complet if norm_text(original.nom_complet) in sub_norm else "(différent ou illisible)",
-                           original.nom_complet))
+                           original.nom_complet, "nom"))
     yr = re.search(r"((?:19|20)\d{2})\s*[-/–]\s*((?:19|20)\d{2})", submitted_text)
     rows.append(Comparison("Année académique", f"{yr.group(1)}-{yr.group(2)}" if yr else "—",
-                           original.annee_academique or "—"))
+                           original.annee_academique or "—", "annee"))
     g_sub, g_orig = _grades(submitted_text), _grades(original_text)
-    for key, (label, note) in g_orig.items():
+    for key, (label, note, code) in g_orig.items():
         sub = g_sub.get(key)
         if sub is None:  # tolère une petite différence de libellé (OCR)
             from rapidfuzz import fuzz, process
             best = process.extractOne(key, list(g_sub), scorer=fuzz.ratio, score_cutoff=80)
             sub = g_sub.get(best[0]) if best else None
-        rows.append(Comparison(label, sub[1] if sub else "—", note))
-    rows.append(Comparison("Moyenne", _moyenne(submitted_text) or "—", _moyenne(original_text) or original.moyenne or "—"))
-    rows.append(Comparison("Décision du jury", detect_statut(submitted_text)[0] or "—", original.statut or "—"))
+        rows.append(Comparison(label, sub[1] if sub else "—", note, "ue", code))
+    rows.append(Comparison("Moyenne", _moyenne(submitted_text) or "—", _moyenne(original_text) or original.moyenne or "—",
+                           "moyenne"))
+    rows.append(Comparison("Décision du jury", detect_statut(submitted_text)[0] or "—", original.statut or "—", "decision"))
     return rows
 
 
@@ -166,3 +173,255 @@ def report_pdf(rows: list[Comparison], original: Releve, dest: str | Path, deman
         c.drawString(490, y, "Conforme" if r.conforme else "DIVERGENT")
     c.save()
     return Path(dest)
+
+
+# ---------------------------------------------------------------- positions sur les documents
+# L'écran de vérification surligne chaque champ comparé sur les deux documents et y amène les deux volets.
+# Positions en fractions de la page (origine en haut à gauche) : indépendantes du zoom de l'affichage.
+
+@dataclass
+class Ligne:
+    page: int            # numéro de page dans le fichier affiché (1 = première)
+    text: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    def boite(self) -> dict:
+        r = lambda v: round(max(0.0, min(1.0, v)), 4)  # noqa: E731
+        return {"page": self.page, "x0": r(self.x0), "y0": r(self.y0), "x1": r(self.x1), "y1": r(self.y1)}
+
+
+@dataclass
+class Lecture:
+    """Le document soumis tel que lu : texte, lignes situées (si possible), nature et confiance OCR."""
+    text: str
+    lignes: list[Ligne]
+    nature: str           # « PDF texte », « PDF scanné », « Image »
+    pages: int
+    ocr: float | None = None
+
+    def info(self) -> dict:
+        return {"nature": self.nature, "pages": self.pages, "ocr": self.ocr, "positions": bool(self.lignes)}
+
+
+def _group_lines(items: list[tuple[int, float, float, float, float, str]]) -> list[Ligne]:
+    """Regroupe des morceaux de texte situés (page, x0, y0, x1, y1, texte) en lignes : même page, même hauteur ;
+    dans une ligne, les morceaux sont remis de gauche à droite (cellules d'un tableau Word)."""
+    groups: list[list[tuple[int, float, float, float, float, str]]] = []
+    for it in sorted((t for t in items if t[5].strip()), key=lambda t: (t[0], (t[2] + t[4]) / 2, t[1])):
+        page, _x0, y0, _x1, y1, _t = it
+        cy = (y0 + y1) / 2
+        g = groups[-1] if groups else None
+        if g and g[0][0] == page:
+            gy0, gy1 = min(p[2] for p in g), max(p[4] for p in g)
+            if gy0 <= cy <= gy1 and abs((gy0 + gy1) / 2 - cy) < max(0.006, (y1 - y0) * 0.6):
+                g.append(it)
+                continue
+        groups.append([it])
+    out = []
+    for g in groups:
+        g.sort(key=lambda p: p[1])
+        out.append(Ligne(page=g[0][0], text=re.sub(r"\s+", " ", " ".join(p[5].strip() for p in g)),
+                         x0=min(p[1] for p in g), y0=min(p[2] for p in g), x1=max(p[3] for p in g), y1=max(p[4] for p in g)))
+    return out
+
+
+def pdf_lines(path: str | Path, first: int = 1, last: int | None = None) -> list[Ligne]:
+    """Lignes d'un PDF texte, situées (PDFium : rectangles de texte de la couche texte)."""
+    from .extractors import open_pdf
+    items: list[tuple[int, float, float, float, float, str]] = []
+    try:
+        doc = open_pdf(Path(path))
+    except Exception:
+        return []
+    try:
+        n = len(doc)
+        for num in range(max(1, first), min(n, last or n) + 1):
+            page = doc[num - 1]
+            try:
+                w, h = page.get_size()
+                tp = page.get_textpage()
+                try:
+                    rects = [tp.get_rect(i) for i in range(tp.count_rects())]
+                    rects.sort(key=lambda r: (-(r[1] + r[3]) / 2, r[0]))
+                    for left, bottom, right, top in rects:
+                        text = (tp.get_text_bounded(left, bottom, right, top) or "").replace("\r", " ").replace("\n", " ")
+                        items.append((num, left / w, (h - top) / h, right / w, (h - bottom) / h, text))
+                finally:
+                    tp.close()
+            except Exception:
+                continue
+            finally:
+                page.close()
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    return _group_lines(items)
+
+
+def _unrotate(x: float, y: float, w: int, h: int, w0: int, h0: int, angle: float) -> tuple[float, float]:
+    """Point de l'image redressée (PIL rotate(angle, expand=True)) ramené dans l'image d'origine."""
+    import math
+    t = math.radians(angle)
+    dx, dy = x - w / 2, y - h / 2
+    ox = dx * math.cos(t) - dy * math.sin(t)
+    oy = dx * math.sin(t) + dy * math.cos(t)
+    return ox + w0 / 2, oy + h0 / 2
+
+
+def _ocr_image(img, settings: Settings, page: int) -> tuple[str, list[Ligne], float | None]:
+    """OCR d'une image avec les boîtes des mots (Tesseract image_to_data) : texte, lignes situées, confiance."""
+    import pytesseract
+    w0, h0 = img.size
+    angle = 0.0
+    if settings.ocr_preprocess:
+        img, angle = preprocess_for_ocr(img)
+    w, h = img.size
+    data = pytesseract.image_to_data(img, lang=settings.ocr_lang or "fra", config="--psm 6",
+                                     output_type=pytesseract.Output.DICT)
+    groups: dict[tuple, list[int]] = {}
+    confs: list[float] = []
+    for i, word in enumerate(data["text"]):
+        if not str(word).strip():
+            continue
+        groups.setdefault((data["block_num"][i], data["par_num"][i], data["line_num"][i]), []).append(i)
+        try:
+            c = float(data["conf"][i])
+            if c >= 0:
+                confs.append(c)
+        except (TypeError, ValueError):
+            pass
+    texts, lignes = [], []
+    for _key, idx in sorted(groups.items()):
+        words = " ".join(str(data["text"][i]) for i in idx)
+        texts.append(words)
+        pts = []
+        for i in idx:
+            x, y, bw, bh = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            for px, py in ((x, y), (x + bw, y), (x, y + bh), (x + bw, y + bh)):
+                pts.append(_unrotate(px, py, w, h, w0, h0, angle) if abs(angle) >= 0.01 else (px, py))
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        lignes.append(Ligne(page=page, text=words, x0=min(xs) / w0, y0=min(ys) / h0, x1=max(xs) / w0, y1=max(ys) / h0))
+    return "\n".join(texts), lignes, (round(sum(confs) / len(confs), 1) if confs else None)
+
+
+def read_layout(path: str | Path, settings: Settings) -> Lecture:
+    """Comme read_submitted, avec en plus les lignes situées : couche texte d'un PDF, boîtes OCR d'un scan."""
+    path = Path(path)
+    if path.suffix.lower() == ".pdf":
+        pages = pdf_pages_text(path)
+        if sum(len(p.text.strip()) for p in pages) < MIN_TEXT_CHARS * len(pages) and configure_tesseract(settings):
+            from .extractors import open_pdf
+            texts, lignes, confs = [], [], []
+            doc = open_pdf(path)
+            try:
+                for p in pages:
+                    img = doc[p.number - 1].render(scale=300 / 72).to_pil()
+                    t, ls, c = _ocr_image(img, settings, p.number)
+                    texts.append(t)
+                    lignes += ls
+                    if c is not None:
+                        confs.append(c)
+            finally:
+                doc.close()
+            return Lecture("\n".join(texts), lignes, "PDF scanné", len(pages),
+                           round(sum(confs) / len(confs), 1) if confs else None)
+        return Lecture("\n".join(p.text for p in pages), pdf_lines(path), "PDF texte", len(pages))
+    from PIL import Image, ImageOps
+    if not configure_tesseract(settings):
+        raise RuntimeError("Tesseract est nécessaire pour lire une image.")
+    with Image.open(path) as im:
+        img = ImageOps.exif_transpose(im).convert("RGB")      # photo de téléphone : sens réel de la prise de vue
+    text, lignes, conf = _ocr_image(img, settings, 1)
+    return Lecture(text, lignes, "Image", 1, conf)
+
+
+_VAL = lambda v: (v or "").replace(".", ",").strip()  # noqa: E731
+RX_LABEL = {
+    "matricule": re.compile(r"\bMATRICULE\b"),
+    "nom": re.compile(r"\bNOMS?\b.*\bPRENOMS?\b|^\s*NOMS?\b"),
+    "annee": re.compile(r"\bANNEE\s+ACADEMIQUE\b|\bACADEMIC\s+YEAR\b"),
+    "moyenne": re.compile(r"\bMOYENNE\b"),
+    "decision": re.compile(r"\bDECISION\b"),
+}
+
+
+def _find_line(row: Comparison, value: str, lignes: list[Ligne]) -> Ligne | None:
+    """La ligne du document qui porte ce champ (valeur et/ou libellé)."""
+    if not lignes:
+        return None
+    norms = [norm_text(l.text) for l in lignes]
+    raw = [l.text.replace(".", ",") for l in lignes]
+    val = _VAL(value)
+    has_val = bool(val) and val not in ("—", "(différent ou illisible)")
+    cle = row.cle
+    if cle == "ue":
+        from rapidfuzz import fuzz
+        key = norm_text(row.champ)[:24]
+        best, best_score = None, 0.0
+        for i, n in enumerate(norms):
+            if RX_LABEL["moyenne"].search(n):
+                continue
+            score = fuzz.partial_ratio(key, n) if key else 0
+            if row.code and row.code in n.replace(" ", ""):
+                score += 40
+            if has_val and re.search(r"(?<![\d,])" + re.escape(val) + r"(?![\d])", raw[i]):
+                score += 15
+            if score > best_score:
+                best, best_score = lignes[i], score
+        return best if best_score >= 80 else None
+    if cle == "matricule":
+        if has_val:
+            v = norm_text(val).replace(" ", "")
+            for i, n in enumerate(norms):
+                if v and v in n.replace(" ", ""):
+                    return lignes[i]
+        return next((lignes[i] for i, n in enumerate(norms) if RX_LABEL["matricule"].search(n)), None)
+    if cle == "nom":
+        if has_val:
+            v = norm_text(val)
+            for i, n in enumerate(norms):
+                if v and v in n:
+                    return lignes[i]
+        return next((lignes[i] for i, n in enumerate(norms) if RX_LABEL["nom"].search(n)), None)
+    if cle == "annee":
+        if has_val:
+            m = re.match(r"((?:19|20)\d\d)\D+((?:19|20)\d\d)", val)
+            if m:
+                rx = re.compile(m.group(1) + r"\s*[-/–]\s*" + m.group(2))
+                for i, l in enumerate(lignes):
+                    if rx.search(l.text):
+                        return l
+        return next((lignes[i] for i, n in enumerate(norms) if RX_LABEL["annee"].search(n)), None)
+    if cle == "moyenne":
+        cands = [i for i, n in enumerate(norms) if RX_LABEL["moyenne"].search(n)]
+        if has_val:
+            with_val = [i for i in cands if val in raw[i]] or [i for i, r in enumerate(raw) if val in r and i not in cands and
+                                                               re.search(r"(?<![\d,])" + re.escape(val) + r"(?![\d])", r)]
+            if with_val:
+                return lignes[with_val[-1]]
+        pref = [i for i in cands if re.search(r"ANNUELLE|GENERALE", norms[i])]
+        return lignes[(pref or cands)[-1]] if (pref or cands) else None
+    if cle == "decision":
+        cands = [i for i, n in enumerate(norms) if RX_LABEL["decision"].search(n)]
+        if cands:
+            return lignes[cands[-1]]
+        if has_val:
+            v = norm_text(val)
+            hits = [i for i, n in enumerate(norms) if v and re.search(r"\b" + re.escape(v) + r"\b", n)]
+            return lignes[hits[-1]] if hits else None
+    return None
+
+
+def locate(rows: list[Comparison], soumis: list[Ligne], original: list[Ligne]) -> list[dict]:
+    """Pour chaque champ comparé : sa ligne sur le document soumis et sur l'original (ou None)."""
+    out = []
+    for r in rows:
+        s = _find_line(r, r.soumis, soumis) if soumis else None
+        o = _find_line(r, r.original, original) if original else None
+        out.append({"soumis": s.boite() if s else None, "original": o.boite() if o else None})
+    return out
