@@ -1118,7 +1118,7 @@ async function search(q) {
   const selKey = () => page.locator(`${RV} [data-testid="piece"].sel`).getAttribute("data-key");
   const order = () => page.locator(`${RV} [data-testid="piece"]`).evaluateAll((els) => els.map((e) => e.dataset.key));
 
-  await scenario("Revue de la demande : aperçu avant préparation, contrôle à l'écran, vues, ordre, duplicata", async () => {
+  if (!process.env.E2E_NO_WORD) await scenario("Revue de la demande : aperçu avant préparation, contrôle à l'écran, vues, ordre, duplicata", async () => {
     await page.keyboard.press("Control+1");
     await search("18M042");
     await page.locator(ROWS).first().waitFor({ timeout: 30000 });
@@ -1212,7 +1212,7 @@ async function search(q) {
     await page.locator(RV).waitFor({ state: "detached" });
   });
 
-  await scenario("Page Demandes : maître–détail, pièces dépliées, Entrée = revue, Ctrl+Entrée = remise", async () => {
+  if (!process.env.E2E_NO_WORD) await scenario("Page Demandes : maître–détail, pièces dépliées, Entrée = revue, Ctrl+Entrée = remise", async () => {
     await page.keyboard.press("Control+2");
     await page.getByTestId("demandes-topbar").waitFor();
     await page.getByTestId("demandes-statuts").getByRole("radio", { name: /^À remettre/ }).click();
@@ -1245,7 +1245,7 @@ async function search(q) {
     await waitToast(/remise et close/);
   });
 
-  await scenario("Revue de la demande : Échap pendant la préparation = Arrêter, rien n'est produit", async () => {
+  if (!process.env.E2E_NO_WORD) await scenario("Revue de la demande : Échap pendant la préparation = Arrêter, rien n'est produit", async () => {
     await page.keyboard.press("Control+1");
     await search("18M042");
     await page.locator(ROWS).first().waitFor({ timeout: 30000 });
@@ -1337,9 +1337,14 @@ async function search(q) {
     await page.getByTestId("rule-chercher").fill("RELEVÉ DE NOTES");
     await page.getByTestId("rule-remplacer").fill("Ref N° RELEVÉ DE NOTES");
     await page.getByTestId("rule-taille").fill("7");
-    const after = page.getByTestId("rules-after-img");
-    await after.locator("img").waitFor({ timeout: 60000 });
-    await after.locator(".hd-rect.ins").first().waitFor({ timeout: 60000 });     // texte ajouté situé sur le rendu
+    if (process.env.E2E_NO_WORD) {
+      // poste sans Word ni LibreOffice : rendu typographique, signalé comme tel
+      await page.getByText(/rendu typographique \(aucun convertisseur sur ce poste\)/).first().waitFor({ timeout: 60000 });
+    } else {
+      const after = page.getByTestId("rules-after-img");
+      await after.locator("img").waitFor({ timeout: 60000 });
+      await after.locator(".hd-rect.ins").first().waitFor({ timeout: 60000 });   // texte ajouté situé sur le rendu
+    }
     await page.getByTestId("rules-preview").getByText(/[1-9]\d* remplacements?/).first().waitFor();
     await page.waitForTimeout(400);
     await shot("reglages_remplacements");
