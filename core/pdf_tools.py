@@ -186,11 +186,14 @@ def _cover_page(rels: list[Releve], title: str, page_labels: list[str] | None = 
 def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
                   stamp: tuple[str, str] | None = None, title: str = "Cursus académique",
                   prepare=None, absent: list[str] | None = None,
-                  footer: str | None = None) -> tuple[Path, int, list[str]]:
+                  footer: str | None = None, layout: list | None = None) -> tuple[Path, int, list[str]]:
     """Fusionne plusieurs relevés (dans l'ordre donné) en un seul PDF. Renvoie (chemin, nb pages, manquants).
 
     ``prepare(rel) -> rel`` produit au besoin l'aperçu PDF d'un relevé Word (voir core/preview.py).
-    ``absent`` : périodes attendues mais introuvables, signalées sur la page de garde."""
+    ``absent`` : périodes attendues mais introuvables, signalées sur la page de garde.
+    ``layout`` : liste remplie avec la place de chaque page du PDF produit (aperçu du cursus : vignettes
+    numérotées comme l'impression) — {"releve_id": None, "first", "last"} pour la page de garde, puis un
+    élément par relevé fusionné."""
     missing: list[str] = []
     chunks: list[tuple[Releve, PdfReader, range]] = []
     readers: dict[str, PdfReader] = {}
@@ -222,7 +225,11 @@ def merge_releves(rels: list[Releve], dest: str | Path, cover: bool = True,
             pos += len(pages)
         for page in _cover_page(kept, title, labels, (absent or []) + missing).pages:
             writer.add_page(page)
-    for _, reader, pages in chunks:
+        if layout is not None:
+            layout.append({"releve_id": None, "first": 1, "last": len(writer.pages)})
+    for r, reader, pages in chunks:
+        if layout is not None and len(pages):
+            layout.append({"releve_id": r.id, "first": len(writer.pages) + 1, "last": len(writer.pages) + len(pages)})
         for i in pages:
             page = writer.add_page(reader.pages[i])
             if stamp:

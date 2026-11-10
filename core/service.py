@@ -394,13 +394,11 @@ class Service:
                      mode: str = "export", op: str | None = None) -> dict:
         """Fusion du cursus. Les aperçus Word sont produits d'abord, UNE fois par fichier source (progression
         « Conversion 3/7 : EM4 S1.docx… », annulable avec ``cancel(op)``) ; un relevé dont l'aperçu échoue est
-        écarté avec son motif, sans bloquer les autres. Le numéro de délivrance n'est réservé qu'ensuite."""
-        rels = [r for r in (self.db.get(int(i)) for i in releve_ids) if r]
-        if not rels:
-            raise ServiceError("Cochez au moins un relevé.")
-        rels = self.db.collapse(rels)      # deux exemplaires du même relevé cochés : fusionné une seule fois
-        rels.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",
-                                 1 if (r.session or "").lower().startswith("rattrap") else 0))
+        écarté avec son motif, sans bloquer les autres. Le numéro de délivrance n'est réservé qu'ensuite.
+        ``mode="preview"`` : aperçu fusionné de la revue du cursus, sans numéro ni journal (voir _cursus_preview)."""
+        if mode == "preview":
+            return self._cursus_preview(matricule, releve_ids, cover, duplicata, op)
+        rels = self._cursus_rels(releve_ids)
         with self._operation(op) as cancelled:
             ready, errors = self._prepare_word(rels, op, cancelled, "Fusion")
             self._progress(op, "fusion", len(rels), len(rels), "Contrôle et fusion des relevés…")
@@ -465,8 +463,11 @@ class Service:
         d = self.db.demande(int(did))
         if d is None:
             raise ServiceError("Demande introuvable.")
-        if "duplicata" in allowed and bool(allowed["duplicata"]) != bool(d["duplicata"]) and d["statut"] == "PRÊTE":
-            allowed["statut"] = "EN COURS"      # le timbre change : le dossier préparé est à refaire
+        if "duplicata" in allowed and bool(allowed["duplicata"]) != bool(d["duplicata"]) \
+                and d["statut"] in ("PRÊTE", "IMPRIMÉE"):
+            # le timbre change : le dossier préparé (ou déjà imprimé) est à refaire, sinon une réimpression
+            # partirait avec l'ancien timbre ; la revue de la demande le demande et l'explique avant
+            allowed["statut"] = "EN COURS"
         if allowed:
             self.db.update_demande(int(did), **allowed)
         return self._demande(did)
@@ -1210,6 +1211,205 @@ class Service:
         self._log("INDEX EXCLUSION", None, f"Dossier exclu : {d} · {n_files} fichier(s), {n_rel} relevé(s) et "
                                            f"{n_anom} anomalie(s) retirés de l'index (archives non modifiées)")
         return dict(res, applique=True, exclusions=list(self.s.exclusions))
+
+    # ---- revue demandes / cursus ----
+    # Revue de la demande (contrôle à l'écran pièce par pièce, étapes horodatées, bordereau provisoire), page
+    # Demandes (tableau de bord) et aperçu du cursus fusionné sans numéro de délivrance. Bloc délimité : les
+    # autres chantiers (vérification, indexation, réglages) n'y touchent pas.
+    CONTROLE = "CONTRÔLE VISUEL"
+    CONTROLE_RETIRE = "CONTRÔLE VISUEL RETIRÉ"
+    CONTROLE_OMIS = "CONTRÔLE VISUEL OMIS"
+
+    def demande_review(self, did: int) -> dict:
+        """La demande telle que la montre la revue : pièces (fichier préparé encore valable ou non), relevés
+        contrôlés à l'écran (journal), heure de chaque étape, bordereau et dossier préparés."""
+        res = self._demande(did)
+        d = res["demande"]
+        state: dict[int, bool] = {}
+        for row in self.db.conn.execute(
+                "SELECT action, releve_id FROM journal WHERE action IN (?, ?) AND detail LIKE ? ORDER BY id",
+                (self.CONTROLE, self.CONTROLE_RETIRE, f"Demande {d['numero']} ·%")):
+            state[row["releve_id"]] = row["action"] == self.CONTROLE
+        present = {it["item"]["releve_id"] for it in res["items"]}
+        prepared = d["statut"] in ("PRÊTE", "IMPRIMÉE", "REMISE")
+        folder = Path(d["dossier"]) if d["dossier"] else None
+
+        def exists(p) -> bool:
+            try:
+                return bool(p) and Path(p).exists()
+            except OSError:
+                return False
+        for it in res["items"]:
+            item = it["item"]
+            it["prepared"] = bool(prepared and item["etat"] == "PRÊT" and exists(item["fichier"]))
+        bord = folder / demandes.BORDEREAU if prepared and folder else None
+        tout = folder / demandes.A_IMPRIMER if prepared and folder else None
+        res["review"] = {
+            "controles": sorted(i for i, ok in state.items() if ok and i in present),
+            "etapes": self._demande_etapes(d),
+            "bordereau": str(bord) if exists(bord) else None,
+            "a_imprimer": str(tout) if exists(tout) else None,
+            "pages": sum((it["releve"] or {}).get("nb_pages") or 0 for it in res["items"]),
+        }
+        return res
+
+    def _demande_etapes(self, d) -> dict:
+        """Heure de chaque étape (journal « DEMANDE ») ; seulement celles que le statut actuel a franchies
+        (une demande modifiée après préparation repart « EN COURS » : l'ancienne heure ne vaut plus)."""
+        seen: dict[str, str] = {}
+        for row in self.db.conn.execute("SELECT horodatage, detail FROM journal WHERE action='DEMANDE' AND detail LIKE ? "
+                                        "ORDER BY id", (f"{d['numero']}%",)):
+            detail = row["detail"] or ""
+            for key, mark in (("preparer", f"{d['numero']} préparée"), ("imprimer", f"{d['numero']} : imprimée"),
+                              ("remettre", f"{d['numero']} : remise"), ("annuler", f"{d['numero']} : annulée")):
+                if detail.startswith(mark):
+                    seen[key] = row["horodatage"]
+        rank = {"EN COURS": 0, "PRÊTE": 1, "IMPRIMÉE": 2, "REMISE": 3, "ANNULÉE": 0}.get(d["statut"], 0)
+        out = {"recue": d["creee_le"], "preparer": None, "imprimer": None, "remettre": None, "annuler": None}
+        for k, need in (("preparer", 1), ("imprimer", 2), ("remettre", 3)):
+            if rank >= need:
+                out[k] = seen.get(k)
+        if d["statut"] == "ANNULÉE":
+            out["annuler"] = seen.get("annuler")
+        return out
+
+    def demande_control(self, did: int, releve_id: int, checked: bool = True) -> dict:
+        """Coche « contrôlé à l'écran » d'un relevé de la demande : tracée au journal comme le contrôle visuel
+        du guichet (retirer la coche est tracé aussi)."""
+        d = self.db.demande(int(did))
+        if d is None:
+            raise ServiceError("Demande introuvable.")
+        rel = self.db.get(int(releve_id))
+        what = f"{rel.periode} · {rel.annee_academique or '?'}" if rel else "relevé retiré de l'index"
+        self.db.log(self.CONTROLE if checked else self.CONTROLE_RETIRE, self.s.operateur, self.s.poste, int(releve_id),
+                    rel.matricule if rel else d["matricule"],
+                    f"Demande {d['numero']} · {what} · " + ("contrôlé à l'écran par l'agent avant impression" if checked
+                                                            else "coche « contrôlé à l'écran » retirée"))
+        return self.demande_review(did)
+
+    def demande_control_skipped(self, did: int, releve_ids: list[int]) -> dict:
+        """« Imprimer tout » confirmé alors que des relevés n'ont pas été contrôlés à l'écran : c'est tracé."""
+        d = self.db.demande(int(did))
+        if d is None:
+            raise ServiceError("Demande introuvable.")
+        for rid in releve_ids or []:
+            rel = self.db.get(int(rid))
+            what = f"{rel.periode} · {rel.annee_academique or '?'}" if rel else "relevé retiré de l'index"
+            self.db.log(self.CONTROLE_OMIS, self.s.operateur, self.s.poste, int(rid), rel.matricule if rel else d["matricule"],
+                        f"Demande {d['numero']} · {what} · impression confirmée par l'agent sans contrôle à l'écran")
+        return {"logged": len(releve_ids or [])}
+
+    def demande_bordereau_preview(self, did: int) -> dict:
+        """Bordereau provisoire (avant préparation) pour l'aperçu de la revue ; refait seulement si la demande a
+        changé. Fichier temporaire : aucun numéro de délivrance réservé, rien au journal."""
+        d = self.db.demande(int(did))
+        if d is None:
+            raise ServiceError("Demande introuvable.")
+        items = tuple((item["releve_id"], item["ordre"]) for item, _rel in self.db.demande_items(int(did)))
+        sig = (d["maj_le"], d["demandeur"], d["motif"], d["duplicata"], d["nom"], d["matricule"], items)
+        with self._ops_lock:
+            cache = self.__dict__.setdefault("_bordereaux", {})
+            hit = cache.get(int(did))
+        if hit and hit[0] == sig and Path(hit[1]).exists():
+            return {"path": hit[1], "provisoire": True}
+        dest = pdf_tools.temp_pdf("bordereau_")
+        demandes.bordereau_provisoire(self.db, self.s, int(did), dest)
+        with self._ops_lock:
+            old = cache.get(int(did))
+            cache[int(did)] = (sig, str(dest))
+        if old:
+            _unlink_temp(old[1])
+        return {"path": str(dest), "provisoire": True}
+
+    def demandes_board(self, statuts: list[str] | None = None) -> list[dict]:
+        """Page Demandes : chaque demande avec ses pages, ses relevés bloqués et la date de sa dernière étape."""
+        rows = [_row(r) for r in self.db.demandes(statuts or None)]
+        if not rows:
+            return rows
+        extra = {r["did"]: r for r in self.db.conn.execute(
+            "SELECT i.demande_id AS did, SUM(CASE WHEN i.etat LIKE 'BLOQU%' THEN 1 ELSE 0 END) AS bloques, "
+            "SUM(CASE WHEN r.id IS NULL THEN 0 ELSE r.page_fin - r.numero_page + 1 END) AS pages "
+            "FROM demande_items i LEFT JOIN etudiants_releves r ON r.id = i.releve_id GROUP BY i.demande_id")}
+        for r in rows:
+            e = extra.get(r["id"])
+            r["bloques"] = int(e["bloques"] or 0) if e else 0
+            r["pages"] = int(e["pages"] or 0) if e else 0
+        return rows
+
+    def _cursus_rels(self, releve_ids: list[int]) -> list[Releve]:
+        """Relevés cochés, un seul exemplaire par relevé, dans l'ordre du cursus."""
+        rels = [r for r in (self.db.get(int(i)) for i in releve_ids) if r]
+        if not rels:
+            raise ServiceError("Cochez au moins un relevé.")
+        rels = self._exemplaires_uniques(rels)
+        rels.sort(key=lambda r: (r.niveau_num, r.semestre or 0, r.annee_academique or "",
+                                 1 if (r.session or "").lower().startswith("rattrap") else 0))
+        return rels
+
+    def _exemplaires_uniques(self, rels: list[Releve]) -> list[Releve]:
+        """Deux exemplaires du même relevé cochés : fusionné une seule fois. L'exemplaire gardé est celui que
+        l'agent a coché (choix « exemplaires multiples » de la revue du cursus), pas d'office celui de l'index."""
+        groups, _info = self.db._dup_groups({r.matricule for r in rels})
+        out, seen = [], set()
+        for r in rels:
+            key = (groups.get(r.id) or [r.id])[0]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+        return out
+
+    def _cursus_preview(self, matricule: str, releve_ids: list[int], cover: bool, duplicata: bool,
+                        op: str | None) -> dict:
+        """Aperçu du PDF fusionné tel qu'il sortira (page de garde, ordre, timbre, pied de page) : mêmes
+        conversions Word que l'impression (une par fichier source, progression, annulation) — elles servent
+        ensuite à l'impression. Aucun numéro de délivrance réservé, rien au journal ; mis en cache par sélection."""
+        rels = self._cursus_rels(releve_ids)
+        with self._operation(op) as cancelled:
+            ready, errors = self._prepare_word(rels, op, cancelled, "Aperçu du cursus")
+            self._progress(op, "fusion", len(rels), len(rels), "Contrôle et fusion de l'aperçu…")
+            base = self.db.cursus(matricule) or rels
+            absent = missing_periods(base)
+
+            def sig_of(rel: Releve):
+                r = ready.get(rel.id, rel)
+                try:
+                    mtime = Path(r.preview_pdf).stat().st_mtime if r.preview_pdf else 0
+                except OSError:
+                    mtime = 0
+                return (r.id, r.preview_pdf, mtime, r.numero_page, r.page_fin)
+            sig = (tuple(sig_of(r) for r in rels), bool(cover), bool(duplicata), tuple(sorted(errors.items())),
+                   tuple(absent), bool(self.s.delivery_ref_stamp))
+            with self._ops_lock:
+                cache = self.__dict__.setdefault("_cursus_previews", {})
+                hit = cache.get(sig)
+            if hit and Path(hit["path"]).exists():
+                return dict(hit, cached=True)
+
+            def prepare(rel):
+                if rel.id in errors:
+                    raise ExtractionError(errors[rel.id])
+                rel = ready.get(rel.id, rel)
+                check_before_print(rel)
+                return rel
+            dest = pdf_tools.temp_pdf("cursus_apercu_")
+            layout: list[dict] = []
+            try:
+                path, n, missing = pdf_tools.merge_releves(
+                    rels, dest, cover=cover, stamp=pdf_tools.stamp_text() if duplicata else None, prepare=prepare,
+                    absent=absent, layout=layout,
+                    footer=pdf_tools.footer_text("(attribuée à l'impression)") if self.s.delivery_ref_stamp else None)
+            except ValueError as exc:
+                _unlink_temp(str(dest))
+                raise ServiceError(f"Aperçu impossible : {exc}") from exc
+        out = {"path": str(path), "name": Path(path).name, "pages": n, "missing": missing, "ref": None,
+               "preview": True, "layout": layout, "location": ""}
+        with self._ops_lock:
+            cache[sig] = out
+            while len(cache) > 6:
+                old = cache.pop(next(iter(cache)))
+                _unlink_temp(old["path"])
+        return dict(out, cached=False)
 
 
 def _unlink_temp(file: str | None) -> None:

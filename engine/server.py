@@ -99,6 +99,9 @@ class Engine:
                  "visual_refused", "demande_add_cursus", "journal_export", "suggest_path", "exports_dir",
                  "check_integrity", "verify_print_prepare", "verify_printed", "preview_original"]
         names += ["index_overview", "anomalies_summary", "anomalies_files", "anomalies_detail", "anomalies_mark_seen", "anomalies_export"]  # écran Indexation (2.1)
+        # revue demandes / cursus
+        names += ["demande_review", "demande_control", "demande_control_skipped", "demande_bordereau_preview",
+                  "demandes_board"]
         table = {n: getattr(s, n) for n in names}
         table.update({"index_start": self.index_start, "index_stop": self.index_stop,
                       "index_reset": self.index_reset, "index_impact": s.index_impact,

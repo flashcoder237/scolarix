@@ -2,6 +2,7 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 import "./styles/verification.css";
 import "./styles/indexation.css";
+import "./styles/revue.css";
 import { App } from "./App";
 import { sx } from "./api";
 
