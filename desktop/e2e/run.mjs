@@ -508,21 +508,79 @@ async function search(q) {
     await page.getByTestId("demandes-filter").fill("");
   });
 
-  await scenario("Extraction Décanat et journal du jour (Ctrl+4)", async () => {
+  // ---- Extraction et journal (2.1) : toutes les lignes, filtres avec effectifs, tri, dock ; journal en vue sœur
+  await scenario("Extraction Décanat : toutes les lignes, filtres, tri, export Excel (Ctrl+4)", async () => {
     await page.keyboard.press("Control+4");
     await page.getByRole("heading", { name: "Extraction et journal" }).waitFor();
-    await page.waitForTimeout(800);
-    const rows = await page.locator("table.grid").last().locator("tbody tr").count();
-    if (rows < 3) throw new Error(`journal du jour : ${rows} ligne(s)`);
-    if (!/CONSULTATION/.test(await page.locator("table.grid").last().innerText())) throw new Error("consultations absentes du journal");
+    await page.getByTestId("view-extraction").click();
+    const count = async () => Number((await page.getByTestId("xr-count").innerText()).replace(/\D/g, ""));
+    await page.locator('[data-testid="xr-table"] tbody tr:not(.vt-pad)').first().waitFor();
+    const all = await count();
+    if (all < 10) throw new Error(`extraction : ${all} ligne(s)`);
     await shot("extraction");
+    // filière : l'effectif affiché est celui obtenu au clic, et une puce apparaît dans la barre
+    const nM = Number((await page.getByTestId("fil-M").locator(".n").innerText()).replace(/\D/g, ""));
+    await page.getByTestId("fil-M").click();
+    await page.waitForFunction((n) => Number(document.querySelector('[data-testid="xr-count"]').textContent.replace(/\D/g, "")) === n, nM, { timeout: 10000 });
+    await page.getByTestId("filter-chips").getByText("Médecine").waitFor();
+    await page.getByRole("button", { name: "Retirer le filtre Médecine" }).click();
+    await page.waitForFunction((n) => Number(document.querySelector('[data-testid="xr-count"]').textContent.replace(/\D/g, "")) === n, all, { timeout: 10000 });
+    // tous les relevés (sans le « dernier niveau ») : plus de lignes qu'avant, et plus de plafond à 200
+    await page.getByTestId("niveau-choisis").click();
+    await page.waitForFunction((n) => Number(document.querySelector('[data-testid="xr-count"]').textContent.replace(/\D/g, "")) > n, all, { timeout: 10000 });
+    // tri par moyenne (décroissante au premier clic)
+    await page.locator('[data-testid="xr-table"] th', { hasText: "Moyenne" }).click();
+    await page.waitForTimeout(300);
+    const moys = (await page.locator('[data-testid="xr-table"] tbody tr:not(.vt-pad) td.xr-moy').allInnerTexts()).slice(0, 8).map((x) => parseFloat(x.replace(",", ".")) || -1);
+    if (moys.some((m, i) => i && m > moys[i - 1])) throw new Error(`tri par moyenne : ${moys.join(" ")}`);
+    // recherche dans le résultat (Ctrl+F reste sur l'écran)
+    await page.keyboard.press("Control+f");
+    await page.keyboard.type("18M042");
+    await page.waitForTimeout(300);
+    const rows = await page.locator('[data-testid="xr-table"] tbody tr:not(.vt-pad)').allInnerTexts();
+    if (!rows.length || rows.some((r) => !/18M042/.test(r))) throw new Error(`recherche : ${rows.slice(0, 3).join(" / ")}`);
+    await page.getByTestId("xr-search").fill("");
+    await page.getByTestId("niveau-dernier").click();
+    // export Excel (Ctrl+E) des lignes affichées, journalisé, listé dans « Dernières extractions »
+    const dest = join(work, "extraction_e2e.xlsx");
+    rmSync(dest, { force: true });
+    await electronApp.evaluate(({ dialog }, file) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath: file }); }, dest);
+    await page.locator('[data-testid="xr-table"]').click({ position: { x: 200, y: 60 } });
+    await page.keyboard.press("Control+e");
+    await waitToast(/Exporté : extraction_e2e\.xlsx/);
+    if (!existsSync(dest)) throw new Error("export Excel non écrit");
+    await page.getByTestId("xr-recent").getByText(/lignes · Excel/).waitFor({ timeout: 10000 });
+    // ligne choisie : Entrée ouvre l'étudiant au guichet
+    await page.locator('[data-testid="xr-table"] tbody tr:not(.vt-pad)').first().click();
+    const mat = (await page.locator('[data-testid="xr-table"] tbody tr.sel td').first().innerText()).trim();
+    await page.keyboard.press("Enter");
+    await page.locator('[data-page="guichet"]').waitFor({ state: "visible" });
+    await page.waitForFunction((m) => document.querySelector('[data-page="guichet"] [data-testid="search"]')?.value === m, mat, { timeout: 5000 });
+  });
+
+  await scenario("Journal des actions : vue sœur, période, filtres, export CSV", async () => {
+    await page.keyboard.press("Control+4");
+    await page.getByTestId("view-journal").click();
+    await page.locator('[data-testid="journal-table"] tbody tr:not(.vt-pad)').first().waitFor();
+    const text = await page.getByTestId("journal-table").innerText();
+    if (!/CONSULTATION/.test(text) || !/EXTRACTION/.test(text)) throw new Error("consultations ou extraction absentes du journal");
+    const total = Number((await page.getByTestId("journal-count").innerText()).replace(/\D/g, ""));
+    if (total < 3) throw new Error(`journal : ${total} ligne(s)`);
+    // filtre par type d'action (effectifs à côté)
+    await page.getByTestId("journal-actions").locator("label", { hasText: "EXTRACTION" }).locator("input").uncheck();
+    // (le guichet a pu journaliser une consultation entre-temps : on vérifie le contenu, pas un total)
+    await page.waitForFunction(() => !/EXTRACTION/.test(document.querySelector('[data-testid="journal-table"]').innerText), null, { timeout: 10000 });
+    await page.getByTestId("filter-chips").getByText("sans EXTRACTION").waitFor();
+    await page.getByRole("button", { name: /Retirer le filtre/ }).nth(1).click();
+    await page.getByTestId("journal-period-tout").click();
+    await shot("journal");
     const dest = join(work, "journal_e2e.csv");
     rmSync(dest, { force: true });
     await electronApp.evaluate(({ dialog }, file) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath: file }); }, dest);
-    await page.getByTestId("journal-period").selectOption("");
     await page.getByTestId("journal-export").click();
     await waitToast(/Journal exporté/);
     if (!existsSync(dest)) throw new Error("journal CSV non écrit");
+    await page.keyboard.press("Control+1");             // la vue Journal reste choisie au retour sur l'écran
   });
 
   // ---------------------------------------------------------------- Vérification (2.1) : deux grands volets liés
@@ -954,26 +1012,47 @@ async function search(q) {
     await shot("apres_relance_moteur");
   });
 
-  await scenario("Réglages : ouverture et enregistrement", async () => {
+  // ---- Réglages (2.1) : feuille large, navigation, recherche Ctrl+K, modifications nommées, outils, remplacements
+  await scenario("Réglages : ouverture, outils du poste, modifications nommées, Ctrl+S", async () => {
     await page.keyboard.press("Control+1");
     await page.getByTestId("stats-btn").click();                 // chiffres du jour : poste et opérateur
     await page.getByTestId("settings").click();
     const dlg = page.getByRole("dialog", { name: "Réglages" });
     await dlg.waitFor();
-    await page.getByTestId("set-tesseract").waitFor();
-    await shot("reglages");
-    await dlg.getByRole("radio", { name: "Indexation" }).click();
+    await page.getByTestId("sec-outils").click();
+    await page.getByTestId("tool-tesseract").getByText(/DÉTECTÉ|INTROUVABLE/).waitFor({ timeout: 20000 });
+    await page.getByTestId("tool-libreoffice").getByText(/DÉTECTÉ|INTROUVABLE/).waitFor();
+    await page.getByTestId("tool-db").getByText(/relevés/).waitFor({ timeout: 10000 });
+    await shot("reglages_outils");
+    await page.getByTestId("sec-diagnostic").click();
+    await page.getByTestId("settings-version").waitFor();
+    await page.getByTestId("sec-indexation").click();
     await page.getByTestId("exclusion-pattern").click();
     await page.getByRole("dialog", { name: "Motif à exclure" }).locator("input").fill("*BROUILLON*");
     await page.keyboard.press("Enter");
+    await page.getByTestId("settings-pending").getByText("exclusions").waitFor();
     await page.getByTestId("exclusions").getByText("*BROUILLON*").click();
     await page.getByTestId("exclusion-remove").click();
     if (await page.getByTestId("exclusions").getByText("*BROUILLON*").count()) throw new Error("motif non retiré");
-    await page.getByTestId("settings-save").click();
+    if (await page.getByTestId("settings-pending").count()) throw new Error("modification fantôme après retour à l'état d'origine");
+    // recherche dans les réglages : Ctrl+K, Entrée mène à la section et au champ
+    await page.keyboard.press("Control+k");
+    await page.keyboard.type("recto");
+    await page.keyboard.press("Enter");
+    await page.locator('[data-section="impression"] [data-set="duplex"]').waitFor();
+    await page.getByTestId("sec-operateur").click();
+    const op = page.getByTestId("set-operateur");
+    const before = await op.inputValue();
+    await op.fill(`${before} (test)`);
+    await page.getByTestId("settings-pending").getByText(/1 modification non enregistrée : opérateur/).waitFor();
+    await shot("reglages_modifications");
+    await op.fill(before);
+    await page.keyboard.press("Control+s");
     await waitToast(/Réglages enregistrés/);
+    await dlg.waitFor({ state: "detached" });
   });
 
-  await scenario("Réglages : barre latérale, Ctrl+, et remplacements Word", async () => {
+  await scenario("Réglages : barre latérale, Ctrl+, et remplacements Word (texte libre)", async () => {
     const dlg = page.getByRole("dialog", { name: "Réglages" });
     await page.getByTestId("nav-reglages").click();
     await dlg.waitFor();
@@ -981,20 +1060,28 @@ async function search(q) {
     await dlg.waitFor({ state: "detached" });
     await page.keyboard.press("Control+,");
     await dlg.waitFor();
-    await dlg.getByRole("radio", { name: "Remplacements (Word)" }).click();
+    await page.getByTestId("sec-remplacements").click();
+    await page.getByTestId("rules-texte").click();
     const result = page.getByTestId("rules-result");
     await result.filter({ hasText: "3 remplacement(s)" }).waitFor({ timeout: 10000 });
     if (!/Ref N° RELEVE DE NOTES/.test(await result.innerText())) throw new Error("essai : « Ref N° » absent");
-    await shot("reglages_remplacements");
-    // une règle ajoutée est essayée aussitôt
-    await page.getByTestId("rule-add").click();
-    const n = (await page.locator('[data-testid="rules"] > .soft').count()) - 1;
-    await page.getByTestId(`rule-${n}-chercher`).fill("TRANSCRIPT");
-    await page.getByTestId(`rule-${n}-remplacer`).fill("RELEVÉ");
+    await page.getByTestId("rules-after").locator(".hd-ins").first().waitFor();          // ajouté en vert
+    await page.getByTestId("rules-preview").locator(".hd-del").first().waitFor();         // retiré barré en rouge
+    await shot("reglages_remplacements_texte");
+    // une règle ajoutée (Ctrl+N) est essayée aussitôt
+    await page.keyboard.press("Control+n");
+    await page.getByTestId("rule-chercher").fill("TRANSCRIPT");
+    await page.getByTestId("rule-remplacer").fill("RELEVÉ");
     await result.filter({ hasText: "4 remplacement(s)" }).waitFor({ timeout: 10000 });
+    await page.getByTestId("settings-pending").getByText(/1 règle\(s\) ajoutée\(s\)/).waitFor();
+    // Alt+↑ : la règle remonte (l'ordre fait partie des modifications)
+    await page.keyboard.press("Alt+ArrowUp");
+    await page.getByTestId("rule-2").getByText(/3\. Nouvelle règle/).waitFor();
+    await page.getByTestId("settings-pending").getByText(/règle/).waitFor();
+    await page.keyboard.press("Alt+ArrowDown");
     // une expression invalide est signalée et l'enregistrement refusé, la fenêtre reste ouverte
-    await page.getByTestId(`rule-${n}`).getByText("Expression régulière", { exact: true }).click();
-    await page.getByTestId(`rule-${n}-chercher`).fill("(TRANSCRIPT");
+    await page.getByTestId("rule-regex").click();
+    await page.getByTestId("rule-chercher").fill("(TRANSCRIPT");
     await result.filter({ hasText: "Règle 4" }).waitFor({ timeout: 10000 });
     await page.getByTestId("settings-save").click();
     await waitToast(/Enregistrement impossible.*Corrections Word/);
@@ -1232,6 +1319,71 @@ async function search(q) {
     await waitPrinted(before + 1, 120000);
     await page.keyboard.press("Escape");
     await page.locator(CR).waitFor({ state: "detached" });
+  });
+
+  await scenario("Remplacements : AVANT / APRÈS rendu par le moteur sur l'en-tête d'un vrai relevé Word", async () => {
+    const dlg = page.getByRole("dialog", { name: "Réglages" });
+    await page.keyboard.press("Control+,");
+    await dlg.waitFor();
+    await page.getByTestId("sec-remplacements").click();
+    const src = page.getByTestId("rules-source");
+    await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="rules-source"] option')].some((o) => /^\d+$/.test(o.value)), null, { timeout: 15000 }).catch(() => undefined);
+    const first = await src.locator("option").first().getAttribute("value");
+    if (!first || !/^\d+$/.test(first)) throw new Error("aucun relevé Word proposé pour l'essai");
+    await src.selectOption(first);
+    // règle propre aux relevés fictifs (titre accentué) : « Ref N° » ajouté devant, en 7 pt
+    await page.keyboard.press("Control+n");
+    await page.getByTestId("rule-description").fill("Ref N° devant le titre (essai)");
+    await page.getByTestId("rule-chercher").fill("RELEVÉ DE NOTES");
+    await page.getByTestId("rule-remplacer").fill("Ref N° RELEVÉ DE NOTES");
+    await page.getByTestId("rule-taille").fill("7");
+    const after = page.getByTestId("rules-after-img");
+    await after.locator("img").waitFor({ timeout: 60000 });
+    await after.locator(".hd-rect.ins").first().waitFor({ timeout: 60000 });     // texte ajouté situé sur le rendu
+    await page.getByTestId("rules-preview").getByText(/[1-9]\d* remplacements?/).first().waitFor();
+    await page.waitForTimeout(400);
+    await shot("reglages_remplacements");
+    await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1920, 1080));
+    await page.waitForTimeout(900);
+    await shot("reglages_remplacements_1920");
+    await electronApp.evaluate(({ BrowserWindow }, [w, h]) => BrowserWindow.getAllWindows()[0].setContentSize(w, h), SIZE);
+    await page.waitForTimeout(500);
+    // Échap avec des modifications : confirmation, puis abandon (rien n'est enregistré)
+    await page.keyboard.press("Escape");
+    const q = page.getByRole("dialog", { name: "Modifications non enregistrées" });
+    await q.waitFor();
+    await q.getByRole("button", { name: "Abandonner les modifications" }).click();
+    await dlg.waitFor({ state: "detached" });
+    await page.keyboard.press("Control+,");
+    await dlg.waitFor();
+    await page.getByTestId("sec-remplacements").click();
+    if (await page.getByText("Ref N° devant le titre (essai)").count()) throw new Error("règle abandonnée pourtant conservée");
+    await page.keyboard.press("Escape");
+    await dlg.waitFor({ state: "detached" });
+  });
+
+  await scenario("Grand écran 1920×1080 : Extraction, Journal, Réglages", async () => {
+    await electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1920, 1080));
+    await page.waitForTimeout(600);
+    await page.keyboard.press("Control+4");
+    await page.getByTestId("view-extraction").click();
+    await page.locator('[data-testid="xr-table"] tbody tr:not(.vt-pad)').first().waitFor();
+    await page.waitForTimeout(500);
+    const visible = await page.evaluate(() => { const w = document.querySelector('[data-testid="xr-table"]'); return Math.floor((w.clientHeight - 36) / 34); });
+    console.log(`    Extraction à 1920×1080 : ${visible} lignes visibles`);
+    await shot("extraction_1920");
+    await page.getByTestId("view-journal").click();
+    await page.locator('[data-testid="journal-table"] tbody tr:not(.vt-pad)').first().waitFor();
+    await shot("journal_1920");
+    await page.keyboard.press("Control+,");
+    await page.getByRole("dialog", { name: "Réglages" }).waitFor();
+    await page.getByTestId("sec-outils").click();
+    await page.getByTestId("tool-tesseract").getByText(/DÉTECTÉ|INTROUVABLE/).waitFor({ timeout: 20000 });
+    await shot("reglages_outils_1920");
+    await page.keyboard.press("Escape");
+    await electronApp.evaluate(({ BrowserWindow }, [w, h]) => BrowserWindow.getAllWindows()[0].setContentSize(w, h), SIZE);
+    await page.waitForTimeout(400);
+    await page.keyboard.press("Control+1");
   });
 
   await electronApp.close();

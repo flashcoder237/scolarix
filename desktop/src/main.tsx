@@ -3,6 +3,7 @@ import "./styles.css";
 import "./styles/verification.css";
 import "./styles/indexation.css";
 import "./styles/revue.css";
+import "./styles/reglages-extraction.css";
 import { App } from "./App";
 import { sx } from "./api";
 

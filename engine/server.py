@@ -102,6 +102,7 @@ class Engine:
         # revue demandes / cursus
         names += ["demande_review", "demande_control", "demande_control_skipped", "demande_bordereau_preview",
                   "demandes_board"]
+        names += ["tools_status", "diagnostic", "cache_clear", "rules_preview_releves", "rules_preview", "extraction_view", "extraction_view_export", "extraction_recent", "journal_view", "journal_view_export"]  # réglages / extraction
         table = {n: getattr(s, n) for n in names}
         table.update({"index_start": self.index_start, "index_stop": self.index_stop,
                       "index_reset": self.index_reset, "index_impact": s.index_impact,
