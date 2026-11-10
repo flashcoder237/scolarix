@@ -22,6 +22,15 @@ export function RIcon({ name, size = 16 }: { name: string; size?: number }) {
     strokeLinejoin="round" aria-hidden="true" dangerouslySetInnerHTML={{ __html: EXTRA[name] }} />;
 }
 
+/** Après un clic sur un bouton ou une case, le clavier revient à la revue : Entrée ne relance jamais en
+ *  douce le dernier bouton cliqué (« Préparer », « Imprimer »…), Espace et ↑ ↓ gardent leur sens. */
+export function refocus(e: React.MouseEvent, root: HTMLElement | null) {
+  const t = e.target as HTMLElement;
+  const b = t.closest("button, input[type=checkbox], label.switch");
+  if (!b || t.closest(".popover") || !root) return;
+  root.focus({ preventScroll: true });
+}
+
 /** Ctrl+1…5 (autre écran) pendant une revue : la revue se ferme d'abord, puis l'écran demandé s'affiche. */
 export function useReviewNav(close: () => boolean | void) {
   const map: Record<string, () => boolean | void> = {};
@@ -43,7 +52,7 @@ export function ReviewShell({ label, testid, backLabel, onBack, icon, tone = "vi
     return () => { if (before && document.contains(before)) before.focus(); };
   }, []);
   return createPortal(
-    <div className="review" ref={root} tabIndex={-1} role="region" aria-label={label} data-testid={testid}>
+    <div className="review" ref={root} tabIndex={-1} role="region" aria-label={label} data-testid={testid} onClick={(e) => refocus(e, root.current)}>
       <header className="card rv-top">
         <button className="btn ghost sm rv-back" onClick={onBack} data-testid="review-back" title={`Retour (Échap)`}>
           <Icon name="arrow_left" size={16} />{backLabel}<span className="kbd">Échap</span></button>

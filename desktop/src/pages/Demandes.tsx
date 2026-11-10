@@ -3,7 +3,7 @@ import { call, plural, type Demande } from "../api";
 import { useApp, useShortcuts } from "../state";
 import { Badge, Icon, useDialogs, useToast } from "../components/ui";
 import { type PdfViewHandle, type PdfViewState } from "../components/PdfView";
-import { OpProgress, ReviewFocusBar } from "../components/ReviewShell";
+import { OpProgress, ReviewFocusBar, refocus } from "../components/ReviewShell";
 import { Stepper, ageLabel, hourLabel } from "../components/Stepper";
 import {
   DemandeMenu, DemandeReview, DemandeStage, PieceStrip, ReviewDock, STATUT_AIDE, STATUT_TONE, STEP_IDX, stepsOf, useDemandeReview,
@@ -222,6 +222,7 @@ function DemandeDetail({ rv, pdf, onReview, onGuichet }: { rv: DemandeReviewStat
   const [pv, setPv] = useState<PdfViewState>({ fit: "auto", scale: null, overflow: false });
   const [mmHost, setMmHost] = useState<HTMLDivElement | null>(null);
   const [focus, setFocus] = useState(false);
+  const box = useRef<HTMLElement>(null);
   const d = rv.d;
   useShortcuts({ "escape": () => setFocus(false) }, focus);
   if (!d) return (
@@ -233,7 +234,7 @@ function DemandeDetail({ rv, pdf, onReview, onGuichet }: { rv: DemandeReviewStat
   const st = d.demande.statut;
   const open = st === "EN COURS" || st === "PRÊTE" || st === "IMPRIMÉE";
   return (
-    <section className="gx-preview">
+    <section className="gx-preview" tabIndex={-1} ref={box} onClick={(e) => refocus(e, box.current)} style={{ outline: "none" }}>
       <div className="card strip dm-strip" data-testid="demande-strip">
         <Badge text={st} tone={STATUT_TONE[st] || "gray"} big dot />
         <span className="mono nowrap">{d.demande.numero}</span>

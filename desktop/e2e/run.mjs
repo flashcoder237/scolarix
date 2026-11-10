@@ -815,6 +815,40 @@ async function search(q) {
     await waitToast(/remise et close/);
   });
 
+  await scenario("Revue de la demande : Échap pendant la préparation = Arrêter, rien n'est produit", async () => {
+    await page.keyboard.press("Control+1");
+    await search("18M042");
+    await page.locator(ROWS).first().waitFor({ timeout: 30000 });
+    await page.keyboard.press("Control+n");
+    await page.getByRole("dialog", { name: "Nouvelle demande" }).waitFor();
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(400);
+    for (let k = 0; k < 5; k++) {                         // N1 à N4 : plusieurs fichiers Word à convertir
+      await page.keyboard.press("Control+d");
+      await page.waitForTimeout(300);
+      await page.getByTestId("search").press("ArrowDown");
+      await page.waitForTimeout(200);
+    }
+    await page.waitForTimeout(800);
+    // comme des fichiers jamais consultés : aperçus Word à refaire pendant la préparation
+    for (const f of readdirSync(join(work, "cache"))) rmSync(join(work, "cache", f), { recursive: true, force: true });
+    await page.getByTestId("demande-chip").click();
+    await page.getByTestId("demande-open").click();
+    await page.locator(RV).waitFor();
+    await page.getByTestId("demande-prepare").click();
+    await page.getByTestId("demande-progress").waitFor({ timeout: 5000 });          // progression dans la liste, avec Arrêter
+    await page.waitForTimeout(400);
+    await shot("revue_preparation");
+    await page.keyboard.press("Escape");                                            // Échap pendant l'opération = Arrêter
+    await waitToast(/annulée/, 60000);
+    await page.getByTestId("demande-progress").waitFor({ state: "detached", timeout: 30000 });
+    if (!(await page.locator(RV).isVisible())) throw new Error("Échap pendant la préparation a fermé la revue");
+    await page.locator(`${RV} [data-testid="stepper"] .st.cur`).filter({ hasText: "Préparer" }).waitFor({ timeout: 5000 });
+    if (await page.locator(`${RV} [data-testid="piece"]`).filter({ hasText: /PRÊT ·/ }).count()) throw new Error("des pièces préparées malgré l'arrêt");
+    await page.keyboard.press("Escape");
+    await page.locator(RV).waitFor({ state: "detached" });
+  });
+
   await scenario("Cursus : aperçu du PDF fusionné page par page, page de garde, Ctrl+P", async () => {
     await page.keyboard.press("Control+1");
     await search("18M042");
